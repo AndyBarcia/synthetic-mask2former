@@ -10,6 +10,7 @@ from torch import nn
 from torch.cuda.amp import autocast
 
 from detectron2.projects.point_rend.point_features import point_sample
+from .utils import compute_mask_block_counts
 
 
 def batch_dice_loss(inputs: torch.Tensor, targets: torch.Tensor):
@@ -67,6 +68,31 @@ batch_sigmoid_ce_loss_jit = torch.jit.script(
 )  # type: torch.jit.ScriptModule
 
 
+def batch_block_sigmoid_ce_loss(
+    logits: torch.Tensor,
+    positive_counts: torch.Tensor,
+    block_area: int,
+    target_area: int,
+):
+    """Pairwise BCE cost computed exactly from target counts per logit block."""
+    constant = block_area * F.softplus(logits).sum(1)
+    positive_term = torch.einsum("qc,mc->qm", logits, positive_counts)
+    return (constant[:, None] - positive_term) / target_area
+
+
+def batch_block_dice_loss(
+    logits: torch.Tensor, positive_counts: torch.Tensor, block_area: int
+):
+    """Pairwise dense Dice cost computed from target counts per logit block."""
+    probabilities = logits.sigmoid()
+    numerator = 2 * torch.einsum("qc,mc->qm", probabilities, positive_counts)
+    denominator = (
+        block_area * probabilities.sum(1)[:, None]
+        + positive_counts.sum(1)[None, :]
+    )
+    return 1 - (numerator + 1) / (denominator + 1)
+
+
 class HungarianMatcher(nn.Module):
     """This class computes an assignment between the targets and the predictions of the network
 
@@ -75,7 +101,9 @@ class HungarianMatcher(nn.Module):
     while the others are un-matched (and thus treated as non-objects).
     """
 
-    def __init__(self, cost_class: float = 1, cost_mask: float = 1, cost_dice: float = 1, num_points: int = 0):
+    def __init__(self, cost_class: float = 1, cost_mask: float = 1,
+                 cost_dice: float = 1, num_points: int = 0,
+                 mask_loss_type: str = "point"):
         """Creates the matcher
 
         Params:
@@ -91,6 +119,11 @@ class HungarianMatcher(nn.Module):
         assert cost_class != 0 or cost_mask != 0 or cost_dice != 0, "all costs cant be 0"
 
         self.num_points = num_points
+        if mask_loss_type not in {"point", "block"}:
+            raise ValueError(
+                f"mask_loss_type must be 'point' or 'block', got {mask_loss_type!r}"
+            )
+        self.mask_loss_type = mask_loss_type
 
     @torch.no_grad()
     def memory_efficient_forward(self, outputs, targets):
@@ -105,6 +138,10 @@ class HungarianMatcher(nn.Module):
             out_prob = outputs["pred_logits"][b].softmax(-1)  # [num_queries, num_classes]
             tgt_ids = targets[b]["labels"]
 
+            if tgt_ids.numel() == 0:
+                indices.append(([], []))
+                continue
+
             # Compute the classification cost. Contrary to the loss, we don't use the NLL,
             # but approximate it in 1 - proba[target class].
             # The 1 is a constant that doesn't change the matching, it can be ommitted.
@@ -114,31 +151,45 @@ class HungarianMatcher(nn.Module):
             # gt masks are already padded when preparing target
             tgt_mask = targets[b]["masks"].to(out_mask)
 
-            out_mask = out_mask[:, None]
-            tgt_mask = tgt_mask[:, None]
-            # all masks share the same set of points for efficient matching!
-            point_coords = torch.rand(1, self.num_points, 2, device=out_mask.device)
-            # get gt labels
-            tgt_mask = point_sample(
-                tgt_mask,
-                point_coords.repeat(tgt_mask.shape[0], 1, 1),
-                align_corners=False,
-            ).squeeze(1)
+            if self.mask_loss_type == "block":
+                positive_counts, block_area, target_h, target_w = compute_mask_block_counts(
+                    tgt_mask, out_mask.shape[-2:]
+                )
+                out_mask = out_mask.flatten(1).float()
+                positive_counts = positive_counts.to(out_mask)
+                with autocast(enabled=False):
+                    cost_mask = batch_block_sigmoid_ce_loss(
+                        out_mask, positive_counts, block_area, target_h * target_w
+                    )
+                    cost_dice = batch_block_dice_loss(
+                        out_mask, positive_counts, block_area
+                    )
+            else:
+                out_mask = out_mask[:, None]
+                tgt_mask = tgt_mask[:, None]
+                # all masks share the same set of points for efficient matching!
+                point_coords = torch.rand(1, self.num_points, 2, device=out_mask.device)
+                # get gt labels
+                tgt_mask = point_sample(
+                    tgt_mask,
+                    point_coords.repeat(tgt_mask.shape[0], 1, 1),
+                    align_corners=False,
+                ).squeeze(1)
 
-            out_mask = point_sample(
-                out_mask,
-                point_coords.repeat(out_mask.shape[0], 1, 1),
-                align_corners=False,
-            ).squeeze(1)
+                out_mask = point_sample(
+                    out_mask,
+                    point_coords.repeat(out_mask.shape[0], 1, 1),
+                    align_corners=False,
+                ).squeeze(1)
 
-            with autocast(enabled=False):
-                out_mask = out_mask.float()
-                tgt_mask = tgt_mask.float()
-                # Compute the focal loss between masks
-                cost_mask = batch_sigmoid_ce_loss_jit(out_mask, tgt_mask)
+                with autocast(enabled=False):
+                    out_mask = out_mask.float()
+                    tgt_mask = tgt_mask.float()
+                    # Compute the focal loss between masks
+                    cost_mask = batch_sigmoid_ce_loss_jit(out_mask, tgt_mask)
 
-                # Compute the dice loss betwen masks
-                cost_dice = batch_dice_loss_jit(out_mask, tgt_mask)
+                    # Compute the dice loss between masks
+                    cost_dice = batch_dice_loss_jit(out_mask, tgt_mask)
             
             # Final cost matrix
             C = (
@@ -184,6 +235,7 @@ class HungarianMatcher(nn.Module):
             "cost_class: {}".format(self.cost_class),
             "cost_mask: {}".format(self.cost_mask),
             "cost_dice: {}".format(self.cost_dice),
+            "mask_loss_type: {}".format(self.mask_loss_type),
         ]
         lines = [head] + [" " * _repr_indent + line for line in body]
         return "\n".join(lines)

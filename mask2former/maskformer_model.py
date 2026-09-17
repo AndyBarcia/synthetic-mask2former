@@ -113,6 +113,7 @@ class MaskFormer(nn.Module):
             cost_mask=mask_weight,
             cost_dice=dice_weight,
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
+            mask_loss_type=cfg.MODEL.MASK_FORMER.MASK_LOSS_TYPE,
         )
 
         weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight}
@@ -135,6 +136,7 @@ class MaskFormer(nn.Module):
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
             oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
+            mask_loss_type=cfg.MODEL.MASK_FORMER.MASK_LOSS_TYPE,
         )
 
         return {

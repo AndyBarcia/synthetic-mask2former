@@ -16,6 +16,7 @@ from detectron2.projects.point_rend.point_features import (
 )
 
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
+from .utils import compute_mask_block_counts
 
 
 def dice_loss(
@@ -95,7 +96,8 @@ class SetCriterion(nn.Module):
     """
 
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
-                 num_points, oversample_ratio, importance_sample_ratio):
+                 num_points, oversample_ratio, importance_sample_ratio,
+                 mask_loss_type="point"):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -118,6 +120,11 @@ class SetCriterion(nn.Module):
         self.num_points = num_points
         self.oversample_ratio = oversample_ratio
         self.importance_sample_ratio = importance_sample_ratio
+        if mask_loss_type not in {"point", "block"}:
+            raise ValueError(
+                f"MASK_LOSS_TYPE must be 'point' or 'block', got {mask_loss_type!r}"
+            )
+        self.mask_loss_type = mask_loss_type
 
     def loss_labels(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -152,6 +159,34 @@ class SetCriterion(nn.Module):
         target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()
         target_masks = target_masks.to(src_masks)
         target_masks = target_masks[tgt_idx]
+
+        if src_masks.shape[0] == 0:
+            zero = outputs["pred_masks"].sum() * 0.0
+            return {"loss_mask": zero, "loss_dice": zero}
+
+        if self.mask_loss_type == "block":
+            logits = src_masks.flatten(1)
+            positive_counts, block_area, target_h, target_w = compute_mask_block_counts(
+                target_masks, src_masks.shape[-2:]
+            )
+            positive_counts = positive_counts.to(logits)
+
+            # This is algebraically identical to dense BCE, while retaining one
+            # logit and one positive-pixel count per prediction block.
+            loss_mask = (
+                block_area * F.softplus(logits) - logits * positive_counts
+            ).sum(1) / (target_h * target_w)
+
+            probabilities = logits.sigmoid()
+            numerator = 2 * (probabilities * positive_counts).sum(1)
+            denominator = (
+                block_area * probabilities.sum(1) + positive_counts.sum(1)
+            )
+            loss_dice = 1 - (numerator + 1) / (denominator + 1)
+            return {
+                "loss_mask": loss_mask.sum() / num_masks,
+                "loss_dice": loss_dice.sum() / num_masks,
+            }
 
         # No need to upsample predictions as we are using normalized coordinates :)
         # N x 1 x H x W
@@ -257,6 +292,7 @@ class SetCriterion(nn.Module):
             "num_points: {}".format(self.num_points),
             "oversample_ratio: {}".format(self.oversample_ratio),
             "importance_sample_ratio: {}".format(self.importance_sample_ratio),
+            "mask_loss_type: {}".format(self.mask_loss_type),
         ]
         _repr_indent = 4
         lines = [head] + [" " * _repr_indent + line for line in body]

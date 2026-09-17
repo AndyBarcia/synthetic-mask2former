@@ -49,6 +49,7 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.CLASS_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.DICE_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.MASK_WEIGHT = 20.0
+    cfg.MODEL.MASK_FORMER.MASK_LOSS_TYPE = "point"
 
     # transformer config
     cfg.MODEL.MASK_FORMER.NHEADS = 8
