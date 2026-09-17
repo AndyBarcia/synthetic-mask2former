@@ -1,0 +1,26 @@
+_BASE_: ../../ade20k/semantic-segmentation/maskformer2_R50_bs16_160k.yaml
+MODEL:
+  SEM_SEG_HEAD:
+    NUM_CLASSES: 6
+  MASK_FORMER:
+    TEST:
+      SEMANTIC_ON: True
+      INSTANCE_ON: True
+      PANOPTIC_ON: True
+DATASETS:
+  TRAIN: ("synthetic_scene_panoptic_train",)
+  TEST: ("synthetic_scene_panoptic_val","synthetic_scene_sem_seg_val",)
+INPUT:
+  DATASET_MAPPER_NAME: "synthetic_scene_panoptic_batch"
+  SYNTHETIC_SCENE:
+    WIDTH: 512
+    HEIGHT: 512
+    SEED: 1234
+    TEST_SEED: 4321
+    TEST_SAMPLES: 1000
+    TEST_BATCH_SIZE: 4
+DATALOADER:
+  FILTER_EMPTY_ANNOTATIONS: False
+  NUM_WORKERS: 0
+TEST:
+  EVAL_PERIOD: 500

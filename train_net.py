@@ -57,6 +57,13 @@ from mask2former import (
     SemanticSegmentorWithTTA,
     add_maskformer2_config,
 )
+from mask2former.data.synthetic_scene_batch_loader import SyntheticSceneBatchLoader
+from mask2former.evaluation.synthetic_scene_panoptic_evaluation import (
+    SyntheticScenePanopticEvaluator,
+)
+from mask2former.evaluation.synthetic_scene_sem_seg_evaluation import (
+    SyntheticSceneSemSegEvaluator,
+)
 
 
 class Trainer(DefaultTrainer):
@@ -77,6 +84,14 @@ class Trainer(DefaultTrainer):
             output_folder = os.path.join(cfg.OUTPUT_DIR, "inference")
         evaluator_list = []
         evaluator_type = MetadataCatalog.get(dataset_name).evaluator_type
+        if evaluator_type == "synthetic_scene_sem_seg":
+            metadata = MetadataCatalog.get(dataset_name)
+            return SyntheticSceneSemSegEvaluator(
+                class_names=metadata.stuff_classes,
+                ignore_label=metadata.ignore_label,
+            )
+        if evaluator_type == "synthetic_scene_panoptic_seg":
+            return SyntheticScenePanopticEvaluator()
         # semantic segmentation
         if evaluator_type in ["sem_seg", "ade20k_panoptic_seg"]:
             evaluator_list.append(
@@ -148,10 +163,16 @@ class Trainer(DefaultTrainer):
 
     @classmethod
     def build_train_loader(cls, cfg):
+        if cfg.INPUT.DATASET_MAPPER_NAME in (
+            "synthetic_scene_batch",
+            "synthetic_scene_panoptic_batch",
+        ):
+            return SyntheticSceneBatchLoader(cfg)
         # Semantic segmentation dataset mapper
         if cfg.INPUT.DATASET_MAPPER_NAME == "mask_former_semantic":
             mapper = MaskFormerSemanticDatasetMapper(cfg, True)
             return build_detection_train_loader(cfg, mapper=mapper)
+
         # Panoptic segmentation dataset mapper
         elif cfg.INPUT.DATASET_MAPPER_NAME == "mask_former_panoptic":
             mapper = MaskFormerPanopticDatasetMapper(cfg, True)
@@ -171,6 +192,15 @@ class Trainer(DefaultTrainer):
         else:
             mapper = None
             return build_detection_train_loader(cfg, mapper=mapper)
+
+    @classmethod
+    def build_test_loader(cls, cfg, dataset_name):
+        if MetadataCatalog.get(dataset_name).evaluator_type in (
+            "synthetic_scene_sem_seg",
+            "synthetic_scene_panoptic_seg",
+        ):
+            return SyntheticSceneBatchLoader(cfg, is_train=False)
+        return super().build_test_loader(cfg, dataset_name)
 
     @classmethod
     def build_lr_scheduler(cls, cfg, optimizer):

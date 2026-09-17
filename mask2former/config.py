@@ -19,6 +19,20 @@ def add_maskformer2_config(cfg):
     # Pad image and segmentation GT in dataset mapper.
     cfg.INPUT.SIZE_DIVISIBILITY = -1
 
+    # Online CUDA synthetic-scene renderer.
+    cfg.INPUT.SYNTHETIC_SCENE = CN()
+    cfg.INPUT.SYNTHETIC_SCENE.WIDTH = 768
+    cfg.INPUT.SYNTHETIC_SCENE.HEIGHT = 512
+    cfg.INPUT.SYNTHETIC_SCENE.SEED = 1234
+    cfg.INPUT.SYNTHETIC_SCENE.HOUSE_COUNT = 10
+    cfg.INPUT.SYNTHETIC_SCENE.TREE_COUNT = 10
+    cfg.INPUT.SYNTHETIC_SCENE.CLOUD_COUNT = 5
+    cfg.INPUT.SYNTHETIC_SCENE.CAR_COUNT = 5
+    cfg.INPUT.SYNTHETIC_SCENE.PERSON_COUNT = 5
+    cfg.INPUT.SYNTHETIC_SCENE.TEST_SEED = 4321
+    cfg.INPUT.SYNTHETIC_SCENE.TEST_SAMPLES = 1000
+    cfg.INPUT.SYNTHETIC_SCENE.TEST_BATCH_SIZE = 4
+
     # solver config
     # weight decay on embedding
     cfg.SOLVER.WEIGHT_DECAY_EMBED = 0.0
