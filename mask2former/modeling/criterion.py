@@ -143,6 +143,18 @@ class SetCriterion(nn.Module):
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
         losses = {"loss_ce": loss_ce}
         return losses
+
+    def loss_query_bias(self, outputs, targets, indices, num_masks):
+        """Binary query-selection loss: matched queries are positive."""
+        assert "query_bias_logits" in outputs
+        logits = outputs["query_bias_logits"].float()
+        target = torch.zeros_like(logits)
+        for batch_index, (src_indices, _) in enumerate(indices):
+            target[batch_index, src_indices] = 1.0
+
+        loss = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+        weights = torch.where(target.bool(), 1.0, self.eos_coef)
+        return {"loss_query_bias": (loss * weights).sum() / weights.sum().clamp_min(1.0)}
     
     def loss_masks(self, outputs, targets, indices, num_masks):
         """Compute the losses related to the masks: the focal loss and the dice loss.
@@ -240,6 +252,7 @@ class SetCriterion(nn.Module):
         loss_map = {
             'labels': self.loss_labels,
             'masks': self.loss_masks,
+            'query_bias': self.loss_query_bias,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)

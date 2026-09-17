@@ -316,6 +316,9 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         self.query_feat = nn.Embedding(num_queries, hidden_dim)
         # learnable query p.e.
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        self.query_bias_embed = nn.Linear(hidden_dim, num_queries)
+        nn.init.zeros_(self.query_bias_embed.weight)
+        nn.init.zeros_(self.query_bias_embed.bias)
 
         # level embedding (we always use 3 scales)
         self.num_feature_levels = 3
@@ -379,6 +382,11 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
             pos[-1] = pos[-1].permute(2, 0, 1)
             src[-1] = src[-1].permute(2, 0, 1)
 
+        # Pool all projected image tokens once. These logits are deliberately
+        # reused for matching and supervision at every decoder depth.
+        pooled_image = torch.cat(src, dim=0).mean(0)
+        query_bias_logits = self.query_bias_embed(pooled_image)
+
         _, bs, _ = src[0].shape
 
         # QxNxC
@@ -424,8 +432,10 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         out = {
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
+            'query_bias_logits': query_bias_logits,
             'aux_outputs': self._set_aux_loss(
-                predictions_class if self.mask_classification else None, predictions_mask
+                predictions_class if self.mask_classification else None, predictions_mask,
+                query_bias_logits
             )
         }
         return out
@@ -448,13 +458,13 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         return outputs_class, outputs_mask, attn_mask
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_seg_masks):
+    def _set_aux_loss(self, outputs_class, outputs_seg_masks, query_bias_logits):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
         if self.mask_classification:
             return [
-                {"pred_logits": a, "pred_masks": b}
+                {"pred_logits": a, "pred_masks": b, "query_bias_logits": query_bias_logits}
                 for a, b in zip(outputs_class[:-1], outputs_seg_masks[:-1])
             ]
         else:

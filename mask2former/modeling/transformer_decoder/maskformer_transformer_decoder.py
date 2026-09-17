@@ -91,6 +91,9 @@ class StandardTransformerDecoder(nn.Module):
         hidden_dim = transformer.d_model
 
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        self.query_bias_embed = nn.Linear(hidden_dim, num_queries)
+        nn.init.zeros_(self.query_bias_embed.weight)
+        nn.init.zeros_(self.query_bias_embed.bias)
 
         if in_channels != hidden_dim or enforce_input_project:
             self.input_proj = Conv2d(in_channels, hidden_dim, kernel_size=1)
@@ -133,11 +136,13 @@ class StandardTransformerDecoder(nn.Module):
         pos = self.pe_layer(x, mask)
 
         src = x
-        hs, memory = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos)
+        projected_src = self.input_proj(src)
+        query_bias_logits = self.query_bias_embed(projected_src.flatten(2).mean(-1))
+        hs, memory = self.transformer(projected_src, mask, self.query_embed.weight, pos)
 
         if self.mask_classification:
             outputs_class = self.class_embed(hs)
-            out = {"pred_logits": outputs_class[-1]}
+            out = {"pred_logits": outputs_class[-1], "query_bias_logits": query_bias_logits}
         else:
             out = {}
 
@@ -147,7 +152,8 @@ class StandardTransformerDecoder(nn.Module):
             outputs_seg_masks = torch.einsum("lbqc,bchw->lbqhw", mask_embed, mask_features)
             out["pred_masks"] = outputs_seg_masks[-1]
             out["aux_outputs"] = self._set_aux_loss(
-                outputs_class if self.mask_classification else None, outputs_seg_masks
+                outputs_class if self.mask_classification else None, outputs_seg_masks,
+                query_bias_logits
             )
         else:
             # FIXME h_boxes takes the last one computed, keep this in mind
@@ -158,13 +164,13 @@ class StandardTransformerDecoder(nn.Module):
         return out
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_seg_masks):
+    def _set_aux_loss(self, outputs_class, outputs_seg_masks, query_bias_logits):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
         if self.mask_classification:
             return [
-                {"pred_logits": a, "pred_masks": b}
+                {"pred_logits": a, "pred_masks": b, "query_bias_logits": query_bias_logits}
                 for a, b in zip(outputs_class[:-1], outputs_seg_masks[:-1])
             ]
         else:

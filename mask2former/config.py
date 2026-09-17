@@ -49,6 +49,9 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.CLASS_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.DICE_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.MASK_WEIGHT = 20.0
+    # Image-conditioned prior for selecting object queries. The same Q logits
+    # are used by every decoder layer for matching and binary supervision.
+    cfg.MODEL.MASK_FORMER.QUERY_BIAS_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.MASK_LOSS_TYPE = "point"
 
     # transformer config

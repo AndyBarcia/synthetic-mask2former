@@ -106,17 +106,24 @@ class MaskFormer(nn.Module):
         class_weight = cfg.MODEL.MASK_FORMER.CLASS_WEIGHT
         dice_weight = cfg.MODEL.MASK_FORMER.DICE_WEIGHT
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
+        query_bias_weight = cfg.MODEL.MASK_FORMER.QUERY_BIAS_WEIGHT
 
         # building criterion
         matcher = HungarianMatcher(
             cost_class=class_weight,
             cost_mask=mask_weight,
             cost_dice=dice_weight,
+            cost_query_bias=query_bias_weight,
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
             mask_loss_type=cfg.MODEL.MASK_FORMER.MASK_LOSS_TYPE,
         )
 
-        weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight}
+        weight_dict = {
+            "loss_ce": class_weight,
+            "loss_mask": mask_weight,
+            "loss_dice": dice_weight,
+            "loss_query_bias": query_bias_weight,
+        }
 
         if deep_supervision:
             dec_layers = cfg.MODEL.MASK_FORMER.DEC_LAYERS
@@ -125,7 +132,7 @@ class MaskFormer(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
 
-        losses = ["labels", "masks"]
+        losses = ["labels", "masks", "query_bias"]
 
         criterion = SetCriterion(
             sem_seg_head.num_classes,

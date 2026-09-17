@@ -103,7 +103,7 @@ class HungarianMatcher(nn.Module):
 
     def __init__(self, cost_class: float = 1, cost_mask: float = 1,
                  cost_dice: float = 1, num_points: int = 0,
-                 mask_loss_type: str = "point"):
+                 mask_loss_type: str = "point", cost_query_bias: float = 1):
         """Creates the matcher
 
         Params:
@@ -115,6 +115,7 @@ class HungarianMatcher(nn.Module):
         self.cost_class = cost_class
         self.cost_mask = cost_mask
         self.cost_dice = cost_dice
+        self.cost_query_bias = cost_query_bias
 
         assert cost_class != 0 or cost_mask != 0 or cost_dice != 0, "all costs cant be 0"
 
@@ -197,6 +198,11 @@ class HungarianMatcher(nn.Module):
                 + self.cost_class * cost_class
                 + self.cost_dice * cost_dice
             )
+            # This is a query-selection prior, so its row cost is shared by all
+            # targets. High activation makes a query cheaper to select.
+            if "query_bias_logits" in outputs:
+                query_bias_cost = -outputs["query_bias_logits"][b].float().sigmoid()
+                C = C + self.cost_query_bias * query_bias_cost[:, None]
             C = C.reshape(num_queries, -1).cpu()
 
             indices.append(linear_sum_assignment(C))
@@ -235,6 +241,7 @@ class HungarianMatcher(nn.Module):
             "cost_class: {}".format(self.cost_class),
             "cost_mask: {}".format(self.cost_mask),
             "cost_dice: {}".format(self.cost_dice),
+            "cost_query_bias: {}".format(self.cost_query_bias),
             "mask_loss_type: {}".format(self.mask_loss_type),
         ]
         lines = [head] + [" " * _repr_indent + line for line in body]
