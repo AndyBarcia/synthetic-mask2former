@@ -227,6 +227,7 @@ class MaskFormer(nn.Module):
         else:
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
+            query_bias_results = outputs["query_bias_logits"].sigmoid()
             # upsample masks
             mask_pred_results = F.interpolate(
                 mask_pred_results,
@@ -238,8 +239,12 @@ class MaskFormer(nn.Module):
             del outputs
 
             processed_results = []
-            for mask_cls_result, mask_pred_result, input_per_image, image_size in zip(
-                mask_cls_results, mask_pred_results, batched_inputs, images.image_sizes
+            for mask_cls_result, mask_pred_result, query_bias_result, input_per_image, image_size in zip(
+                mask_cls_results,
+                mask_pred_results,
+                query_bias_results,
+                batched_inputs,
+                images.image_sizes,
             ):
                 height = input_per_image.get("height", image_size[0])
                 width = input_per_image.get("width", image_size[1])
@@ -250,22 +255,29 @@ class MaskFormer(nn.Module):
                         mask_pred_result, image_size, height, width
                     )
                     mask_cls_result = mask_cls_result.to(mask_pred_result)
+                    query_bias_result = query_bias_result.to(mask_pred_result)
 
                 # semantic segmentation inference
                 if self.semantic_on:
-                    r = retry_if_cuda_oom(self.semantic_inference)(mask_cls_result, mask_pred_result)
+                    r = retry_if_cuda_oom(self.semantic_inference)(
+                        mask_cls_result, mask_pred_result, query_bias_result
+                    )
                     if not self.sem_seg_postprocess_before_inference:
                         r = retry_if_cuda_oom(sem_seg_postprocess)(r, image_size, height, width)
                     processed_results[-1]["sem_seg"] = r
 
                 # panoptic segmentation inference
                 if self.panoptic_on:
-                    panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(mask_cls_result, mask_pred_result)
+                    panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(
+                        mask_cls_result, mask_pred_result, query_bias_result
+                    )
                     processed_results[-1]["panoptic_seg"] = panoptic_r
                 
                 # instance segmentation inference
                 if self.instance_on:
-                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result)
+                    instance_r = retry_if_cuda_oom(self.instance_inference)(
+                        mask_cls_result, mask_pred_result, query_bias_result
+                    )
                     processed_results[-1]["instances"] = instance_r
 
             return processed_results
@@ -286,14 +298,15 @@ class MaskFormer(nn.Module):
             )
         return new_targets
 
-    def semantic_inference(self, mask_cls, mask_pred):
-        mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1]
+    def semantic_inference(self, mask_cls, mask_pred, query_bias):
+        mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1] * query_bias[:, None]
         mask_pred = mask_pred.sigmoid()
         semseg = torch.einsum("qc,qhw->chw", mask_cls, mask_pred)
         return semseg
 
-    def panoptic_inference(self, mask_cls, mask_pred):
+    def panoptic_inference(self, mask_cls, mask_pred, query_bias):
         scores, labels = F.softmax(mask_cls, dim=-1).max(-1)
+        scores = scores * query_bias
         mask_pred = mask_pred.sigmoid()
 
         keep = labels.ne(self.sem_seg_head.num_classes) & (scores > self.object_mask_threshold)
@@ -350,12 +363,12 @@ class MaskFormer(nn.Module):
 
             return panoptic_seg, segments_info
 
-    def instance_inference(self, mask_cls, mask_pred):
+    def instance_inference(self, mask_cls, mask_pred, query_bias):
         # mask_pred is already processed to have the same shape as original input
         image_size = mask_pred.shape[-2:]
 
         # [Q, K]
-        scores = F.softmax(mask_cls, dim=-1)[:, :-1]
+        scores = F.softmax(mask_cls, dim=-1)[:, :-1] * query_bias[:, None]
         labels = torch.arange(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(self.num_queries, 1).flatten(0, 1)
         # scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.num_queries, sorted=False)
         scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.test_topk_per_image, sorted=False)
