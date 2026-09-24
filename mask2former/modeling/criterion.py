@@ -97,7 +97,7 @@ class SetCriterion(nn.Module):
 
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
                  num_points, oversample_ratio, importance_sample_ratio,
-                 mask_loss_type="point"):
+                 mask_loss_type="point", object_decoder=None):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -112,6 +112,7 @@ class SetCriterion(nn.Module):
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
         self.losses = losses
+        self.object_decoder = object_decoder
         # pointwise mask loss parameters
         self.num_points = num_points
         self.oversample_ratio = oversample_ratio
@@ -145,6 +146,33 @@ class SetCriterion(nn.Module):
         loss = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
         weights = torch.where(target.bool(), 1.0, self.eos_coef)
         return {"loss_query_bias": (loss * weights).sum() / weights.sum().clamp_min(1.0)}
+
+    def loss_object_decoder(self, outputs, indices):
+        """Teacher-force matched queries in descending query-bias order, then EOF."""
+        embeddings = outputs["mask_embeddings"]
+        batch_size, num_queries = embeddings.shape[:2]
+        ordered = []
+        for batch_index, (src_indices, _) in enumerate(indices):
+            src_indices = src_indices.to(embeddings.device)
+            bias = outputs["query_bias_logits"][batch_index, src_indices].detach()
+            ordered.append(src_indices[torch.argsort(bias, descending=True, stable=True)])
+        steps = max(len(indices_per_image) for indices_per_image in ordered) + 1
+        previous = torch.full((batch_size, steps), num_queries, dtype=torch.long, device=embeddings.device)
+        targets = torch.full((batch_size, steps), -100, dtype=torch.long, device=embeddings.device)
+        previous[:, 0] = -1  # beginning-of-sequence embedding
+        for batch_index, indices_per_image in enumerate(ordered):
+            count = len(indices_per_image)
+            targets[batch_index, :count] = indices_per_image
+            targets[batch_index, count] = num_queries
+            if count:
+                previous[batch_index, 1:count + 1] = indices_per_image
+        image_regions = self.object_decoder.prepare_regions(
+            outputs["pred_masks"], outputs["object_decoder_image_sizes"]
+        )
+        logits = self.object_decoder(
+            embeddings, outputs["object_decoder_image_features"], image_regions, previous
+        )
+        return {"loss_object_decoder": F.cross_entropy(logits.flatten(0, 1), targets.flatten())}
     
     def loss_masks(self, outputs, targets, indices, num_masks):
         """Compute the losses related to the masks: the focal loss and the dice loss.
@@ -272,6 +300,8 @@ class SetCriterion(nn.Module):
         losses = {}
         for loss in self.losses:
             losses.update(self.get_loss(loss, outputs, targets, indices, num_masks))
+        if self.object_decoder is not None:
+            losses.update(self.loss_object_decoder(outputs, indices))
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if "aux_outputs" in outputs:

@@ -432,6 +432,14 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         out = {
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
+            'mask_embeddings': self.mask_embed(self.decoder_norm(output).transpose(0, 1)),
+            # Reuse the main decoder's projected features and spatial positions.
+            # The object decoder cross-attends to one scale per layer.
+            'object_decoder_image_features': [
+                (features + positions).transpose(0, 1)
+                for features, positions in zip(src, pos)
+            ],
+            'object_decoder_image_sizes': size_list,
             'query_bias_logits': query_bias_logits,
             'aux_outputs': self._set_aux_loss(
                 predictions_class if self.mask_classification else None, predictions_mask,

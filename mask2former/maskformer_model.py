@@ -15,6 +15,7 @@ from detectron2.utils.memory import retry_if_cuda_oom
 
 from .modeling.criterion import SetCriterion
 from .modeling.matcher import HungarianMatcher
+from .modeling.object_decoder import ObjectDecoder
 
 
 @META_ARCH_REGISTRY.register()
@@ -125,11 +126,17 @@ class MaskFormer(nn.Module):
             "loss_query_bias": query_bias_weight,
         }
 
+        use_object_decoder = (
+            cfg.MODEL.MASK_FORMER.TRANSFORMER_DECODER_NAME == "MultiScaleMaskedTransformerDecoder"
+        )
+        if use_object_decoder:
+            weight_dict["loss_object_decoder"] = 1.0
+
         if deep_supervision:
             dec_layers = cfg.MODEL.MASK_FORMER.DEC_LAYERS
             aux_weight_dict = {}
             for i in range(dec_layers - 1):
-                aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
+                aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items() if k != "loss_object_decoder"})
             weight_dict.update(aux_weight_dict)
 
         losses = ["labels", "masks", "query_bias"]
@@ -144,6 +151,14 @@ class MaskFormer(nn.Module):
             oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
             mask_loss_type=cfg.MODEL.MASK_FORMER.MASK_LOSS_TYPE,
+            object_decoder=ObjectDecoder(
+                cfg.MODEL.SEM_SEG_HEAD.MASK_DIM,
+                cfg.MODEL.MASK_FORMER.HIDDEN_DIM,
+                cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES,
+                cfg.MODEL.MASK_FORMER.OBJECT_DEC_LAYERS,
+                cfg.MODEL.MASK_FORMER.NHEADS,
+                cfg.MODEL.MASK_FORMER.DIM_FEEDFORWARD,
+            ) if use_object_decoder else None,
         )
 
         return {
@@ -228,6 +243,14 @@ class MaskFormer(nn.Module):
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
             query_bias_results = outputs["query_bias_logits"].sigmoid()
+            generated_objects = (
+                self.criterion.object_decoder.generate(
+                    outputs["mask_embeddings"], outputs["object_decoder_image_features"],
+                    outputs["pred_masks"], outputs["object_decoder_image_sizes"],
+                )
+                if self.criterion.object_decoder is not None
+                else [(None, None, None)] * len(batched_inputs)
+            )
             # upsample masks
             mask_pred_results = F.interpolate(
                 mask_pred_results,
@@ -239,16 +262,24 @@ class MaskFormer(nn.Module):
             del outputs
 
             processed_results = []
-            for mask_cls_result, mask_pred_result, query_bias_result, input_per_image, image_size in zip(
+            for mask_cls_result, mask_pred_result, query_bias_result, generated, input_per_image, image_size in zip(
                 mask_cls_results,
                 mask_pred_results,
                 query_bias_results,
+                generated_objects,
                 batched_inputs,
                 images.image_sizes,
             ):
+                object_order, object_log_odds, object_probabilities = generated
                 height = input_per_image.get("height", image_size[0])
                 width = input_per_image.get("width", image_size[1])
                 processed_results.append({})
+                if object_order is not None:
+                    processed_results[-1]["object_decoder"] = {
+                        "query_indices": object_order,
+                        "mask_vs_eof_logits": object_log_odds,
+                        "mask_vs_eof_probabilities": object_probabilities,
+                    }
 
                 if self.sem_seg_postprocess_before_inference:
                     mask_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
@@ -259,8 +290,12 @@ class MaskFormer(nn.Module):
 
                 # semantic segmentation inference
                 if self.semantic_on:
+                    semantic_query_weights = query_bias_result
+                    if object_order is not None:
+                        semantic_query_weights = torch.zeros_like(query_bias_result)
+                        semantic_query_weights[object_order] = 1
                     r = retry_if_cuda_oom(self.semantic_inference)(
-                        mask_cls_result, mask_pred_result, query_bias_result
+                        mask_cls_result, mask_pred_result, semantic_query_weights
                     )
                     if not self.sem_seg_postprocess_before_inference:
                         r = retry_if_cuda_oom(sem_seg_postprocess)(r, image_size, height, width)
@@ -269,7 +304,7 @@ class MaskFormer(nn.Module):
                 # panoptic segmentation inference
                 if self.panoptic_on:
                     panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(
-                        mask_cls_result, mask_pred_result, query_bias_result
+                        mask_cls_result, mask_pred_result, query_bias_result, object_order
                     )
                     processed_results[-1]["panoptic_seg"] = panoptic_r
                 
@@ -304,79 +339,53 @@ class MaskFormer(nn.Module):
         semseg = torch.einsum("qc,qhw->chw", mask_cls, mask_pred)
         return semseg
 
-    def panoptic_inference(self, mask_cls, mask_pred, query_bias):
-        scores, labels = F.softmax(mask_cls[..., :-1], dim=-1).max(-1)
-        scores = scores * query_bias
-        mask_pred = mask_pred.sigmoid()
+    def panoptic_inference(self, mask_cls, mask_pred, query_bias, object_order=None):
+        class_scores, labels = F.softmax(mask_cls[..., :-1], dim=-1).max(-1)
+        if object_order is None:
+            # Compatibility with a transformer that has no object decoder.
+            scores = class_scores * query_bias
+            kept = torch.where(scores > self.object_mask_threshold)[0]
+            object_order = kept[torch.argsort(scores[kept], descending=True)]
 
-        keep = scores > self.object_mask_threshold
-        cur_scores = scores[keep]
-        cur_classes = labels[keep]
-        cur_masks = mask_pred[keep]
-        cur_mask_cls = mask_cls[keep]
-        cur_mask_cls = cur_mask_cls[:, :-1]
-
-        cur_prob_masks = cur_scores.view(-1, 1, 1) * cur_masks
-
-        h, w = cur_masks.shape[-2:]
-        panoptic_seg = torch.zeros((h, w), dtype=torch.int32, device=cur_masks.device)
+        panoptic_seg = torch.zeros(mask_pred.shape[-2:], dtype=torch.int32, device=mask_pred.device)
         segments_info = []
+        stuff_ids = {}
+        thing_classes = set(self.metadata.thing_dataset_id_to_contiguous_id.values())
 
-        current_segment_id = 0
+        # Generation runs from front to back; draw in reverse so front masks win overlaps.
+        for query_index in object_order.flip(0).tolist():
+            mask = mask_pred[query_index] > 0
+            if not mask.any():
+                continue
+            category_id = int(labels[query_index])
+            isthing = category_id in thing_classes
+            if not isthing and category_id in stuff_ids:
+                segment_id = stuff_ids[category_id]
+            else:
+                segment_id = len(segments_info) + 1
+                segments_info.append({
+                    "id": segment_id,
+                    "isthing": isthing,
+                    "category_id": category_id,
+                })
+                if not isthing:
+                    stuff_ids[category_id] = segment_id
+            panoptic_seg[mask] = segment_id
 
-        if cur_masks.shape[0] == 0:
-            # We didn't detect any mask :(
-            return panoptic_seg, segments_info
-        else:
-            # take argmax
-            cur_mask_ids = cur_prob_masks.argmax(0)
-            stuff_memory_list = {}
-            for k in range(cur_classes.shape[0]):
-                pred_class = cur_classes[k].item()
-                isthing = pred_class in self.metadata.thing_dataset_id_to_contiguous_id.values()
-                mask_area = (cur_mask_ids == k).sum().item()
-                original_area = (cur_masks[k] >= 0.5).sum().item()
-                mask = (cur_mask_ids == k) & (cur_masks[k] >= 0.5)
-
-                if mask_area > 0 and original_area > 0 and mask.sum().item() > 0:
-                    if mask_area / original_area < self.overlap_threshold:
-                        continue
-
-                    # merge stuff regions
-                    if not isthing:
-                        if int(pred_class) in stuff_memory_list.keys():
-                            panoptic_seg[mask] = stuff_memory_list[int(pred_class)]
-                            continue
-                        else:
-                            stuff_memory_list[int(pred_class)] = current_segment_id + 1
-
-                    current_segment_id += 1
-                    panoptic_seg[mask] = current_segment_id
-
-                    segments_info.append(
-                        {
-                            "id": current_segment_id,
-                            "isthing": bool(isthing),
-                            "category_id": int(pred_class),
-                        }
-                    )
-
-            return panoptic_seg, segments_info
+        # A later front mask may have covered an earlier segment completely.
+        visible_ids = set(panoptic_seg.unique().tolist())
+        segments_info = [segment for segment in segments_info if segment["id"] in visible_ids]
+        return panoptic_seg, segments_info
 
     def instance_inference(self, mask_cls, mask_pred, query_bias):
         # mask_pred is already processed to have the same shape as original input
         image_size = mask_pred.shape[-2:]
 
-        # [Q, K]
-        scores = F.softmax(mask_cls[:, :-1], dim=-1) * query_bias[:, None]
-        labels = torch.arange(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(self.num_queries, 1).flatten(0, 1)
-        # scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.num_queries, sorted=False)
-        scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.test_topk_per_image, sorted=False)
-        labels_per_image = labels[topk_indices]
-
-        topk_indices = topk_indices // self.sem_seg_head.num_classes
-        # mask_pred = mask_pred.unsqueeze(1).repeat(1, self.sem_seg_head.num_classes, 1).flatten(0, 1)
-        mask_pred = mask_pred[topk_indices]
+        class_scores, labels_per_image = F.softmax(mask_cls[:, :-1], dim=-1).max(-1)
+        order = torch.argsort(query_bias, descending=True, stable=True)
+        scores_per_image = class_scores[order] * query_bias[order]
+        labels_per_image = labels_per_image[order]
+        mask_pred = mask_pred[order]
 
         # if this is panoptic segmentation, we only keep the "thing" classes
         if self.panoptic_on:
