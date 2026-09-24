@@ -103,7 +103,7 @@ class SetCriterion(nn.Module):
             num_classes: number of object categories, omitting the special no-object category
             matcher: module able to compute a matching between targets and proposals
             weight_dict: dict containing as key the names of the losses and as values their relative weight.
-            eos_coef: relative classification weight applied to the no-object category
+            eos_coef: relative weight applied to unmatched queries in the query-bias loss
             losses: list of all the losses to be applied. See get_loss for list of available losses.
         """
         super().__init__()
@@ -112,10 +112,6 @@ class SetCriterion(nn.Module):
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
         self.losses = losses
-        empty_weight = torch.ones(self.num_classes + 1)
-        empty_weight[-1] = self.eos_coef
-        self.register_buffer("empty_weight", empty_weight)
-
         # pointwise mask loss parameters
         self.num_points = num_points
         self.oversample_ratio = oversample_ratio
@@ -127,22 +123,16 @@ class SetCriterion(nn.Module):
         self.mask_loss_type = mask_loss_type
 
     def loss_labels(self, outputs, targets, indices, num_masks):
-        """Classification loss (NLL)
-        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
-        """
+        """Classify matched queries among foreground classes only."""
         assert "pred_logits" in outputs
-        src_logits = outputs["pred_logits"].float()
-
         idx = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(
-            src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device
-        )
-        target_classes[idx] = target_classes_o
-
-        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
-        losses = {"loss_ce": loss_ce}
-        return losses
+        # Keep the legacy output shape for checkpoint compatibility, but never
+        # normalize over or train its final (background) logit.
+        src_logits = outputs["pred_logits"][idx][..., :self.num_classes].float()
+        if src_logits.shape[0] == 0:
+            return {"loss_ce": src_logits.sum()}
+        return {"loss_ce": F.cross_entropy(src_logits, target_classes_o)}
 
     def loss_query_bias(self, outputs, targets, indices, num_masks):
         """Binary query-selection loss: matched queries are positive."""
