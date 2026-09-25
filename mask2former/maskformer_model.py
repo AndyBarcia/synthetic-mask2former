@@ -33,6 +33,7 @@ class MaskFormer(nn.Module):
         criterion: nn.Module,
         num_queries: int,
         object_mask_threshold: float,
+        panoptic_paint_order: str,
         overlap_threshold: float,
         metadata,
         size_divisibility: int,
@@ -76,6 +77,9 @@ class MaskFormer(nn.Module):
         self.num_queries = num_queries
         self.overlap_threshold = overlap_threshold
         self.object_mask_threshold = object_mask_threshold
+        if panoptic_paint_order not in ("reverse", "forward"):
+            raise ValueError(f"Unknown panoptic paint order: {panoptic_paint_order}")
+        self.panoptic_paint_order = panoptic_paint_order
         self.metadata = metadata
         if size_divisibility < 0:
             # use backbone size_divisibility if not set
@@ -167,6 +171,7 @@ class MaskFormer(nn.Module):
             "criterion": criterion,
             "num_queries": cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES,
             "object_mask_threshold": cfg.MODEL.MASK_FORMER.TEST.OBJECT_MASK_THRESHOLD,
+            "panoptic_paint_order": cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_PAINT_ORDER,
             "overlap_threshold": cfg.MODEL.MASK_FORMER.TEST.OVERLAP_THRESHOLD,
             "metadata": MetadataCatalog.get(cfg.DATASETS.TRAIN[0]),
             "size_divisibility": cfg.MODEL.MASK_FORMER.SIZE_DIVISIBILITY,
@@ -352,8 +357,8 @@ class MaskFormer(nn.Module):
         stuff_ids = {}
         thing_classes = set(self.metadata.thing_dataset_id_to_contiguous_id.values())
 
-        # Generation runs from front to back; draw in reverse so front masks win overlaps.
-        for query_index in object_order.flip(0).tolist():
+        paint_order = object_order.flip(0) if self.panoptic_paint_order == "reverse" else object_order
+        for query_index in paint_order.tolist():
             mask = mask_pred[query_index] > 0
             if not mask.any():
                 continue
