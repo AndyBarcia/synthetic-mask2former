@@ -58,6 +58,7 @@ from mask2former import (
     add_maskformer2_config,
 )
 from mask2former.data.synthetic_scene_batch_loader import SyntheticSceneBatchLoader
+from mask2former.utils.rl_logging import RLMetricPrinter
 from mask2former.evaluation.synthetic_scene_panoptic_evaluation import (
     SyntheticScenePanopticEvaluator,
 )
@@ -70,6 +71,9 @@ class Trainer(DefaultTrainer):
     """
     Extension of the Trainer class adapted to MaskFormer.
     """
+
+    def build_writers(self):
+        return super().build_writers() + [RLMetricPrinter()]
 
     @classmethod
     def build_evaluator(cls, cfg, dataset_name, output_folder=None):

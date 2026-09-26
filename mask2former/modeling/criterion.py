@@ -16,6 +16,7 @@ from detectron2.projects.point_rend.point_features import (
 )
 
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
+from ..utils.rl_logging import record_rl_diagnostics
 from .utils import compute_mask_block_counts
 
 
@@ -271,12 +272,18 @@ class SetCriterion(nn.Module):
             outputs["pred_masks"].detach(),
             outputs["object_decoder_image_sizes"],
         )
-        sampled, log_probability = self.object_decoder.rollout(
-            *policy_inputs, sample=True, max_steps=self.object_rl_max_steps)
+        sampled, log_probability, sampled_stats = self.object_decoder.rollout(
+            *policy_inputs, sample=True, max_steps=self.object_rl_max_steps,
+            return_diagnostics=True)
         with torch.no_grad():
-            greedy, _ = self.object_decoder.rollout(
-                *policy_inputs, sample=False, max_steps=self.object_rl_max_steps)
-            advantage = self.object_reward(sampled, outputs, targets) - self.object_reward(greedy, outputs, targets)
+            greedy, _, greedy_stats = self.object_decoder.rollout(
+                *policy_inputs, sample=False, max_steps=self.object_rl_max_steps,
+                return_diagnostics=True)
+            sampled_reward = self.object_reward(sampled, outputs, targets)
+            greedy_reward = self.object_reward(greedy, outputs, targets)
+            advantage = sampled_reward - greedy_reward
+            record_rl_diagnostics(sampled_reward, greedy_reward, sampled, greedy,
+                                  sampled_stats, greedy_stats, log_probability)
         return {"loss_object_rl": -(advantage * log_probability).mean()}
     
     def loss_masks(self, outputs, targets, indices, num_masks):

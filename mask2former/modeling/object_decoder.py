@@ -160,7 +160,7 @@ class ObjectDecoder(nn.Module):
         ]
 
     def rollout(self, mask_embeddings, image_features, mask_logits, image_sizes,
-                sample=True, max_steps=32):
+                sample=True, max_steps=32, return_diagnostics=False):
         """Generate query orders and sequence log probabilities for policy gradients.
 
         A capped rollout is treated as an implicit EOF after the last selected query.
@@ -174,12 +174,24 @@ class ObjectDecoder(nn.Module):
         previous = torch.full((batch_size, 1), -1, dtype=torch.long, device=mask_embeddings.device)
         orders = [[] for _ in range(batch_size)]
         log_probability = mask_embeddings.new_zeros(batch_size)
+        diagnostics = {
+            key: torch.zeros(batch_size, device=mask_embeddings.device)
+            for key in ("actions", "entropy", "top1_probability", "eof_probability", "available_masks")
+        } if return_diagnostics else None
         for _ in range(max_steps):
             logits = self(mask_embeddings, image_features, regions, previous, exclusions)[:, -1].clone()
             logits[:, :num_queries].masked_fill_(unavailable.clone(), -torch.inf)
             distribution = torch.distributions.Categorical(logits=logits)
             token = distribution.sample() if sample else logits.argmax(-1)
             active = ~finished
+            if diagnostics is not None:
+                with torch.no_grad():
+                    probabilities = distribution.probs.detach()
+                    diagnostics["actions"] += active.float()
+                    diagnostics["entropy"] += torch.where(active, distribution.entropy().detach(), 0)
+                    diagnostics["top1_probability"] += torch.where(active, probabilities.max(-1).values, 0)
+                    diagnostics["eof_probability"] += torch.where(active, probabilities[:, -1], 0)
+                    diagnostics["available_masks"] += torch.where(active, (~unavailable).sum(-1), 0)
             if sample:
                 log_probability = log_probability + torch.where(
                     active, distribution.log_prob(token), 0.0
@@ -194,4 +206,8 @@ class ObjectDecoder(nn.Module):
             if finished.all():
                 break
             previous = torch.cat((previous, torch.where(finished, num_queries, token)[:, None]), dim=1)
+        if diagnostics is not None:
+            diagnostics["length"] = torch.tensor([len(order) for order in orders], device=finished.device).float()
+            diagnostics["truncated"] = (~finished).float()
+            return orders, log_probability, diagnostics
         return orders, log_probability
