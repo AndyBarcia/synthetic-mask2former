@@ -169,8 +169,12 @@ class SetCriterion(nn.Module):
         image_regions = self.object_decoder.prepare_regions(
             outputs["pred_masks"], outputs["object_decoder_image_sizes"]
         )
+        vocabulary_exclusions = self.object_decoder.prepare_vocabulary_exclusions(
+            outputs["pred_masks"]
+        )
         logits = self.object_decoder(
-            embeddings, outputs["object_decoder_image_features"], image_regions, previous
+            embeddings, outputs["object_decoder_image_features"], image_regions, previous,
+            vocabulary_exclusions,
         )
         return {"loss_object_decoder": F.cross_entropy(logits.flatten(0, 1), targets.flatten())}
     

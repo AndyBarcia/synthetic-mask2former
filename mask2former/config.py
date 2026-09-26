@@ -61,6 +61,8 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.ENC_LAYERS = 0
     cfg.MODEL.MASK_FORMER.DEC_LAYERS = 6
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_LAYERS = 5
+    # Exclude selected masks and other vocabulary masks above this predicted-mask IoU.
+    cfg.MODEL.MASK_FORMER.OBJECT_DEC_MASK_IOU_THRESHOLD = 0.8
     cfg.MODEL.MASK_FORMER.PRE_NORM = False
 
     cfg.MODEL.MASK_FORMER.HIDDEN_DIM = 256

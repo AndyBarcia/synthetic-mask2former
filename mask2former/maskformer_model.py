@@ -162,6 +162,7 @@ class MaskFormer(nn.Module):
                 cfg.MODEL.MASK_FORMER.OBJECT_DEC_LAYERS,
                 cfg.MODEL.MASK_FORMER.NHEADS,
                 cfg.MODEL.MASK_FORMER.DIM_FEEDFORWARD,
+                cfg.MODEL.MASK_FORMER.OBJECT_DEC_MASK_IOU_THRESHOLD,
             ) if use_object_decoder else None,
         )
 
