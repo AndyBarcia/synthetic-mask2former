@@ -168,14 +168,15 @@ class ObjectDecoder(nn.Module):
         batch_size, num_queries = mask_embeddings.shape[:2]
         max_steps = min(max_steps, num_queries + 1)
         regions = self.prepare_regions(mask_logits, image_sizes)
-        selected = torch.zeros(batch_size, num_queries, dtype=torch.bool, device=mask_embeddings.device)
+        exclusions = self.prepare_vocabulary_exclusions(mask_logits)
+        unavailable = torch.zeros(batch_size, num_queries, dtype=torch.bool, device=mask_embeddings.device)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=mask_embeddings.device)
         previous = torch.full((batch_size, 1), -1, dtype=torch.long, device=mask_embeddings.device)
         orders = [[] for _ in range(batch_size)]
         log_probability = mask_embeddings.new_zeros(batch_size)
         for _ in range(max_steps):
-            logits = self(mask_embeddings, image_features, regions, previous)[:, -1].clone()
-            logits[:, :num_queries].masked_fill_(selected.clone(), -torch.inf)
+            logits = self(mask_embeddings, image_features, regions, previous, exclusions)[:, -1].clone()
+            logits[:, :num_queries].masked_fill_(unavailable.clone(), -torch.inf)
             distribution = torch.distributions.Categorical(logits=logits)
             token = distribution.sample() if sample else logits.argmax(-1)
             active = ~finished
@@ -187,7 +188,8 @@ class ObjectDecoder(nn.Module):
                 if active[index] and token[index] != num_queries:
                     orders[index].append(int(token[index]))
             chosen = active & (token != num_queries)
-            selected[torch.arange(batch_size, device=selected.device)[chosen], token[chosen]] = True
+            chosen_batch = torch.arange(batch_size, device=unavailable.device)[chosen]
+            unavailable[chosen_batch] |= exclusions[chosen_batch, token[chosen]]
             finished = finished | (token == num_queries)
             if finished.all():
                 break
