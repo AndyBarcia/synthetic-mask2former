@@ -6,10 +6,14 @@ from torch.nn import functional as F
 
 
 class ObjectDecoder(nn.Module):
-    def __init__(self, mask_dim, hidden_dim, num_queries, num_layers, num_heads, dim_feedforward):
+    def __init__(self, mask_dim, hidden_dim, num_queries, num_layers, num_heads,
+                 dim_feedforward, mask_iou_threshold=0.8):
         super().__init__()
+        if not 0 <= mask_iou_threshold <= 1:
+            raise ValueError("mask_iou_threshold must be between 0 and 1")
         self.num_queries = num_queries
         self.num_heads = num_heads
+        self.mask_iou_threshold = mask_iou_threshold
         self.mask_projection = nn.Linear(mask_dim, hidden_dim)
         self.bos = nn.Parameter(torch.zeros(hidden_dim))
         self.eof = nn.Parameter(torch.zeros(hidden_dim))
@@ -22,6 +26,13 @@ class ObjectDecoder(nn.Module):
             dropout=0.0, batch_first=True,
         )
         self.layers = nn.TransformerDecoder(layer, num_layers=num_layers)
+        self.vocabulary_attention = nn.ModuleList([
+            nn.MultiheadAttention(hidden_dim, num_heads, dropout=0.0, batch_first=True)
+            for _ in range(num_layers)
+        ])
+        self.vocabulary_norm = nn.ModuleList([
+            nn.LayerNorm(hidden_dim) for _ in range(num_layers)
+        ])
         self.norm = nn.LayerNorm(hidden_dim)
         self.scale = hidden_dim ** -0.5
 
@@ -34,6 +45,28 @@ class ObjectDecoder(nn.Module):
                  .flatten(2) > 0)
                 for size in image_sizes
             ]
+
+    def prepare_vocabulary_exclusions(self, mask_logits):
+        """Find masks to exclude after selecting each query, including the query itself."""
+        with torch.no_grad():
+            masks = (mask_logits.detach().flatten(2) > 0).float()
+            intersection = torch.bmm(masks, masks.transpose(1, 2))
+            area = masks.sum(-1)
+            union = area[:, :, None] + area[:, None, :] - intersection
+            exclusions = intersection / union.clamp_min(1) > self.mask_iou_threshold
+            identity = torch.eye(masks.shape[1], dtype=torch.bool, device=masks.device)
+            return exclusions | identity
+
+    @staticmethod
+    def _vocabulary_mask(exclusions, previous_tokens):
+        """Exclude selected masks and their IoU neighbors from later positions."""
+        batch_size, num_queries, _ = exclusions.shape
+        indices = previous_tokens.clamp(0, num_queries - 1)
+        prior = exclusions.gather(1, indices.unsqueeze(-1).expand(-1, -1, num_queries))
+        valid = (previous_tokens >= 0) & (previous_tokens < num_queries)
+        blocked = (prior & valid.unsqueeze(-1)).cumsum(dim=1) > 0
+        # EOF remains available even when every mask has been excluded.
+        return F.pad(blocked, (0, 1), value=False)
 
     def _memory_mask(self, regions, previous_tokens):
         """Block the union of masks emitted up to each autoregressive position."""
@@ -50,8 +83,9 @@ class ObjectDecoder(nn.Module):
             batch_size * self.num_heads, previous_tokens.shape[1], spatial_tokens + 1
         )
 
-    def forward(self, mask_embeddings, image_features, image_regions, previous_tokens):
-        """Return next-token logits with causal multi-scale image cross-attention."""
+    def forward(self, mask_embeddings, image_features, image_regions, previous_tokens,
+                vocabulary_exclusions):
+        """Return next-token logits with causal image and vocabulary attention."""
         if len(image_features) != 3 or len(image_regions) != 3:
             raise ValueError("Object decoder requires three image feature levels")
         mask_tokens = self.mask_projection(mask_embeddings)
@@ -65,6 +99,10 @@ class ObjectDecoder(nn.Module):
         steps = previous.shape[1]
         previous = previous + self.position.weight[:steps]
         causal_mask = torch.ones(steps, steps, dtype=torch.bool, device=previous.device).triu(1)
+        vocabulary_mask = self._vocabulary_mask(vocabulary_exclusions, previous_tokens)
+        vocabulary_mask = vocabulary_mask[:, None].expand(-1, self.num_heads, -1, -1).reshape(
+            mask_tokens.shape[0] * self.num_heads, steps, self.num_queries + 1
+        )
         decoded = previous
         for layer_index, layer in enumerate(self.layers.layers):
             level_index = layer_index % len(image_features)
@@ -77,6 +115,11 @@ class ObjectDecoder(nn.Module):
                 tgt_mask=causal_mask,
                 memory_mask=self._memory_mask(image_regions[level_index], previous_tokens),
             )
+            attended = self.vocabulary_attention[layer_index](
+                decoded, vocabulary, vocabulary, attn_mask=vocabulary_mask,
+                need_weights=False,
+            )[0]
+            decoded = self.vocabulary_norm[layer_index](decoded + attended)
         decoded = self.norm(decoded)
         return torch.matmul(decoded, vocabulary.transpose(1, 2)) * self.scale
 
@@ -85,7 +128,8 @@ class ObjectDecoder(nn.Module):
         """Return ordered queries, mask-versus-EOF logits, and probabilities."""
         batch_size, num_queries, _ = mask_embeddings.shape
         image_regions = self.prepare_regions(mask_logits, image_sizes)
-        selected = torch.zeros(batch_size, num_queries, dtype=torch.bool, device=mask_embeddings.device)
+        exclusions = self.prepare_vocabulary_exclusions(mask_logits)
+        unavailable = torch.zeros(batch_size, num_queries, dtype=torch.bool, device=mask_embeddings.device)
         order = torch.full((batch_size, num_queries), -1, dtype=torch.long, device=mask_embeddings.device)
         log_odds = torch.zeros(batch_size, num_queries, dtype=mask_embeddings.dtype, device=mask_embeddings.device)
         probabilities = torch.zeros(batch_size, num_queries, dtype=mask_embeddings.dtype, device=mask_embeddings.device)
@@ -93,12 +137,12 @@ class ObjectDecoder(nn.Module):
         finished = torch.zeros(batch_size, dtype=torch.bool, device=mask_embeddings.device)
         tokens = torch.full((batch_size, 1), -1, dtype=torch.long, device=mask_embeddings.device)
         for _ in range(num_queries):
-            logits = self(mask_embeddings, image_features, image_regions, tokens)[:, -1]
-            logits[:, :num_queries].masked_fill_(selected, -torch.inf)
+            logits = self(mask_embeddings, image_features, image_regions, tokens, exclusions)[:, -1]
+            logits[:, :num_queries].masked_fill_(unavailable, -torch.inf)
             next_token = logits.argmax(-1)
             active = ~finished & (next_token != num_queries)
-            active_batch = torch.arange(batch_size, device=selected.device)[active]
-            selected[active_batch, next_token[active]] = True
+            active_batch = torch.arange(batch_size, device=unavailable.device)[active]
+            unavailable[active_batch] |= exclusions[active_batch, next_token[active]]
             order[active_batch, lengths[active]] = next_token[active]
             relative_logits = logits[active_batch, next_token[active]] - logits[active_batch, num_queries]
             log_odds[active_batch, lengths[active]] = relative_logits
