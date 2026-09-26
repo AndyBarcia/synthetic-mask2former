@@ -61,6 +61,11 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.ENC_LAYERS = 0
     cfg.MODEL.MASK_FORMER.DEC_LAYERS = 6
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_LAYERS = 5
+    cfg.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT = 0.0
+    cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY = False
+    cfg.MODEL.MASK_FORMER.OBJECT_RL_MAX_STEPS = 32
+    # Zero scores at ground-truth resolution; positive values use a square proxy.
+    cfg.MODEL.MASK_FORMER.OBJECT_RL_REWARD_SIZE = 0
     cfg.MODEL.MASK_FORMER.PRE_NORM = False
 
     cfg.MODEL.MASK_FORMER.HIDDEN_DIM = 256

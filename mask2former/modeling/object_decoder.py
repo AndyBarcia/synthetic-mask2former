@@ -114,3 +114,38 @@ class ObjectDecoder(nn.Module):
              probabilities[batch_index, :lengths[batch_index]])
             for batch_index in range(batch_size)
         ]
+
+    def rollout(self, mask_embeddings, image_features, mask_logits, image_sizes,
+                sample=True, max_steps=32):
+        """Generate query orders and sequence log probabilities for policy gradients.
+
+        A capped rollout is treated as an implicit EOF after the last selected query.
+        """
+        batch_size, num_queries = mask_embeddings.shape[:2]
+        max_steps = min(max_steps, num_queries + 1)
+        regions = self.prepare_regions(mask_logits, image_sizes)
+        selected = torch.zeros(batch_size, num_queries, dtype=torch.bool, device=mask_embeddings.device)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=mask_embeddings.device)
+        previous = torch.full((batch_size, 1), -1, dtype=torch.long, device=mask_embeddings.device)
+        orders = [[] for _ in range(batch_size)]
+        log_probability = mask_embeddings.new_zeros(batch_size)
+        for _ in range(max_steps):
+            logits = self(mask_embeddings, image_features, regions, previous)[:, -1].clone()
+            logits[:, :num_queries].masked_fill_(selected.clone(), -torch.inf)
+            distribution = torch.distributions.Categorical(logits=logits)
+            token = distribution.sample() if sample else logits.argmax(-1)
+            active = ~finished
+            if sample:
+                log_probability = log_probability + torch.where(
+                    active, distribution.log_prob(token), 0.0
+                )
+            for index in range(batch_size):
+                if active[index] and token[index] != num_queries:
+                    orders[index].append(int(token[index]))
+            chosen = active & (token != num_queries)
+            selected[torch.arange(batch_size, device=selected.device)[chosen], token[chosen]] = True
+            finished = finished | (token == num_queries)
+            if finished.all():
+                break
+            previous = torch.cat((previous, torch.where(finished, num_queries, token)[:, None]), dim=1)
+        return orders, log_probability
