@@ -232,30 +232,40 @@ class SetCriterion(nn.Module):
         """Teacher-force matched queries in descending query-bias order, then EOF."""
         embeddings = outputs["mask_embeddings"]
         batch_size, num_queries = embeddings.shape[:2]
+        vocabulary_exclusions = self.object_decoder.prepare_vocabulary_exclusions(
+            outputs["pred_masks"], outputs["query_bias_logits"]
+        )
         ordered = []
         for batch_index, (src_indices, _) in enumerate(indices):
             src_indices = src_indices.to(embeddings.device)
             bias = outputs["query_bias_logits"][batch_index, src_indices].detach()
-            ordered.append(src_indices[torch.argsort(bias, descending=True, stable=True)])
+            ranked = src_indices[torch.argsort(bias, descending=True, stable=True)]
+            exclusions_for_image = vocabulary_exclusions[batch_index].cpu()
+            unavailable = torch.zeros(num_queries, dtype=torch.bool)
+            available_targets = []
+            for query in ranked.tolist():
+                if not unavailable[query]:
+                    available_targets.append(query)
+                    unavailable |= exclusions_for_image[query]
+            ordered.append(available_targets)
         steps = max(len(indices_per_image) for indices_per_image in ordered) + 1
         previous = torch.full((batch_size, steps), num_queries, dtype=torch.long, device=embeddings.device)
         targets = torch.full((batch_size, steps), -100, dtype=torch.long, device=embeddings.device)
         previous[:, 0] = -1  # beginning-of-sequence embedding
         for batch_index, indices_per_image in enumerate(ordered):
             count = len(indices_per_image)
-            targets[batch_index, :count] = indices_per_image
+            selected = torch.as_tensor(indices_per_image, dtype=torch.long,
+                                       device=embeddings.device)
+            targets[batch_index, :count] = selected
             targets[batch_index, count] = num_queries
             if count:
-                previous[batch_index, 1:count + 1] = indices_per_image
+                previous[batch_index, 1:count + 1] = selected
         image_regions = self.object_decoder.prepare_regions(
             outputs["pred_masks"], outputs["object_decoder_image_sizes"]
         )
-        vocabulary_exclusions = self.object_decoder.prepare_vocabulary_exclusions(
-            outputs["pred_masks"]
-        )
         logits = self.object_decoder(
             embeddings, outputs["object_decoder_image_features"], image_regions, previous,
-            vocabulary_exclusions,
+            vocabulary_exclusions, outputs["query_bias_logits"],
         )
         return {"loss_object_decoder": F.cross_entropy(logits.flatten(0, 1), targets.flatten())}
 

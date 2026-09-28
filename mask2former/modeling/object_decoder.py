@@ -37,6 +37,10 @@ class ObjectDecoder(nn.Module):
         ])
         self.norm = nn.LayerNorm(hidden_dim)
         self.scale = hidden_dim ** -0.5
+        # The query prior is shared by vocabulary attention and token selection.
+        # Its input is detached so object decoding cannot train the mask decoder.
+        self.query_bias_scale = nn.Parameter(torch.ones(()))
+        self.query_bias_offset = nn.Parameter(torch.zeros(()))
 
     @staticmethod
     def prepare_regions(mask_logits, image_sizes):
@@ -48,8 +52,8 @@ class ObjectDecoder(nn.Module):
                 for size in image_sizes
             ]
 
-    def prepare_vocabulary_exclusions(self, mask_logits):
-        """Find masks to exclude after selecting each query, including the query itself."""
+    def prepare_vocabulary_exclusions(self, mask_logits, query_bias_logits=None):
+        """Exclude overlaps and higher-priority queries after each selection."""
         with torch.no_grad():
             masks = (mask_logits.detach().flatten(2) > 0).float()
             intersection = torch.bmm(masks, masks.transpose(1, 2))
@@ -57,7 +61,21 @@ class ObjectDecoder(nn.Module):
             union = area[:, :, None] + area[:, None, :] - intersection
             exclusions = intersection / union.clamp_min(1) > self.mask_iou_threshold
             identity = torch.eye(masks.shape[1], dtype=torch.bool, device=masks.device)
-            return exclusions | identity
+            exclusions = exclusions | identity
+            if self.bias_order_constraint:
+                if query_bias_logits is None:
+                    raise ValueError("Bias-ordered decoding requires query_bias_logits")
+                bias = query_bias_logits.detach()
+                # Row i lists queries unavailable after selecting query i.
+                exclusions = exclusions | (bias[:, None, :] > bias[:, :, None])
+            return exclusions
+
+    def _query_prior(self, query_bias_logits, vocabulary):
+        if query_bias_logits is None:
+            return vocabulary.new_zeros(vocabulary.shape[0], self.num_queries + 1)
+        prior = (query_bias_logits.detach().to(vocabulary.dtype) * self.query_bias_scale
+                 + self.query_bias_offset).to(vocabulary.dtype)
+        return F.pad(prior, (0, 1), value=0.0)
 
     def _bias_ranks(self, query_bias_logits, batch_size, device):
         if not self.bias_order_constraint:
@@ -106,7 +124,7 @@ class ObjectDecoder(nn.Module):
         )
 
     def forward(self, mask_embeddings, image_features, image_regions, previous_tokens,
-                vocabulary_exclusions):
+                vocabulary_exclusions, query_bias_logits=None, mask_token_logits=True):
         """Return next-token logits with causal image and vocabulary attention."""
         if len(image_features) != 3 or len(image_regions) != 3:
             raise ValueError("Object decoder requires three image feature levels")
@@ -121,7 +139,11 @@ class ObjectDecoder(nn.Module):
         steps = previous.shape[1]
         previous = previous + self.position.weight[:steps]
         causal_mask = torch.ones(steps, steps, dtype=torch.bool, device=previous.device).triu(1)
-        vocabulary_mask = self._vocabulary_mask(vocabulary_exclusions, previous_tokens)
+        blocked = self._vocabulary_mask(vocabulary_exclusions, previous_tokens)
+        query_prior = self._query_prior(query_bias_logits, vocabulary)
+        vocabulary_mask = query_prior[:, None, :].expand(-1, steps, -1).masked_fill(
+            blocked, -torch.inf
+        )
         vocabulary_mask = vocabulary_mask[:, None].expand(-1, self.num_heads, -1, -1).reshape(
             mask_tokens.shape[0] * self.num_heads, steps, self.num_queries + 1
         )
@@ -143,7 +165,9 @@ class ObjectDecoder(nn.Module):
             )[0]
             decoded = self.vocabulary_norm[layer_index](decoded + attended)
         decoded = self.norm(decoded)
-        return torch.matmul(decoded, vocabulary.transpose(1, 2)) * self.scale
+        logits = torch.matmul(decoded, vocabulary.transpose(1, 2)) * self.scale
+        logits = logits + query_prior[:, None, :]
+        return logits.masked_fill(blocked, -torch.inf) if mask_token_logits else logits
 
     @torch.no_grad()
     def generate(self, mask_embeddings, image_features, mask_logits, image_sizes,
@@ -151,7 +175,7 @@ class ObjectDecoder(nn.Module):
         """Return ordered queries, mask-versus-EOF logits, and probabilities."""
         batch_size, num_queries, _ = mask_embeddings.shape
         image_regions = self.prepare_regions(mask_logits, image_sizes)
-        exclusions = self.prepare_vocabulary_exclusions(mask_logits)
+        exclusions = self.prepare_vocabulary_exclusions(mask_logits, query_bias_logits)
         bias_ranks = self._bias_ranks(query_bias_logits, batch_size, mask_embeddings.device)
         unavailable = torch.zeros(batch_size, num_queries, dtype=torch.bool, device=mask_embeddings.device)
         order = torch.full((batch_size, num_queries), -1, dtype=torch.long, device=mask_embeddings.device)
@@ -161,7 +185,8 @@ class ObjectDecoder(nn.Module):
         finished = torch.zeros(batch_size, dtype=torch.bool, device=mask_embeddings.device)
         tokens = torch.full((batch_size, 1), -1, dtype=torch.long, device=mask_embeddings.device)
         for _ in range(num_queries):
-            logits = self(mask_embeddings, image_features, image_regions, tokens, exclusions)[:, -1]
+            logits = self(mask_embeddings, image_features, image_regions, tokens, exclusions,
+                          query_bias_logits)[:, -1]
             logits[:, :num_queries].masked_fill_(unavailable, -torch.inf)
             next_token = logits.argmax(-1)
             active = ~finished & (next_token != num_queries)
@@ -196,7 +221,7 @@ class ObjectDecoder(nn.Module):
         batch_size, num_queries = mask_embeddings.shape[:2]
         max_steps = min(max_steps, num_queries + 1)
         regions = self.prepare_regions(mask_logits, image_sizes)
-        exclusions = self.prepare_vocabulary_exclusions(mask_logits)
+        exclusions = self.prepare_vocabulary_exclusions(mask_logits, query_bias_logits)
         bias_ranks = self._bias_ranks(query_bias_logits, batch_size, mask_embeddings.device)
         unavailable = torch.zeros(batch_size, num_queries, dtype=torch.bool, device=mask_embeddings.device)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=mask_embeddings.device)
@@ -209,7 +234,8 @@ class ObjectDecoder(nn.Module):
             for key in ("actions", "entropy", "top1_probability", "eof_probability", "available_masks")
         } if return_diagnostics else None
         for _ in range(max_steps):
-            logits = self(mask_embeddings, image_features, regions, previous, exclusions)[:, -1].clone()
+            logits = self(mask_embeddings, image_features, regions, previous, exclusions,
+                          query_bias_logits)[:, -1].clone()
             logits[:, :num_queries].masked_fill_(unavailable.clone(), -torch.inf)
             distribution = torch.distributions.Categorical(logits=logits)
             token = distribution.sample() if sample else logits.argmax(-1)
@@ -272,7 +298,7 @@ class ObjectDecoder(nn.Module):
             torch.full((batch_size, 1), -1, dtype=torch.long, device=actions.device),
             actions[:, :-1],
         ), dim=1)
-        exclusions = self.prepare_vocabulary_exclusions(mask_logits)
+        exclusions = self.prepare_vocabulary_exclusions(mask_logits, query_bias_logits)
         bias_ranks = self._bias_ranks(query_bias_logits, batch_size, mask_embeddings.device)
         unavailable = torch.zeros(
             batch_size, num_queries, dtype=torch.bool, device=actions.device
@@ -290,7 +316,8 @@ class ObjectDecoder(nn.Module):
                 chosen_ranks = bias_ranks[chosen_batch, actions[chosen_batch, step]]
                 unavailable[chosen_batch] |= bias_ranks[chosen_batch] <= chosen_ranks[:, None]
         regions = self.prepare_regions(mask_logits, image_sizes)
-        logits = self(mask_embeddings, image_features, regions, previous, exclusions)
+        logits = self(mask_embeddings, image_features, regions, previous, exclusions,
+                      query_bias_logits)
         logits = logits.float().masked_fill(~torch.stack(allowed, dim=1), -torch.inf)
         log_probabilities = F.log_softmax(logits, dim=-1).gather(
             -1, actions.unsqueeze(-1)
@@ -408,7 +435,8 @@ class ObjectDecoder(nn.Module):
         log_probability = mask_embeddings.new_zeros(batch_size)
         for step in range(int(counts.max().item())):
             active = counts > step
-            logits = self(mask_embeddings, image_features, regions, previous, exclusions)[:, -1].clone()
+            logits = self(mask_embeddings, image_features, regions, previous, exclusions,
+                          mask_token_logits=False)[:, -1].clone()
             remaining = proposal_mask & ~selected
             eligible = remaining & ~excluded_neighbors
             # IoU exclusions defer overlapping proposals. Once every remaining
@@ -468,7 +496,8 @@ class ObjectDecoder(nn.Module):
             selected[chosen, actions[chosen, step]] = True
             excluded_neighbors[chosen] |= exclusions[chosen, actions[chosen, step]]
         regions = self.prepare_regions(mask_logits, image_sizes)
-        logits = self(mask_embeddings, image_features, regions, previous, exclusions)
+        logits = self(mask_embeddings, image_features, regions, previous, exclusions,
+                      mask_token_logits=False)
         logits = logits.float().masked_fill(~torch.stack(allowed, dim=1), -torch.inf)
         log_probabilities = F.log_softmax(logits, dim=-1).gather(
             -1, actions.unsqueeze(-1)
