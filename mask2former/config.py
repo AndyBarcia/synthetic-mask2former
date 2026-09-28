@@ -64,10 +64,18 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT = 0.0
     cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY = False
     cfg.MODEL.MASK_FORMER.OBJECT_RL_MAX_STEPS = 32
+    cfg.MODEL.MASK_FORMER.OBJECT_RL_NUM_SAMPLES = 4
+    cfg.MODEL.MASK_FORMER.OBJECT_RL_BASELINE = "rloo_greedy"
+    # policy_gradient uses RLOO/SCST; Best-of-N variants imitate a trajectory
+    # (best_of_n_ft) or its unordered selected-query set (best_of_n_set).
+    cfg.MODEL.MASK_FORMER.OBJECT_RL_OBJECTIVE = "policy_gradient"
+    cfg.MODEL.MASK_FORMER.OBJECT_RL_TRAIN_EOF = False
     # Zero scores at ground-truth resolution; positive values use a square proxy.
     cfg.MODEL.MASK_FORMER.OBJECT_RL_REWARD_SIZE = 0
     # Exclude selected masks and other vocabulary masks above this predicted-mask IoU.
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_MASK_IOU_THRESHOLD = 0.8
+    # Permit only subsequences of descending query-bias rank in EOF decoding.
+    cfg.MODEL.MASK_FORMER.OBJECT_DEC_BIAS_ORDER_CONSTRAINT = False
     cfg.MODEL.MASK_FORMER.PRE_NORM = False
 
     cfg.MODEL.MASK_FORMER.HIDDEN_DIM = 256
@@ -82,6 +90,8 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON = False
     cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON = False
     cfg.MODEL.MASK_FORMER.TEST.OBJECT_MASK_THRESHOLD = 0.0
+    cfg.MODEL.MASK_FORMER.TEST.OBJECT_DECODER_MODE = "eof"
+    cfg.MODEL.MASK_FORMER.TEST.OBJECT_DECODER_PROPOSAL_THRESHOLD = 0.8
     cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_PAINT_ORDER = "reverse"
     cfg.MODEL.MASK_FORMER.TEST.OVERLAP_THRESHOLD = 0.0
     cfg.MODEL.MASK_FORMER.TEST.SEM_SEG_POSTPROCESSING_BEFORE_INFERENCE = False

@@ -46,6 +46,8 @@ class MaskFormer(nn.Module):
         instance_on: bool,
         test_topk_per_image: int,
         object_rl_only: bool = False,
+        object_decoder_mode: str = "eof",
+        object_decoder_proposal_threshold: float = 0.8,
     ):
         """
         Args:
@@ -76,6 +78,16 @@ class MaskFormer(nn.Module):
         self.sem_seg_head = sem_seg_head
         self.criterion = criterion
         self.object_rl_only = object_rl_only
+        if object_decoder_mode not in ("eof", "query_bias_permutation"):
+            raise ValueError(f"Unknown object decoder inference mode: {object_decoder_mode}")
+        if (self.criterion.object_decoder is not None and
+                self.criterion.object_decoder.bias_order_constraint and
+                object_decoder_mode != "eof"):
+            raise ValueError("Bias-ordered decoding requires EOF inference mode")
+        if not 0 <= object_decoder_proposal_threshold <= 1:
+            raise ValueError("Object decoder proposal threshold must be in [0, 1]")
+        self.object_decoder_mode = object_decoder_mode
+        self.object_decoder_proposal_threshold = object_decoder_proposal_threshold
         if self.object_rl_only:
             if self.criterion.object_decoder is None or self.criterion.object_rl_weight <= 0:
                 raise ValueError("RL-only training requires an object decoder and positive RL weight")
@@ -175,10 +187,15 @@ class MaskFormer(nn.Module):
                 cfg.MODEL.MASK_FORMER.NHEADS,
                 cfg.MODEL.MASK_FORMER.DIM_FEEDFORWARD,
                 cfg.MODEL.MASK_FORMER.OBJECT_DEC_MASK_IOU_THRESHOLD,
+                cfg.MODEL.MASK_FORMER.OBJECT_DEC_BIAS_ORDER_CONSTRAINT,
             ) if use_object_decoder else None,
             object_rl_weight=cfg.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT,
             object_rl_max_steps=cfg.MODEL.MASK_FORMER.OBJECT_RL_MAX_STEPS,
             object_rl_reward_size=cfg.MODEL.MASK_FORMER.OBJECT_RL_REWARD_SIZE,
+            object_rl_num_samples=cfg.MODEL.MASK_FORMER.OBJECT_RL_NUM_SAMPLES,
+            object_rl_baseline=cfg.MODEL.MASK_FORMER.OBJECT_RL_BASELINE,
+            object_rl_objective=cfg.MODEL.MASK_FORMER.OBJECT_RL_OBJECTIVE,
+            object_rl_train_eof=cfg.MODEL.MASK_FORMER.OBJECT_RL_TRAIN_EOF,
         )
         criterion.object_rl_paint_order = cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_PAINT_ORDER
 
@@ -205,6 +222,10 @@ class MaskFormer(nn.Module):
             "panoptic_on": cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON,
             "test_topk_per_image": cfg.TEST.DETECTIONS_PER_IMAGE,
             "object_rl_only": cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY,
+            "object_decoder_mode": cfg.MODEL.MASK_FORMER.TEST.OBJECT_DECODER_MODE,
+            "object_decoder_proposal_threshold": (
+                cfg.MODEL.MASK_FORMER.TEST.OBJECT_DECODER_PROPOSAL_THRESHOLD
+            ),
         }
 
     @property
@@ -276,14 +297,27 @@ class MaskFormer(nn.Module):
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
             query_bias_results = outputs["query_bias_logits"].sigmoid()
-            generated_objects = (
-                self.criterion.object_decoder.generate(
+            if self.criterion.object_decoder is None:
+                generated_objects = [(None, None, None)] * len(batched_inputs)
+            elif self.object_decoder_mode == "query_bias_permutation":
+                proposal_mask = self.criterion.object_decoder.proposals_from_query_bias(
+                    outputs["query_bias_logits"], self.object_decoder_proposal_threshold
+                )
+                orders, _ = self.criterion.object_decoder.rollout_permutation(
                     outputs["mask_embeddings"], outputs["object_decoder_image_features"],
                     outputs["pred_masks"], outputs["object_decoder_image_sizes"],
+                    proposal_mask, sample=False,
                 )
-                if self.criterion.object_decoder is not None
-                else [(None, None, None)] * len(batched_inputs)
-            )
+                generated_objects = [
+                    (torch.tensor(order, dtype=torch.long, device=proposal_mask.device), None, None)
+                    for order in orders
+                ]
+            else:
+                generated_objects = self.criterion.object_decoder.generate(
+                    outputs["mask_embeddings"], outputs["object_decoder_image_features"],
+                    outputs["pred_masks"], outputs["object_decoder_image_sizes"],
+                    query_bias_logits=outputs["query_bias_logits"],
+                )
             # upsample masks
             mask_pred_results = F.interpolate(
                 mask_pred_results,

@@ -16,6 +16,7 @@ import copy
 import itertools
 import logging
 import os
+import weakref
 
 from collections import OrderedDict
 from typing import Any, Dict, List, Set
@@ -27,11 +28,15 @@ from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
 from detectron2.data import MetadataCatalog, build_detection_train_loader
 from detectron2.engine import (
+    AMPTrainer,
     DefaultTrainer,
+    SimpleTrainer,
     default_argument_parser,
     default_setup,
     launch,
 )
+from detectron2.engine.defaults import create_ddp_model
+from detectron2.engine.train_loop import TrainerBase
 from detectron2.evaluation import (
     CityscapesInstanceEvaluator,
     CityscapesSemSegEvaluator,
@@ -71,6 +76,33 @@ class Trainer(DefaultTrainer):
     """
     Extension of the Trainer class adapted to MaskFormer.
     """
+
+    def __init__(self, cfg):
+        if not cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY:
+            super().__init__(cfg)
+            return
+        # Sampling invokes the decoder without gradients before the scored
+        # trajectories invoke it with gradients. DDP must discover the latter
+        # graph instead of assuming every decoder use contributes to the loss.
+        TrainerBase.__init__(self)
+        cfg = DefaultTrainer.auto_scale_workers(cfg, comm.get_world_size())
+        model = self.build_model(cfg)
+        optimizer = self.build_optimizer(cfg, model)
+        data_loader = self.build_train_loader(cfg)
+        model = create_ddp_model(
+            model, broadcast_buffers=False, find_unused_parameters=True
+        )
+        self._trainer = (AMPTrainer if cfg.SOLVER.AMP.ENABLED else SimpleTrainer)(
+            model, data_loader, optimizer
+        )
+        self.scheduler = self.build_lr_scheduler(cfg, optimizer)
+        self.checkpointer = DetectionCheckpointer(
+            model, cfg.OUTPUT_DIR, trainer=weakref.proxy(self)
+        )
+        self.start_iter = 0
+        self.max_iter = cfg.SOLVER.MAX_ITER
+        self.cfg = cfg
+        self.register_hooks(self.build_hooks())
 
     def build_writers(self):
         return super().build_writers() + [RLMetricPrinter()]
