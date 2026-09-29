@@ -118,7 +118,7 @@ class MaskFormer(nn.Module):
             cost_class=class_weight,
             cost_mask=mask_weight,
             cost_dice=dice_weight,
-            cost_query_bias=query_bias_weight,
+            cost_query_bias=cfg.MODEL.MASK_FORMER.QUERY_BIAS_MATCHER_WEIGHT,
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
             mask_loss_type=cfg.MODEL.MASK_FORMER.MASK_LOSS_TYPE,
         )
