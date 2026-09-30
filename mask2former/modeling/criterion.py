@@ -148,14 +148,13 @@ class SetCriterion(nn.Module):
         return {"loss_query_bias": (loss * weights).sum() / weights.sum().clamp_min(1.0)}
 
     def loss_object_decoder(self, outputs, indices):
-        """Teacher-force matched queries in descending query-bias order, then EOF."""
+        """Teacher-force matched queries in a fresh random order, then EOF."""
         embeddings = outputs["mask_embeddings"]
         batch_size, num_queries = embeddings.shape[:2]
         ordered = []
         for batch_index, (src_indices, _) in enumerate(indices):
             src_indices = src_indices.to(embeddings.device)
-            bias = outputs["query_bias_logits"][batch_index, src_indices].detach()
-            ordered.append(src_indices[torch.argsort(bias, descending=True, stable=True)])
+            ordered.append(src_indices[torch.randperm(len(src_indices), device=embeddings.device)])
         steps = max(len(indices_per_image) for indices_per_image in ordered) + 1
         previous = torch.full((batch_size, steps), num_queries, dtype=torch.long, device=embeddings.device)
         targets = torch.full((batch_size, steps), -100, dtype=torch.long, device=embeddings.device)
