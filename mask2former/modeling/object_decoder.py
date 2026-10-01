@@ -17,7 +17,8 @@ class ObjectDecoder(nn.Module):
         self.num_queries = num_queries
         self.num_heads = num_heads
         self.mask_iou_threshold = mask_iou_threshold
-        self.mask_projection = nn.Linear(mask_dim, hidden_dim)
+        self.input_mask_projection = nn.Linear(mask_dim, hidden_dim)
+        self.output_mask_projection = nn.Linear(mask_dim, hidden_dim)
         self.bos = nn.Parameter(torch.zeros(hidden_dim))
         self.eof = nn.Parameter(torch.zeros(hidden_dim))
         # This key remains available if previous masks cover an entire feature map.
@@ -141,7 +142,7 @@ class ObjectDecoder(nn.Module):
         """Return next-token logits with causal image and vocabulary attention."""
         if len(image_features) != 3 or len(image_regions) != 3:
             raise ValueError("Object decoder requires three image feature levels")
-        mask_tokens = self.mask_projection(mask_embeddings)
+        mask_tokens = self.input_mask_projection(mask_embeddings)
         vocabulary = torch.cat((mask_tokens, self.eof.expand(mask_tokens.shape[0], 1, -1)), dim=1)
         previous = vocabulary.gather(
             1, previous_tokens.clamp_min(0).unsqueeze(-1).expand(-1, -1, vocabulary.shape[-1])
@@ -178,7 +179,11 @@ class ObjectDecoder(nn.Module):
             )[0]
             decoded = self.vocabulary_norm[layer_index](decoded + attended)
         decoded = self.norm(decoded)
-        return torch.matmul(decoded, vocabulary.transpose(1, 2)) * self.scale
+        output_mask_tokens = self.output_mask_projection(mask_embeddings)
+        output_vocabulary = torch.cat((
+            output_mask_tokens, self.eof.expand(output_mask_tokens.shape[0], 1, -1),
+        ), dim=1)
+        return torch.matmul(decoded, output_vocabulary.transpose(1, 2)) * self.scale
 
     @torch.no_grad()
     def generate(self, mask_embeddings, image_features, mask_logits, image_sizes):
