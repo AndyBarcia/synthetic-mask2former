@@ -1,9 +1,11 @@
 """In-memory panoptic evaluation for the online synthetic-scene dataset."""
 
 from collections import OrderedDict
+import logging
 
 import torch
 from scipy.optimize import linear_sum_assignment
+from tabulate import tabulate
 
 from detectron2.evaluation import DatasetEvaluator
 from detectron2.utils import comm
@@ -132,10 +134,29 @@ class SyntheticScenePanopticEvaluator(DatasetEvaluator):
         if not comm.is_main_process():
             return None
         stats = torch.stack(gathered).sum(dim=0)
-        return OrderedDict({
+        results = OrderedDict({
             "panoptic_seg": self._summarize(stats[0]),
             "panoptic_seg_oracle": self._summarize(stats[1]),
         })
+        rows = []
+        for name, values in results.items():
+            mode = "Oracle" if name.endswith("_oracle") else "Standard"
+            for group, suffix in (("All", ""), ("Things", "_th"), ("Stuff", "_st")):
+                rows.append([
+                    mode, group,
+                    *(f"{values[key + suffix]:.2f}" for key in ("PQ", "SQ", "RQ")),
+                    *(values[key + suffix] for key in ("TP", "FP")),
+                ])
+        logging.getLogger(__name__).info(
+            "Panoptic evaluation (PQ/SQ/RQ in percent; TP/FP are segment counts):\n%s",
+            tabulate(
+                rows,
+                headers=("Evaluation", "Segments", "PQ", "SQ", "RQ", "TP", "FP"),
+                tablefmt="github",
+                disable_numparse=True,
+            ),
+        )
+        return results
 
     def _summarize(self, stats):
         def metrics(category_ids):
