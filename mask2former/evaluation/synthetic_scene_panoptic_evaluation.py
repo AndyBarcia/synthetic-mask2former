@@ -3,6 +3,7 @@
 from collections import OrderedDict
 
 import torch
+from scipy.optimize import linear_sum_assignment
 
 from detectron2.evaluation import DatasetEvaluator
 from detectron2.utils import comm
@@ -17,6 +18,7 @@ class SyntheticScenePanopticEvaluator(DatasetEvaluator):
     def reset(self):
         # Columns are IoU sum, true positives, false positives, false negatives.
         self._stats = torch.zeros((self.num_classes, 4), dtype=torch.float64)
+        self._oracle_stats = torch.zeros_like(self._stats)
 
     def process(self, inputs, outputs):
         for input_record, output_record in zip(inputs, outputs):
@@ -28,8 +30,61 @@ class SyntheticScenePanopticEvaluator(DatasetEvaluator):
                 pred_map.detach().to(device="cpu", dtype=torch.int64),
                 pred_info,
             )
+            oracle_map, oracle_info = self._oracle_assignment(
+                gt_map, gt_info, output_record["panoptic_proposals"]
+            )
+            self._accumulate_image(
+                gt_map.detach().to(device="cpu", dtype=torch.int64),
+                gt_info,
+                oracle_map.cpu(),
+                oracle_info,
+                stats=self._oracle_stats,
+            )
 
-    def _accumulate_image(self, gt_map, gt_info, pred_map, pred_info):
+    @staticmethod
+    def _oracle_assignment(gt_map, gt_info, proposals):
+        """Maximize total binary-mask IoU with a one-to-one GT/query assignment.
+
+        Classes and proposal selection are oracle decisions. Selected masks keep
+        their predicted geometry; overlapping pixels go to the highest logit,
+        and pixels outside every selected binary mask remain void.
+        """
+        proposals = proposals.detach()
+        gt_map = gt_map.to(device=proposals.device, dtype=torch.int64)
+        if proposals.ndim != 3 or proposals.shape[-2:] != gt_map.shape:
+            raise ValueError("Panoptic proposals must have shape [Q, H, W] matching ground truth")
+        panoptic_map = torch.zeros_like(gt_map)
+        if not gt_info or proposals.shape[0] == 0:
+            return panoptic_map, []
+
+        gt_masks = torch.stack([gt_map == segment["id"] for segment in gt_info])
+        # Ignore void pixels in IoU, as in the standard PQ calculation.
+        proposal_masks = (proposals > 0) & (gt_map != 0)[None]
+        gt_flat = gt_masks.flatten(1).float()
+        pred_flat = proposal_masks.flatten(1).float()
+        intersection = gt_flat @ pred_flat.T
+        union = gt_flat.sum(1)[:, None] + pred_flat.sum(1)[None] - intersection
+        iou = intersection / union.clamp_min(1)
+        gt_indices, query_indices = linear_sum_assignment(-iou.cpu().numpy())
+        # Zero-overlap assignments add no useful proposal.
+        positive = iou[gt_indices, query_indices].cpu().numpy() > 0
+        gt_indices, query_indices = gt_indices[positive], query_indices[positive]
+        if len(query_indices) == 0:
+            return panoptic_map, []
+
+        selected = proposals[torch.as_tensor(query_indices, device=proposals.device)]
+        best_logits, winners = selected.max(dim=0)
+        panoptic_map[best_logits > 0] = winners[best_logits > 0] + 1
+        visible_ids = set(panoptic_map.unique().tolist())
+        segments = [
+            {**gt_info[gt_index], "id": index + 1}
+            for index, gt_index in enumerate(gt_indices)
+            if index + 1 in visible_ids
+        ]
+        return panoptic_map, segments
+
+    def _accumulate_image(self, gt_map, gt_info, pred_map, pred_info, stats=None):
+        stats = self._stats if stats is None else stats
         gt_segments = {segment["id"]: segment for segment in gt_info}
         pred_segments = {segment["id"]: segment for segment in pred_info}
         gt_area = torch.bincount(gt_map.flatten())
@@ -55,29 +110,32 @@ class SyntheticScenePanopticEvaluator(DatasetEvaluator):
             union = float(gt_area[gt_id] + pred_area[pred_id]) - intersection - void_overlap
             iou = intersection / union if union > 0 else 0.0
             if iou > 0.5:
-                self._stats[category_id, 0] += iou
-                self._stats[category_id, 1] += 1
+                stats[category_id, 0] += iou
+                stats[category_id, 1] += 1
                 matched_gt.add(gt_id)
                 matched_pred.add(pred_id)
 
         for gt_id, segment in gt_segments.items():
             if gt_id not in matched_gt:
-                self._stats[segment["category_id"], 3] += 1
+                stats[segment["category_id"], 3] += 1
         for pred_id, segment in pred_segments.items():
             if pred_id in matched_pred:
                 continue
             void_overlap = float(intersections[pred_id]) if pred_id < intersections.numel() else 0.0
             if pred_id < pred_area.numel() and void_overlap / max(float(pred_area[pred_id]), 1.0) > 0.5:
                 continue
-            self._stats[segment["category_id"], 2] += 1
+            stats[segment["category_id"], 2] += 1
 
     def evaluate(self):
         comm.synchronize()
-        gathered = comm.gather(self._stats)
+        gathered = comm.gather(torch.stack((self._stats, self._oracle_stats)))
         if not comm.is_main_process():
             return None
         stats = torch.stack(gathered).sum(dim=0)
-        return OrderedDict({"panoptic_seg": self._summarize(stats)})
+        return OrderedDict({
+            "panoptic_seg": self._summarize(stats[0]),
+            "panoptic_seg_oracle": self._summarize(stats[1]),
+        })
 
     def _summarize(self, stats):
         def metrics(category_ids):
