@@ -65,6 +65,7 @@ from mask2former import (
     add_maskformer2_config,
 )
 from mask2former.data.synthetic_scene_batch_loader import SyntheticSceneBatchLoader
+from mask2former.utils.amp import install_detectron2_amp_compat
 from mask2former.evaluation.synthetic_scene_panoptic_evaluation import (
     SyntheticScenePanopticEvaluator,
 )
@@ -377,6 +378,7 @@ def prepare_phase_output(cfg):
 
 
 def main(args):
+    install_detectron2_amp_compat()
     cfg = setup(args)
 
     if args.eval_only:
