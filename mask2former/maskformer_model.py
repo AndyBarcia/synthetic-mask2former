@@ -314,6 +314,10 @@ class MaskFormer(nn.Module):
                         mask_cls_result, mask_pred_result, query_bias_result, object_order
                     )
                     processed_results[-1]["panoptic_seg"] = panoptic_r
+                    if "panoptic_ground_truth" in input_per_image:
+                        # Keep every query, before object-decoder/score selection,
+                        # for the synthetic evaluator's oracle assignment.
+                        processed_results[-1]["panoptic_proposals"] = mask_pred_result
                 
                 # instance segmentation inference
                 if self.instance_on:
