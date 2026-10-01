@@ -215,3 +215,283 @@ class ObjectDecoder(nn.Module):
              probabilities[batch_index, :lengths[batch_index]])
             for batch_index in range(batch_size)
         ]
+
+    def rollout(self, mask_embeddings, image_features, mask_logits, image_sizes,
+                sample=True, max_steps=32, return_diagnostics=False,
+                return_actions=False, query_bias_logits=None):
+        """Generate query orders and sequence log probabilities for policy gradients.
+
+        A capped rollout is treated as an implicit EOF after the last selected query.
+        """
+        batch_size, num_queries = mask_embeddings.shape[:2]
+        max_steps = min(max_steps, num_queries + 1)
+        regions = self.prepare_regions(mask_logits, image_sizes)
+        exclusions = self.prepare_vocabulary_exclusions(mask_logits)
+        unavailable = torch.zeros(batch_size, num_queries, dtype=torch.bool, device=mask_embeddings.device)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=mask_embeddings.device)
+        previous = torch.full((batch_size, 1), -1, dtype=torch.long, device=mask_embeddings.device)
+        orders = [[] for _ in range(batch_size)]
+        actions = [[] for _ in range(batch_size)] if return_actions else None
+        log_probability = mask_embeddings.new_zeros(batch_size)
+        diagnostics = {
+            key: torch.zeros(batch_size, device=mask_embeddings.device)
+            for key in ("actions", "entropy", "top1_probability", "eof_probability", "available_masks")
+        } if return_diagnostics else None
+        for _ in range(max_steps):
+            logits = self(mask_embeddings, image_features, regions, previous, exclusions)[:, -1].clone()
+            logits[:, :num_queries].masked_fill_(unavailable.clone(), -torch.inf)
+            distribution = torch.distributions.Categorical(logits=logits)
+            token = distribution.sample() if sample else logits.argmax(-1)
+            active = ~finished
+            if diagnostics is not None:
+                with torch.no_grad():
+                    probabilities = distribution.probs.detach()
+                    diagnostics["actions"] += active.float()
+                    diagnostics["entropy"] += torch.where(active, distribution.entropy().detach(), 0)
+                    diagnostics["top1_probability"] += torch.where(active, probabilities.max(-1).values, 0)
+                    diagnostics["eof_probability"] += torch.where(active, probabilities[:, -1], 0)
+                    diagnostics["available_masks"] += torch.where(active, (~unavailable).sum(-1), 0)
+            if sample:
+                log_probability = log_probability + torch.where(
+                    active, distribution.log_prob(token), 0.0
+                )
+            for index in range(batch_size):
+                if active[index]:
+                    if actions is not None:
+                        actions[index].append(int(token[index]))
+                    if token[index] != num_queries:
+                        orders[index].append(int(token[index]))
+            chosen = active & (token != num_queries)
+            chosen_batch = torch.arange(batch_size, device=unavailable.device)[chosen]
+            unavailable[chosen_batch] |= exclusions[chosen_batch, token[chosen]]
+            finished = finished | (token == num_queries)
+            if finished.all():
+                break
+            previous = torch.cat((previous, torch.where(finished, num_queries, token)[:, None]), dim=1)
+        if diagnostics is not None:
+            diagnostics["length"] = torch.tensor([len(order) for order in orders], device=finished.device).float()
+            diagnostics["truncated"] = (~finished).float()
+            if return_actions:
+                return orders, log_probability, diagnostics, actions
+            return orders, log_probability, diagnostics
+        if return_actions:
+            return orders, log_probability, actions
+        return orders, log_probability
+
+    def autoregressive_log_probability(self, mask_embeddings, image_features,
+                                       mask_logits, image_sizes, trajectories,
+                                       query_bias_logits=None):
+        """Score sampled mask and EOF actions in one causal decoder pass."""
+        batch_size, num_queries = mask_embeddings.shape[:2]
+        steps = max(map(len, trajectories))
+        actions = torch.full(
+            (batch_size, steps), num_queries, dtype=torch.long, device=mask_embeddings.device
+        )
+        lengths = torch.tensor(
+            [len(trajectory) for trajectory in trajectories], device=actions.device
+        )
+        for index, trajectory in enumerate(trajectories):
+            if not trajectory or trajectory[-1] != num_queries:
+                raise ValueError("Every trajectory must end with an EOF action")
+            actions[index, :len(trajectory)] = torch.as_tensor(trajectory, device=actions.device)
+        previous = torch.cat((
+            torch.full((batch_size, 1), -1, dtype=torch.long, device=actions.device),
+            actions[:, :-1],
+        ), dim=1)
+        exclusions = self.prepare_vocabulary_exclusions(mask_logits)
+        unavailable = torch.zeros(
+            batch_size, num_queries, dtype=torch.bool, device=actions.device
+        )
+        allowed = []
+        for step in range(steps):
+            active = lengths > step
+            allowed.append(torch.cat((~unavailable & active[:, None],
+                                      torch.ones(batch_size, 1, dtype=torch.bool,
+                                                 device=actions.device)), dim=-1))
+            chosen = active & (actions[:, step] != num_queries)
+            chosen_batch = chosen.nonzero(as_tuple=True)[0]
+            unavailable[chosen_batch] |= exclusions[chosen_batch, actions[chosen_batch, step]]
+        regions = self.prepare_regions(mask_logits, image_sizes)
+        logits = self(mask_embeddings, image_features, regions, previous, exclusions)
+        logits = logits.float().masked_fill(~torch.stack(allowed, dim=1), -torch.inf)
+        log_probabilities = F.log_softmax(logits, dim=-1).gather(
+            -1, actions.unsqueeze(-1)
+        ).squeeze(-1)
+        return torch.where(
+            torch.arange(steps, device=actions.device)[None, :] < lengths[:, None],
+            log_probabilities, 0.0,
+        ).sum(-1)
+
+    def set_imitation_loss(self, mask_embeddings, image_features, mask_logits,
+                           image_sizes, target_sets):
+        """Imitate an unordered query set using constrained greedy roll-in.
+
+        The roll-in chooses its own order among target queries under no_grad.
+        At each prefix, the supervised event is *any* remaining target query;
+        after the set is complete, the supervised event is EOF.
+        """
+        batch_size, num_queries = mask_embeddings.shape[:2]
+        if len(target_sets) != batch_size:
+            raise ValueError("target_sets must contain one set per image")
+        device = mask_embeddings.device
+        target = torch.zeros(batch_size, num_queries, dtype=torch.bool, device=device)
+        for image, queries in enumerate(target_sets):
+            if len(set(queries)) != len(queries) or any(
+                query < 0 or query >= num_queries for query in queries
+            ):
+                raise ValueError("target queries must be unique and in range")
+            target[image, queries] = True
+        exclusions = self.prepare_vocabulary_exclusions(mask_logits)
+        regions = self.prepare_regions(mask_logits, image_sizes)
+
+        # Choose prefixes from the current policy, constrained to the target
+        # set. The sampled best trajectory contributes only its selected set.
+        with torch.no_grad():
+            remaining = target.clone()
+            unavailable = torch.zeros_like(target)
+            previous = torch.full((batch_size, 1), -1, dtype=torch.long, device=device)
+            rollin = [[] for _ in range(batch_size)]
+            for _ in range(int(target.sum(-1).max().item())):
+                active = remaining.any(-1)
+                eligible = remaining & ~unavailable
+                if (active & ~eligible.any(-1)).any():
+                    raise ValueError("Target set contains mutually excluded queries")
+                logits = self(mask_embeddings, image_features, regions, previous,
+                              exclusions)[:, -1].float()
+                logits[:, :num_queries].masked_fill_(~eligible, -torch.inf)
+                logits[active, num_queries] = -torch.inf
+                logits[~active, num_queries] = 0
+                chosen = logits.argmax(-1)
+                for image in range(batch_size):
+                    if active[image]:
+                        rollin[image].append(int(chosen[image]))
+                active_rows = active.nonzero(as_tuple=True)[0]
+                remaining[active_rows, chosen[active_rows]] = False
+                unavailable[active_rows] |= exclusions[active_rows, chosen[active_rows]]
+                previous = torch.cat((previous, chosen[:, None]), dim=1)
+
+        steps = max(map(len, rollin)) + 1
+        actions = torch.full((batch_size, steps), num_queries, dtype=torch.long, device=device)
+        lengths = torch.tensor([len(order) for order in rollin], device=device)
+        for image, order in enumerate(rollin):
+            if order:
+                actions[image, :len(order)] = torch.as_tensor(order, device=device)
+        previous = torch.cat((
+            torch.full((batch_size, 1), -1, dtype=torch.long, device=device),
+            actions[:, :-1],
+        ), dim=1)
+        logits = self(mask_embeddings, image_features, regions, previous,
+                      exclusions).float()
+        remaining = target.clone()
+        unavailable = torch.zeros_like(target)
+        mask_loss_sum = logits.new_zeros(())
+        eof_loss_sum = logits.new_zeros(())
+        for step in range(steps):
+            active = lengths > step
+            at_eof = lengths == step
+            allowed_logits = logits[:, step].masked_fill(
+                torch.cat((unavailable, unavailable.new_zeros(batch_size, 1)), dim=1),
+                -torch.inf,
+            )
+            log_probabilities = F.log_softmax(allowed_logits, dim=-1)
+            # Inactive rows use EOF as a finite dummy target; their loss is ignored.
+            target_actions = torch.cat((remaining, ~active[:, None]), dim=1)
+            log_target_mass = torch.logsumexp(
+                log_probabilities.masked_fill(~target_actions, -torch.inf), dim=-1
+            )
+            mask_loss_sum = mask_loss_sum - log_target_mass[active].sum()
+            eof_loss_sum = eof_loss_sum - log_target_mass[at_eof].sum()
+            chosen_rows = active.nonzero(as_tuple=True)[0]
+            chosen = actions[chosen_rows, step]
+            remaining[chosen_rows, chosen] = False
+            unavailable[chosen_rows] |= exclusions[chosen_rows, chosen]
+        mask_count = int(lengths.sum().item())
+        token_count = mask_count + batch_size
+        loss = (mask_loss_sum + eof_loss_sum) / token_count
+        return loss, mask_loss_sum.detach(), eof_loss_sum.detach(), token_count, mask_count
+
+    def rollout_permutation(self, mask_embeddings, image_features, mask_logits,
+                            image_sizes, proposal_mask, sample=True):
+        """Select every allowed proposal once; EOF is forced after the last mask."""
+        batch_size, num_queries = mask_embeddings.shape[:2]
+        if proposal_mask.shape != (batch_size, num_queries):
+            raise ValueError("proposal_mask must have shape [batch, num_queries]")
+        if proposal_mask.dtype != torch.bool:
+            raise ValueError("proposal_mask must be boolean")
+        regions = self.prepare_regions(mask_logits, image_sizes)
+        exclusions = self.prepare_vocabulary_exclusions(mask_logits)
+        selected = torch.zeros_like(proposal_mask)
+        excluded_neighbors = torch.zeros_like(proposal_mask)
+        counts = proposal_mask.sum(-1)
+        previous = torch.full((batch_size, 1), -1, dtype=torch.long, device=mask_embeddings.device)
+        orders = [[] for _ in range(batch_size)]
+        log_probability = mask_embeddings.new_zeros(batch_size)
+        for step in range(int(counts.max().item())):
+            active = counts > step
+            logits = self(mask_embeddings, image_features, regions, previous, exclusions)[:, -1].clone()
+            remaining = proposal_mask & ~selected
+            eligible = remaining & ~excluded_neighbors
+            # IoU exclusions defer overlapping proposals. Once every remaining
+            # proposal is deferred, restore them to finish the permutation.
+            eligible = torch.where(eligible.any(-1, keepdim=True), eligible, remaining)
+            logits[:, :num_queries].masked_fill_(~eligible, -torch.inf)
+            logits[active, num_queries] = -torch.inf
+            # Inactive rows still need a valid distribution for batched decoding.
+            logits[~active, num_queries] = 0
+            distribution = torch.distributions.Categorical(logits=logits)
+            token = distribution.sample() if sample else logits.argmax(-1)
+            if sample:
+                log_probability = log_probability + torch.where(
+                    active, distribution.log_prob(token), 0.0
+                )
+            for index in range(batch_size):
+                if active[index]:
+                    orders[index].append(int(token[index]))
+            chosen = active.nonzero(as_tuple=True)[0]
+            selected[chosen, token[chosen]] = True
+            excluded_neighbors[chosen] |= exclusions[chosen, token[chosen]]
+            previous = torch.cat((previous, token[:, None]), dim=1)
+        return orders, log_probability
+
+    def permutation_log_probability(self, mask_embeddings, image_features, mask_logits,
+                                    image_sizes, proposal_mask, orders):
+        """Score fixed permutations in one causal decoder pass per batch."""
+        batch_size, num_queries = proposal_mask.shape
+        counts = proposal_mask.sum(-1)
+        steps = int(counts.max().item())
+        if not steps:
+            return self.bos.sum().expand(batch_size) * 0.0
+        actions = torch.full(
+            (batch_size, steps), num_queries, dtype=torch.long, device=proposal_mask.device
+        )
+        for index, order in enumerate(orders):
+            if len(order) != int(counts[index]):
+                raise ValueError("permutation length must equal the proposal count")
+            actions[index, :len(order)] = torch.as_tensor(order, device=actions.device)
+        previous = torch.cat((
+            torch.full((batch_size, 1), -1, dtype=torch.long, device=actions.device),
+            actions[:, :-1],
+        ), dim=1)
+        exclusions = self.prepare_vocabulary_exclusions(mask_logits)
+        selected = torch.zeros_like(proposal_mask)
+        excluded_neighbors = torch.zeros_like(proposal_mask)
+        allowed = []
+        for step in range(steps):
+            active = counts > step
+            remaining = proposal_mask & ~selected
+            eligible = remaining & ~excluded_neighbors
+            eligible = torch.where(eligible.any(-1, keepdim=True), eligible, remaining)
+            allowed.append(torch.cat((eligible, (~active)[:, None]), dim=-1))
+            chosen = active.nonzero(as_tuple=True)[0]
+            selected[chosen, actions[chosen, step]] = True
+            excluded_neighbors[chosen] |= exclusions[chosen, actions[chosen, step]]
+        regions = self.prepare_regions(mask_logits, image_sizes)
+        logits = self(mask_embeddings, image_features, regions, previous, exclusions)
+        logits = logits.float().masked_fill(~torch.stack(allowed, dim=1), -torch.inf)
+        log_probabilities = F.log_softmax(logits, dim=-1).gather(
+            -1, actions.unsqueeze(-1)
+        ).squeeze(-1)
+        return torch.where(
+            torch.arange(steps, device=actions.device)[None, :] < counts[:, None],
+            log_probabilities, 0.0,
+        ).sum(-1)

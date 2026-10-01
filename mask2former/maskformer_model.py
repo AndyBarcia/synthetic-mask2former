@@ -45,6 +45,7 @@ class MaskFormer(nn.Module):
         panoptic_on: bool,
         instance_on: bool,
         test_topk_per_image: int,
+        object_rl_only: bool = False,
     ):
         """
         Args:
@@ -69,11 +70,18 @@ class MaskFormer(nn.Module):
             instance_on: bool, whether to output instance segmentation prediction
             panoptic_on: bool, whether to output panoptic segmentation prediction
             test_topk_per_image: int, instance segmentation parameter, keep topk instances per image
+            object_rl_only: bool, freeze mask proposals and train only the object decoder
         """
         super().__init__()
         self.backbone = backbone
         self.sem_seg_head = sem_seg_head
         self.criterion = criterion
+        self.object_rl_only = object_rl_only
+        if object_rl_only:
+            if criterion.object_decoder is None or criterion.object_rl_weight <= 0:
+                raise ValueError("RL requires an object decoder and positive RL weight")
+            self.backbone.requires_grad_(False)
+            self.sem_seg_head.requires_grad_(False)
         self.num_queries = num_queries
         self.overlap_threshold = overlap_threshold
         self.object_mask_threshold = object_mask_threshold
@@ -135,12 +143,14 @@ class MaskFormer(nn.Module):
         )
         if use_object_decoder:
             weight_dict["loss_object_decoder"] = 1.0
+            if cfg.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT > 0:
+                weight_dict["loss_object_rl"] = cfg.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT
 
         if deep_supervision:
             dec_layers = cfg.MODEL.MASK_FORMER.DEC_LAYERS
             aux_weight_dict = {}
             for i in range(dec_layers - 1):
-                aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items() if k != "loss_object_decoder"})
+                aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items() if k not in ("loss_object_decoder", "loss_object_rl")})
             weight_dict.update(aux_weight_dict)
 
         losses = ["labels", "masks", "query_bias"]
@@ -165,7 +175,15 @@ class MaskFormer(nn.Module):
                 cfg.MODEL.MASK_FORMER.OBJECT_DEC_MASK_IOU_THRESHOLD,
                 cfg.MODEL.MASK_FORMER.OBJECT_DEC_PREFIX_TREE_BRANCHES,
             ) if use_object_decoder else None,
+            object_rl_weight=cfg.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT,
+            object_rl_max_steps=cfg.MODEL.MASK_FORMER.OBJECT_RL_MAX_STEPS,
+            object_rl_reward_size=cfg.MODEL.MASK_FORMER.OBJECT_RL_REWARD_SIZE,
+            object_rl_num_samples=cfg.MODEL.MASK_FORMER.OBJECT_RL_NUM_SAMPLES,
+            object_rl_baseline=cfg.MODEL.MASK_FORMER.OBJECT_RL_BASELINE,
+            object_rl_objective=cfg.MODEL.MASK_FORMER.OBJECT_RL_OBJECTIVE,
+            object_rl_train_eof=cfg.MODEL.MASK_FORMER.OBJECT_RL_TRAIN_EOF,
         )
+        criterion.object_rl_paint_order = cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_PAINT_ORDER
 
         return {
             "backbone": backbone,
@@ -189,6 +207,7 @@ class MaskFormer(nn.Module):
             "instance_on": cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON,
             "panoptic_on": cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON,
             "test_topk_per_image": cfg.TEST.DETECTIONS_PER_IMAGE,
+            "object_rl_only": cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY,
         }
 
     @property
@@ -225,8 +244,15 @@ class MaskFormer(nn.Module):
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
 
-        features = self.backbone(images.tensor)
-        outputs = self.sem_seg_head(features)
+        if self.training and self.object_rl_only:
+            self.backbone.eval()
+            self.sem_seg_head.eval()
+            with torch.no_grad():
+                features = self.backbone(images.tensor)
+                outputs = self.sem_seg_head(features)
+        else:
+            features = self.backbone(images.tensor)
+            outputs = self.sem_seg_head(features)
 
         if self.training:
             # mask classification target
@@ -237,7 +263,8 @@ class MaskFormer(nn.Module):
                 targets = None
 
             # bipartite matching-based loss
-            losses = self.criterion(outputs, targets)
+            losses = (self.criterion.loss_object_rl(outputs, targets)
+                      if self.object_rl_only else self.criterion(outputs, targets))
 
             for k in list(losses.keys()):
                 if k in self.criterion.weight_dict:

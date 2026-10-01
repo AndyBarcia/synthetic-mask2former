@@ -76,3 +76,5 @@ If you find the code useful, please also consider the following BibTeX entry.
 ## Acknowledgement
 
 Code is largely based on MaskFormer (https://github.com/facebookresearch/MaskFormer).
+
+See [training modes](docs/training-modes.md) for supervised training, supervised → RL, and RL from a checkpoint.

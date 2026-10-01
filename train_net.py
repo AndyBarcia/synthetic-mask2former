@@ -16,6 +16,7 @@ import copy
 import itertools
 import logging
 import os
+import weakref
 
 from collections import OrderedDict
 from typing import Any, Dict, List, Set
@@ -27,11 +28,17 @@ from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
 from detectron2.data import MetadataCatalog, build_detection_train_loader
 from detectron2.engine import (
+    AMPTrainer,
+    SimpleTrainer,
     DefaultTrainer,
     default_argument_parser,
     default_setup,
     launch,
 )
+from detectron2.engine.defaults import create_ddp_model
+from detectron2.engine.train_loop import TrainerBase
+from mask2former.utils.rl_logging import RLMetricPrinter
+from mask2former.utils.training_phases import phase_config, validate_training_mode
 from detectron2.evaluation import (
     CityscapesInstanceEvaluator,
     CityscapesSemSegEvaluator,
@@ -70,6 +77,39 @@ class Trainer(DefaultTrainer):
     """
     Extension of the Trainer class adapted to MaskFormer.
     """
+
+    def __init__(self, cfg):
+        if not cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY:
+            super().__init__(cfg)
+            return
+        # Sampling invokes the decoder without gradients before the scored
+        # trajectories invoke it with gradients. DDP must discover the latter
+        # graph instead of assuming every decoder use contributes to the loss.
+        TrainerBase.__init__(self)
+        cfg = DefaultTrainer.auto_scale_workers(cfg, comm.get_world_size())
+        model = self.build_model(cfg)
+        optimizer = self.build_optimizer(cfg, model)
+        data_loader = self.build_train_loader(cfg)
+        model = create_ddp_model(
+            model, broadcast_buffers=False, find_unused_parameters=True
+        )
+        self._trainer = (AMPTrainer if cfg.SOLVER.AMP.ENABLED else SimpleTrainer)(
+            model, data_loader, optimizer
+        )
+        self.scheduler = self.build_lr_scheduler(cfg, optimizer)
+        self.checkpointer = DetectionCheckpointer(
+            model, cfg.OUTPUT_DIR, trainer=weakref.proxy(self)
+        )
+        self.start_iter = 0
+        self.max_iter = cfg.SOLVER.MAX_ITER
+        self.cfg = cfg
+        self.register_hooks(self.build_hooks())
+
+    def build_writers(self):
+        writers = super().build_writers()
+        if self.cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY:
+            writers.append(RLMetricPrinter())
+        return writers
 
     @classmethod
     def build_evaluator(cls, cfg, dataset_name, output_folder=None):
@@ -318,11 +358,22 @@ def setup(args):
     add_maskformer2_config(cfg)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
+    if not args.eval_only:
+        validate_training_mode(cfg)
     cfg.freeze()
     default_setup(cfg, args)
     # Setup logger for "mask_former" module
     setup_logger(output=cfg.OUTPUT_DIR, distributed_rank=comm.get_rank(), name="mask2former")
     return cfg
+
+
+def prepare_phase_output(cfg):
+    """Save each phase config while keeping one run-level console logger."""
+    if comm.is_main_process():
+        os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
+        with open(os.path.join(cfg.OUTPUT_DIR, "config.yaml"), "w") as handle:
+            handle.write(cfg.dump())
+    comm.synchronize()
 
 
 def main(args):
@@ -340,7 +391,37 @@ def main(args):
             verify_results(cfg, res)
         return res
 
-    trainer = Trainer(cfg)
+    mode = validate_training_mode(cfg)
+    if mode == "supervised":
+        trainer = Trainer(cfg)
+        trainer.resume_or_load(resume=args.resume)
+        return trainer.train()
+
+    if mode == "supervised_then_rl":
+        supervised_cfg = phase_config(cfg, "supervised")
+        checkpoint = os.path.join(supervised_cfg.OUTPUT_DIR, "model_final.pth")
+        rl_cfg = phase_config(cfg, "rl", checkpoint)
+        # Resume RL directly once it has a checkpoint. Otherwise resume the
+        # supervised phase, or use its completed final checkpoint for handoff.
+        rl_started = args.resume and os.path.isfile(os.path.join(rl_cfg.OUTPUT_DIR, "last_checkpoint"))
+        if not rl_started and not (args.resume and os.path.isfile(checkpoint)):
+            prepare_phase_output(supervised_cfg)
+            trainer = Trainer(supervised_cfg)
+            trainer.resume_or_load(resume=args.resume)
+            trainer.train()
+            del trainer
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        comm.synchronize()
+        if not rl_started and not os.path.isfile(checkpoint):
+            raise FileNotFoundError(f"Supervised phase did not produce {checkpoint}")
+    else:
+        rl_cfg = phase_config(cfg, "rl")
+
+    prepare_phase_output(rl_cfg)
+    trainer = Trainer(rl_cfg)
+    # Without an RL last_checkpoint, Detectron2 loads MODEL.WEIGHTS only;
+    # optimizer, schedule, and iteration start fresh for the new phase.
     trainer.resume_or_load(resume=args.resume)
     return trainer.train()
 

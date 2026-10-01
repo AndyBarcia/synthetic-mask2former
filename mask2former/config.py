@@ -64,6 +64,18 @@ def add_maskformer2_config(cfg):
     # Number of suffix permutations sharing a randomly sampled training prefix.
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_PREFIX_TREE_BRANCHES = 4
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_LAYERS = 5
+    cfg.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT = 0.0
+    cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY = False
+    cfg.MODEL.MASK_FORMER.OBJECT_RL_MAX_STEPS = 101
+    cfg.MODEL.MASK_FORMER.OBJECT_RL_NUM_SAMPLES = 4
+    cfg.MODEL.MASK_FORMER.OBJECT_RL_BASELINE = "rloo_greedy"
+    # policy_gradient uses RLOO/SCST; Best-of-N variants imitate a trajectory
+    # (best_of_n_ft) or its unordered selected-query set (best_of_n_set).
+    cfg.MODEL.MASK_FORMER.OBJECT_RL_OBJECTIVE = "policy_gradient"
+    cfg.MODEL.MASK_FORMER.OBJECT_RL_TRAIN_EOF = True
+    # Zero scores at ground-truth resolution; positive values use a square proxy.
+    cfg.MODEL.MASK_FORMER.OBJECT_RL_REWARD_SIZE = 0
+
     # Exclude selected masks and other vocabulary masks above this predicted-mask IoU.
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_MASK_IOU_THRESHOLD = 0.8
     cfg.MODEL.MASK_FORMER.PRE_NORM = False
@@ -80,7 +92,7 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON = False
     cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON = False
     cfg.MODEL.MASK_FORMER.TEST.OBJECT_MASK_THRESHOLD = 0.0
-    cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_PAINT_ORDER = "reverse"
+    cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_PAINT_ORDER = "forward"
     cfg.MODEL.MASK_FORMER.TEST.OVERLAP_THRESHOLD = 0.0
     cfg.MODEL.MASK_FORMER.TEST.SEM_SEG_POSTPROCESSING_BEFORE_INFERENCE = False
 
@@ -137,3 +149,14 @@ def add_maskformer2_config(cfg):
     # Importance sampling parameter for PointRend point sampling during training. Parametr `beta` in
     # the original paper.
     cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO = 0.75
+
+    # Sequential training phases; RL solver settings apply only to the RL phase.
+    cfg.TRAINING = CN()
+    cfg.TRAINING.MODE = "supervised"
+    cfg.TRAINING.RL = CN()
+    cfg.TRAINING.RL.MAX_ITER = 10000
+    cfg.TRAINING.RL.BASE_LR = 0.00001
+    cfg.TRAINING.RL.WARMUP_ITERS = 0
+    cfg.TRAINING.RL.STEPS = (8000, 9500)
+    cfg.TRAINING.RL.LR_SCHEDULER_NAME = "WarmupMultiStepLR"
+    cfg.TRAINING.RL.WEIGHT = 1.0

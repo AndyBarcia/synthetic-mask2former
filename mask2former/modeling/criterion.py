@@ -16,6 +16,7 @@ from detectron2.projects.point_rend.point_features import (
 )
 
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
+from ..utils.rl_logging import record_best_of_n_diagnostics, record_rl_diagnostics
 from .utils import compute_mask_block_counts
 
 
@@ -88,6 +89,51 @@ def calculate_uncertainty(logits):
     return -(torch.abs(gt_class_logits))
 
 
+def rloo_self_critical_loss(sampled_rewards, greedy_rewards, log_probabilities):
+    """Leave-one-out policy gradient, with greedy reward as one baseline member.
+
+    Tensors have shapes [rollouts, images], [images], and [rollouts, images].
+    """
+    if sampled_rewards.shape != log_probabilities.shape or sampled_rewards.ndim != 2:
+        raise ValueError("sampled rewards and log probabilities must have shape [K, batch]")
+    if greedy_rewards.shape != sampled_rewards.shape[1:]:
+        raise ValueError("greedy rewards must have shape [batch]")
+    k = sampled_rewards.shape[0]
+    if k < 1:
+        raise ValueError("at least one sampled rollout is required")
+    baseline = (greedy_rewards.unsqueeze(0) + sampled_rewards.sum(0, keepdim=True)
+                - sampled_rewards) / k
+    advantage = sampled_rewards - baseline.detach()
+    return -(advantage * log_probabilities).mean(), advantage
+
+
+def scst_loss(sampled_rewards, greedy_rewards, log_probabilities):
+    """Use the greedy reward as the baseline for every sampled rollout."""
+    if sampled_rewards.shape != log_probabilities.shape or sampled_rewards.ndim != 2:
+        raise ValueError("sampled rewards and log probabilities must have shape [K, batch]")
+    if greedy_rewards.shape != sampled_rewards.shape[1:]:
+        raise ValueError("greedy rewards must have shape [batch]")
+    if sampled_rewards.shape[0] < 1:
+        raise ValueError("at least one sampled rollout is required")
+    advantage = sampled_rewards - greedy_rewards.detach().unsqueeze(0)
+    return -(advantage * log_probabilities).mean(), advantage
+
+
+def select_best_of_n(sampled_rewards, greedy_rewards, trajectories):
+    """Select one sampled trajectory per image and mark strict greedy wins."""
+    if sampled_rewards.ndim != 2 or greedy_rewards.shape != sampled_rewards.shape[1:]:
+        raise ValueError("rewards must have shapes [K, batch] and [batch]")
+    k, batch_size = sampled_rewards.shape
+    if len(trajectories) != k * batch_size:
+        raise ValueError("trajectories must contain K batches in sample-major order")
+    best_rewards, best_indices = sampled_rewards.max(0)
+    best_trajectories = [
+        trajectories[int(best_indices[image]) * batch_size + image]
+        for image in range(batch_size)
+    ]
+    return best_trajectories, best_rewards, best_rewards > greedy_rewards
+
+
 class SetCriterion(nn.Module):
     """This class computes the loss for DETR.
     The process happens in two steps:
@@ -97,7 +143,10 @@ class SetCriterion(nn.Module):
 
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
                  num_points, oversample_ratio, importance_sample_ratio,
-                 mask_loss_type="point", object_decoder=None):
+                 mask_loss_type="point", object_decoder=None, object_rl_weight=0.0,
+                 object_rl_max_steps=101, object_rl_reward_size=0,
+                 object_rl_num_samples=4, object_rl_train_eof=True,
+                 object_rl_baseline="rloo_greedy", object_rl_objective="policy_gradient"):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -113,6 +162,31 @@ class SetCriterion(nn.Module):
         self.eos_coef = eos_coef
         self.losses = losses
         self.object_decoder = object_decoder
+        self.object_rl_weight = object_rl_weight
+        self.object_rl_max_steps = object_rl_max_steps
+        if object_rl_num_samples < 1:
+            raise ValueError("OBJECT_RL_NUM_SAMPLES must be at least one")
+        self.object_rl_num_samples = object_rl_num_samples
+        if object_rl_baseline not in ("rloo_greedy", "scst"):
+            raise ValueError("OBJECT_RL_BASELINE must be 'rloo_greedy' or 'scst'")
+        self.object_rl_baseline = object_rl_baseline
+        if object_rl_objective not in ("policy_gradient", "best_of_n_ft", "best_of_n_set"):
+            raise ValueError(
+                "OBJECT_RL_OBJECTIVE must be 'policy_gradient', 'best_of_n_ft', "
+                "or 'best_of_n_set'"
+            )
+        self.object_rl_objective = object_rl_objective
+        if object_rl_objective in ("best_of_n_ft", "best_of_n_set") and not object_rl_train_eof:
+            raise ValueError("Best-of-N fine-tuning requires EOF training")
+        self.object_rl_train_eof = object_rl_train_eof
+        if object_rl_weight > 0 and object_rl_train_eof:
+            if object_decoder is None:
+                raise ValueError("EOF training requires an object decoder")
+            if object_rl_max_steps < object_decoder.num_queries + 1:
+                raise ValueError("EOF training requires OBJECT_RL_MAX_STEPS >= num_queries + 1")
+        if object_rl_reward_size < 0:
+            raise ValueError("OBJECT_RL_REWARD_SIZE must be nonnegative")
+        self.object_rl_reward_size = object_rl_reward_size
         # pointwise mask loss parameters
         self.num_points = num_points
         self.oversample_ratio = oversample_ratio
@@ -179,7 +253,322 @@ class SetCriterion(nn.Module):
         )
         loss = -(F.log_softmax(logits.float(), dim=-1) * weights).sum() / weights.sum()
         return {"loss_object_decoder": loss}
-    
+
+    @torch.no_grad()
+    def object_reward(self, orders, outputs, targets):
+        """Per-image mean class PQ with the inference paint and evaluation rules.
+
+        A reward size of zero renders at the ground-truth mask resolution.
+        """
+        classes = outputs["pred_logits"][..., :-1].argmax(-1)
+        rewards = []
+        for batch_index, order in enumerate(orders):
+            target_masks = targets[batch_index]["masks"]
+            size = (self.object_rl_reward_size,) * 2 if self.object_rl_reward_size else target_masks.shape[-2:]
+            masks = F.interpolate(
+                outputs["pred_masks"][batch_index:batch_index + 1].float(),
+                size=size, mode="bilinear", align_corners=False,
+            )[0] > 0
+            painted = torch.zeros(size, dtype=torch.long, device=masks.device)
+            segments = []
+            stuff_id = None
+            paint_order = reversed(order) if self.object_rl_paint_order == "reverse" else order
+            for query in paint_order:
+                if not masks[query].any():
+                    continue
+                category = int(classes[batch_index, query])
+                if category == 0 and stuff_id is not None:
+                    segment_id = stuff_id
+                else:
+                    segment_id = len(segments) + 1
+                    segments.append(category)
+                    if category == 0:
+                        stuff_id = segment_id
+                painted[masks[query]] = segment_id
+            gt_masks = (
+                F.interpolate(target_masks[:, None].float(), size=size, mode="nearest")[:, 0] > 0
+                if len(target_masks) else masks.new_zeros((0, *size))
+            )
+            gt_classes = targets[batch_index]["labels"]
+            gt_map = torch.zeros(size, dtype=torch.long, device=masks.device)
+            for target_index, target_mask in enumerate(gt_masks, start=1):
+                gt_map[target_mask] = target_index
+
+            num_gt = len(gt_masks)
+            num_pred = len(segments)
+            pair_base = num_pred + 1
+            intersections = torch.bincount(
+                (gt_map * pair_base + painted).flatten(),
+                minlength=(num_gt + 1) * pair_base,
+            ).reshape(num_gt + 1, pair_base)
+            pred_area = intersections.sum(0)[1:]
+            gt_area = intersections.sum(1)[1:]
+            void_overlap = intersections[0, 1:]
+            pred_classes = gt_classes.new_tensor(segments)
+            if num_gt and num_pred:
+                overlap = intersections[1:, 1:].float()
+                union = gt_area[:, None] + pred_area[None, :] - overlap - void_overlap[None, :]
+                iou = overlap / union.clamp_min(1)
+                matches = (iou > 0.5) & (gt_classes[:, None] == pred_classes[None, :])
+                matched_gt, matched_pred = matches.nonzero(as_tuple=True)
+                iou_sum = torch.bincount(
+                    gt_classes[matched_gt], weights=iou[matched_gt, matched_pred],
+                    minlength=self.num_classes,
+                )
+                matched_predictions = matches.any(0)
+            else:
+                iou_sum = masks.new_zeros(self.num_classes, dtype=torch.float)
+                matched_predictions = torch.zeros(num_pred, dtype=torch.bool, device=masks.device)
+            counted_predictions = (pred_area > 0) & (
+                matched_predictions | (void_overlap.float() / pred_area.clamp_min(1) <= 0.5)
+            )
+            gt_count = torch.bincount(gt_classes, minlength=self.num_classes)
+            pred_count = torch.bincount(
+                pred_classes[counted_predictions], minlength=self.num_classes,
+            )
+            denominator = 0.5 * (gt_count + pred_count)
+            active_classes = denominator > 0
+            class_pq = iou_sum / denominator.clamp_min(1)
+            rewards.append(class_pq[active_classes].mean() if active_classes.any()
+                           else iou_sum.new_zeros(()))
+        return torch.stack(rewards)
+
+    def loss_object_rl(self, outputs, targets):
+        if self.object_rl_objective in ("best_of_n_ft", "best_of_n_set"):
+            return self.loss_object_best_of_n(outputs, targets)
+        if self.object_rl_train_eof:
+            return self.loss_object_rl_eof(outputs, targets)
+        # Detaching all policy inputs confines this loss to the object decoder.
+        policy_inputs = (
+            outputs["mask_embeddings"].detach(),
+            [feature.detach() for feature in outputs["object_decoder_image_features"]],
+            outputs["pred_masks"].detach(),
+            outputs["object_decoder_image_sizes"],
+        )
+        batch_size, num_queries = policy_inputs[0].shape[:2]
+        proposal_counts = torch.tensor(
+            [len(target["labels"]) for target in targets],
+            device=policy_inputs[0].device,
+        )
+        if (proposal_counts > num_queries).any():
+            raise ValueError("GT instance count exceeds the number of mask proposals")
+        # The GT supplies the proposal count only. Query bias selects which
+        # predictions are eligible, without using GT identities or masks.
+        proposal_rank = outputs["query_bias_logits"].detach().argsort(
+            dim=-1, descending=True, stable=True
+        )
+        proposal_mask = torch.zeros(
+            (batch_size, num_queries), dtype=torch.bool, device=policy_inputs[0].device
+        )
+        proposal_mask.scatter_(1, proposal_rank, (
+            torch.arange(num_queries, device=proposal_counts.device)[None, :] <
+            proposal_counts[:, None]
+        ))
+        k = self.object_rl_num_samples
+        rollout_batch = 4
+        sampled = []
+        with torch.no_grad():
+            for start in range(0, k, rollout_batch):
+                repeats = min(rollout_batch, k - start)
+                sampled_inputs = (
+                    policy_inputs[0].repeat(repeats, 1, 1),
+                    [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
+                    policy_inputs[2].repeat(repeats, 1, 1, 1),
+                    policy_inputs[3],
+                )
+                orders, _ = self.object_decoder.rollout_permutation(
+                    *sampled_inputs, proposal_mask.repeat(repeats, 1), sample=True
+                )
+                sampled.extend(orders)
+            greedy, _ = self.object_decoder.rollout_permutation(
+                *policy_inputs, proposal_mask, sample=False
+            )
+            sampled_reward = torch.stack([
+                self.object_reward(sampled[i * batch_size:(i + 1) * batch_size], outputs, targets)
+                for i in range(k)
+            ])
+            greedy_reward = self.object_reward(greedy, outputs, targets)
+        # Sampling needs no graph. A full causal pass scores each fixed order,
+        # avoiding a growing-prefix autograd graph for every sampled action.
+        log_probabilities = []
+        for start in range(0, k, rollout_batch):
+            repeats = min(rollout_batch, k - start)
+            scored_inputs = (
+                policy_inputs[0].repeat(repeats, 1, 1),
+                [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
+                policy_inputs[2].repeat(repeats, 1, 1, 1),
+                policy_inputs[3],
+            )
+            scores = self.object_decoder.permutation_log_probability(
+                *scored_inputs, proposal_mask.repeat(repeats, 1),
+                sampled[start * batch_size:(start + repeats) * batch_size],
+            )
+            log_probabilities.append(scores.reshape(repeats, batch_size))
+        log_probability = torch.cat(log_probabilities)
+        rl_loss, advantage = self._rl_policy_loss(
+            sampled_reward, greedy_reward, log_probability
+        )
+        # An all-empty batch still needs a graph-connected zero for RL-only runs.
+        rl_loss = rl_loss + self.object_decoder.bos.sum() * 0.0
+        record_rl_diagnostics(sampled_reward, greedy_reward, advantage,
+                              log_probability, rl_loss)
+        return {"loss_object_rl": rl_loss}
+
+    def _rl_policy_loss(self, sampled_reward, greedy_reward, log_probability):
+        loss_fn = scst_loss if self.object_rl_baseline == "scst" else rloo_self_critical_loss
+        return loss_fn(sampled_reward, greedy_reward, log_probability)
+
+    def loss_object_best_of_n(self, outputs, targets):
+        """Imitate the best sample's ordered trajectory or unordered mask set."""
+        query_bias = outputs.get("query_bias_logits")
+        query_bias = query_bias.detach() if query_bias is not None else None
+        policy_inputs = (
+            outputs["mask_embeddings"].detach(),
+            [feature.detach() for feature in outputs["object_decoder_image_features"]],
+            outputs["pred_masks"].detach(),
+            outputs["object_decoder_image_sizes"],
+        )
+        batch_size = policy_inputs[0].shape[0]
+        k = self.object_rl_num_samples
+        rollout_batch = 4
+        sampled_orders = []
+        trajectories = []
+        with torch.no_grad():
+            for start in range(0, k, rollout_batch):
+                repeats = min(rollout_batch, k - start)
+                sampled_inputs = (
+                    policy_inputs[0].repeat(repeats, 1, 1),
+                    [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
+                    policy_inputs[2].repeat(repeats, 1, 1, 1),
+                    policy_inputs[3],
+                )
+                orders, _, actions = self.object_decoder.rollout(
+                    *sampled_inputs, sample=True, max_steps=self.object_rl_max_steps,
+                    return_actions=True,
+                    query_bias_logits=query_bias.repeat(repeats, 1) if query_bias is not None else None,
+                )
+                sampled_orders.extend(orders)
+                trajectories.extend(actions)
+            greedy_orders, _, _ = self.object_decoder.rollout(
+                *policy_inputs, sample=False, max_steps=self.object_rl_max_steps,
+                return_actions=True,
+                query_bias_logits=query_bias,
+            )
+            sampled_reward = torch.stack([
+                self.object_reward(
+                    sampled_orders[i * batch_size:(i + 1) * batch_size], outputs, targets
+                )
+                for i in range(k)
+            ])
+            greedy_reward = self.object_reward(greedy_orders, outputs, targets)
+            best_trajectories, best_reward, winners = select_best_of_n(
+                sampled_reward, greedy_reward, trajectories
+            )
+        if self.object_rl_objective == "best_of_n_set":
+            loss, mask_nll, eof_nll, token_count, mask_count = (
+                self.object_decoder.set_imitation_loss(
+                    *policy_inputs, [trajectory[:-1] for trajectory in best_trajectories]
+                )
+            )
+            metric_group = "set_imitation"
+        else:
+            if winners.any():
+                winning_trajectories = [
+                    trajectory for trajectory, wins in zip(best_trajectories, winners.tolist())
+                    if wins
+                ]
+                log_probability = self.object_decoder.autoregressive_log_probability(
+                    policy_inputs[0][winners],
+                    [feature[winners] for feature in policy_inputs[1]],
+                    policy_inputs[2][winners], policy_inputs[3], winning_trajectories,
+                    query_bias_logits=query_bias[winners] if query_bias is not None else None,
+                )
+                token_count = sum(map(len, winning_trajectories))
+                loss = -log_probability.sum() / token_count
+            else:
+                token_count = 0
+                loss = self.object_decoder.eof.sum() * 0.0
+            metric_group = "best_of_n"
+            mask_nll = eof_nll = mask_count = None
+        record_best_of_n_diagnostics(
+            sampled_reward, greedy_reward, best_reward, winners,
+            greedy_orders, best_trajectories, loss, token_count,
+            metric_group=metric_group, mask_nll=mask_nll, eof_nll=eof_nll,
+            mask_count=mask_count,
+        )
+        return {"loss_object_rl": loss}
+
+    def loss_object_rl_eof(self, outputs, targets):
+        """RLOO over free decoding, including the sampled EOF action."""
+        query_bias = outputs.get("query_bias_logits")
+        query_bias = query_bias.detach() if query_bias is not None else None
+        policy_inputs = (
+            outputs["mask_embeddings"].detach(),
+            [feature.detach() for feature in outputs["object_decoder_image_features"]],
+            outputs["pred_masks"].detach(),
+            outputs["object_decoder_image_sizes"],
+        )
+        batch_size = policy_inputs[0].shape[0]
+        k = self.object_rl_num_samples
+        rollout_batch = 4
+        sampled = []
+        trajectories = []
+        with torch.no_grad():
+            for start in range(0, k, rollout_batch):
+                repeats = min(rollout_batch, k - start)
+                sampled_inputs = (
+                    policy_inputs[0].repeat(repeats, 1, 1),
+                    [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
+                    policy_inputs[2].repeat(repeats, 1, 1, 1),
+                    policy_inputs[3],
+                )
+                orders, _, actions = self.object_decoder.rollout(
+                    *sampled_inputs, sample=True, max_steps=self.object_rl_max_steps,
+                    return_actions=True,
+                    query_bias_logits=query_bias.repeat(repeats, 1) if query_bias is not None else None,
+                )
+                sampled.extend(orders)
+                trajectories.extend(actions)
+            greedy, _, greedy_actions = self.object_decoder.rollout(
+                *policy_inputs, sample=False, max_steps=self.object_rl_max_steps,
+                return_actions=True,
+                query_bias_logits=query_bias,
+            )
+            sampled_reward = torch.stack([
+                self.object_reward(sampled[i * batch_size:(i + 1) * batch_size], outputs, targets)
+                for i in range(k)
+            ])
+            greedy_reward = self.object_reward(greedy, outputs, targets)
+        log_probabilities = []
+        for start in range(0, k, rollout_batch):
+            repeats = min(rollout_batch, k - start)
+            scored_inputs = (
+                policy_inputs[0].repeat(repeats, 1, 1),
+                [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
+                policy_inputs[2].repeat(repeats, 1, 1, 1),
+                policy_inputs[3],
+            )
+            scores = self.object_decoder.autoregressive_log_probability(
+                *scored_inputs,
+                trajectories[start * batch_size:(start + repeats) * batch_size],
+                query_bias_logits=query_bias.repeat(repeats, 1) if query_bias is not None else None,
+            )
+            log_probabilities.append(scores.reshape(repeats, batch_size))
+        log_probability = torch.cat(log_probabilities)
+        rl_loss, advantage = self._rl_policy_loss(
+            sampled_reward, greedy_reward, log_probability
+        )
+        rl_loss = rl_loss + self.object_decoder.bos.sum() * 0.0
+        sampled_lengths = sampled_reward.new_tensor(
+            [len(order) for order in sampled]
+        ).reshape(k, batch_size)
+        greedy_lengths = greedy_reward.new_tensor([len(order) for order in greedy])
+        record_rl_diagnostics(sampled_reward, greedy_reward, advantage,
+                              log_probability, rl_loss,
+                              sampled_lengths=sampled_lengths,
+                              greedy_lengths=greedy_lengths)
+        return {"loss_object_rl": rl_loss}
+
     def loss_masks(self, outputs, targets, indices, num_masks):
         """Compute the losses related to the masks: the focal loss and the dice loss.
         targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
@@ -308,6 +697,8 @@ class SetCriterion(nn.Module):
             losses.update(self.get_loss(loss, outputs, targets, indices, num_masks))
         if self.object_decoder is not None:
             losses.update(self.loss_object_decoder(outputs, indices))
+            if self.object_rl_weight > 0:
+                losses.update(self.loss_object_rl(outputs, targets))
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if "aux_outputs" in outputs:
