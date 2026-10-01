@@ -52,12 +52,21 @@ iterations, learning rate 1e-5, no warmup, and a multistep schedule at 8,000 and
 `TRAINING.RL.WEIGHT` controls the RL loss scale (default 1). The mode sets
 `MODEL.MASK_FORMER.OBJECT_RL_ONLY` and `OBJECT_RL_WEIGHT` automatically.
 
-The default RL objective is policy gradient with an RLOO plus greedy baseline,
-four sampled trajectories per image, and free decoding including EOF. Configure
+The default RL objective is policy gradient with a greedy reward baseline,
+four tree trajectories per image, and free decoding including EOF. Configure
 it through `MODEL.MASK_FORMER.OBJECT_RL_*`:
 
 - `NUM_SAMPLES`: number of sampled trajectories.
-- `BASELINE`: `rloo_greedy` or `scst`.
+- `TREE_SAMPLING`: default `True`; reuse projected self-attention K/V for shared
+  prefixes and score sampled paths together with ancestor-masked tree attention.
+  Set `False` to restore independent, fully sampled rollouts.
+- `BRANCH_THRESHOLD`: default 0.9; sample when the highest allowed action
+  probability is strictly below this value, otherwise follow the greedy action.
+  Sampling is independent with replacement, so duplicate paths are possible.
+  Zero gives entirely greedy paths and no policy-gradient updates; one samples
+  wherever the policy is not deterministic. EOF participates in branching.
+- `BASELINE`: `rloo_greedy` or `scst` for independent rollouts. Tree sampling
+  always uses `scst`, because tree leaves can share sampled ancestors.
 - `TRAIN_EOF`: default `True`; `False` learns ordering among query-bias proposals
   using the ground-truth object count during training.
 - `MAX_STEPS`: default 101; EOF training requires at least query count plus one.
@@ -65,6 +74,14 @@ it through `MODEL.MASK_FORMER.OBJECT_RL_*`:
   proxy resolution.
 - `OBJECTIVE`: `policy_gradient`, `best_of_n_ft`, or `best_of_n_set`. The latter
   two imitate the best sampled trajectory or set and require EOF training.
+
+Tree policy gradients include only sampled decisions in their log probabilities.
+Greedy steps supply context and affect rewards. Best-of-N uses the same tree
+sampler and retains its full-trajectory or set imitation objective. The cache
+adds no checkpoint parameters. Sampling currently visits distinct nodes in
+sequence per image; runtime gains depend on how much prefix sharing occurs.
+The scoring pass uses dense tree attention, so large sample counts can increase
+attention memory substantially.
 
 Rewards use per-image mean class PQ and the configured panoptic paint order.
 RL diagnostics appear in the standard metrics files and console logs.

@@ -146,7 +146,8 @@ class SetCriterion(nn.Module):
                  mask_loss_type="point", object_decoder=None, object_rl_weight=0.0,
                  object_rl_max_steps=101, object_rl_reward_size=0,
                  object_rl_num_samples=4, object_rl_train_eof=True,
-                 object_rl_baseline="rloo_greedy", object_rl_objective="policy_gradient"):
+                 object_rl_baseline="rloo_greedy", object_rl_objective="policy_gradient",
+                 object_rl_tree_sampling=True, object_rl_branch_threshold=0.9):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -167,6 +168,10 @@ class SetCriterion(nn.Module):
         if object_rl_num_samples < 1:
             raise ValueError("OBJECT_RL_NUM_SAMPLES must be at least one")
         self.object_rl_num_samples = object_rl_num_samples
+        self.object_rl_tree_sampling = object_rl_tree_sampling
+        if not 0 <= object_rl_branch_threshold <= 1:
+            raise ValueError("OBJECT_RL_BRANCH_THRESHOLD must be between zero and one")
+        self.object_rl_branch_threshold = object_rl_branch_threshold
         if object_rl_baseline not in ("rloo_greedy", "scst"):
             raise ValueError("OBJECT_RL_BASELINE must be 'rloo_greedy' or 'scst'")
         self.object_rl_baseline = object_rl_baseline
@@ -333,6 +338,13 @@ class SetCriterion(nn.Module):
                            else iou_sum.new_zeros(()))
         return torch.stack(rewards)
 
+    def _sample_rl_tree(self, policy_inputs, proposal_mask=None):
+        return self.object_decoder.rollout_tree(
+            *policy_inputs, num_samples=self.object_rl_num_samples,
+            branch_threshold=self.object_rl_branch_threshold,
+            max_steps=self.object_rl_max_steps, proposal_mask=proposal_mask,
+        )
+
     def loss_object_rl(self, outputs, targets):
         if self.object_rl_objective in ("best_of_n_ft", "best_of_n_set"):
             return self.loss_object_best_of_n(outputs, targets)
@@ -368,21 +380,26 @@ class SetCriterion(nn.Module):
         rollout_batch = 4
         sampled = []
         with torch.no_grad():
-            for start in range(0, k, rollout_batch):
-                repeats = min(rollout_batch, k - start)
-                sampled_inputs = (
-                    policy_inputs[0].repeat(repeats, 1, 1),
-                    [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
-                    policy_inputs[2].repeat(repeats, 1, 1, 1),
-                    policy_inputs[3],
+            if self.object_rl_tree_sampling:
+                sampled, trajectories, sampled_decisions, greedy = self._sample_rl_tree(
+                    policy_inputs, proposal_mask
                 )
-                orders, _ = self.object_decoder.rollout_permutation(
-                    *sampled_inputs, proposal_mask.repeat(repeats, 1), sample=True
+            else:
+                for start in range(0, k, rollout_batch):
+                    repeats = min(rollout_batch, k - start)
+                    sampled_inputs = (
+                        policy_inputs[0].repeat(repeats, 1, 1),
+                        [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
+                        policy_inputs[2].repeat(repeats, 1, 1, 1),
+                        policy_inputs[3],
+                    )
+                    orders, _ = self.object_decoder.rollout_permutation(
+                        *sampled_inputs, proposal_mask.repeat(repeats, 1), sample=True
+                    )
+                    sampled.extend(orders)
+                greedy, _ = self.object_decoder.rollout_permutation(
+                    *policy_inputs, proposal_mask, sample=False
                 )
-                sampled.extend(orders)
-            greedy, _ = self.object_decoder.rollout_permutation(
-                *policy_inputs, proposal_mask, sample=False
-            )
             sampled_reward = torch.stack([
                 self.object_reward(sampled[i * batch_size:(i + 1) * batch_size], outputs, targets)
                 for i in range(k)
@@ -390,21 +407,27 @@ class SetCriterion(nn.Module):
             greedy_reward = self.object_reward(greedy, outputs, targets)
         # Sampling needs no graph. A full causal pass scores each fixed order,
         # avoiding a growing-prefix autograd graph for every sampled action.
-        log_probabilities = []
-        for start in range(0, k, rollout_batch):
-            repeats = min(rollout_batch, k - start)
-            scored_inputs = (
-                policy_inputs[0].repeat(repeats, 1, 1),
-                [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
-                policy_inputs[2].repeat(repeats, 1, 1, 1),
-                policy_inputs[3],
+        if self.object_rl_tree_sampling:
+            log_probability = self.object_decoder.tree_log_probability(
+                *policy_inputs, trajectories, sampled_decisions,
+                proposal_mask=proposal_mask,
             )
-            scores = self.object_decoder.permutation_log_probability(
-                *scored_inputs, proposal_mask.repeat(repeats, 1),
-                sampled[start * batch_size:(start + repeats) * batch_size],
-            )
-            log_probabilities.append(scores.reshape(repeats, batch_size))
-        log_probability = torch.cat(log_probabilities)
+        else:
+            log_probabilities = []
+            for start in range(0, k, rollout_batch):
+                repeats = min(rollout_batch, k - start)
+                scored_inputs = (
+                    policy_inputs[0].repeat(repeats, 1, 1),
+                    [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
+                    policy_inputs[2].repeat(repeats, 1, 1, 1),
+                    policy_inputs[3],
+                )
+                scores = self.object_decoder.permutation_log_probability(
+                    *scored_inputs, proposal_mask.repeat(repeats, 1),
+                    sampled[start * batch_size:(start + repeats) * batch_size],
+                )
+                log_probabilities.append(scores.reshape(repeats, batch_size))
+            log_probability = torch.cat(log_probabilities)
         rl_loss, advantage = self._rl_policy_loss(
             sampled_reward, greedy_reward, log_probability
         )
@@ -415,7 +438,10 @@ class SetCriterion(nn.Module):
         return {"loss_object_rl": rl_loss}
 
     def _rl_policy_loss(self, sampled_reward, greedy_reward, log_probability):
-        loss_fn = scst_loss if self.object_rl_baseline == "scst" else rloo_self_critical_loss
+        # Tree leaves share random ancestors, so other leaves are not an
+        # independent leave-one-out baseline. Greedy reward is action-independent.
+        loss_fn = (scst_loss if self.object_rl_tree_sampling or self.object_rl_baseline == "scst"
+                   else rloo_self_critical_loss)
         return loss_fn(sampled_reward, greedy_reward, log_probability)
 
     def loss_object_best_of_n(self, outputs, targets):
@@ -434,26 +460,31 @@ class SetCriterion(nn.Module):
         sampled_orders = []
         trajectories = []
         with torch.no_grad():
-            for start in range(0, k, rollout_batch):
-                repeats = min(rollout_batch, k - start)
-                sampled_inputs = (
-                    policy_inputs[0].repeat(repeats, 1, 1),
-                    [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
-                    policy_inputs[2].repeat(repeats, 1, 1, 1),
-                    policy_inputs[3],
+            if self.object_rl_tree_sampling:
+                sampled_orders, trajectories, sampled_decisions, greedy_orders = self._sample_rl_tree(
+                    policy_inputs
                 )
-                orders, _, actions = self.object_decoder.rollout(
-                    *sampled_inputs, sample=True, max_steps=self.object_rl_max_steps,
+            else:
+                for start in range(0, k, rollout_batch):
+                    repeats = min(rollout_batch, k - start)
+                    sampled_inputs = (
+                        policy_inputs[0].repeat(repeats, 1, 1),
+                        [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
+                        policy_inputs[2].repeat(repeats, 1, 1, 1),
+                        policy_inputs[3],
+                    )
+                    orders, _, actions = self.object_decoder.rollout(
+                        *sampled_inputs, sample=True, max_steps=self.object_rl_max_steps,
+                        return_actions=True,
+                        query_bias_logits=query_bias.repeat(repeats, 1) if query_bias is not None else None,
+                    )
+                    sampled_orders.extend(orders)
+                    trajectories.extend(actions)
+                greedy_orders, _, _ = self.object_decoder.rollout(
+                    *policy_inputs, sample=False, max_steps=self.object_rl_max_steps,
                     return_actions=True,
-                    query_bias_logits=query_bias.repeat(repeats, 1) if query_bias is not None else None,
+                    query_bias_logits=query_bias,
                 )
-                sampled_orders.extend(orders)
-                trajectories.extend(actions)
-            greedy_orders, _, _ = self.object_decoder.rollout(
-                *policy_inputs, sample=False, max_steps=self.object_rl_max_steps,
-                return_actions=True,
-                query_bias_logits=query_bias,
-            )
             sampled_reward = torch.stack([
                 self.object_reward(
                     sampled_orders[i * batch_size:(i + 1) * batch_size], outputs, targets
@@ -514,47 +545,58 @@ class SetCriterion(nn.Module):
         sampled = []
         trajectories = []
         with torch.no_grad():
-            for start in range(0, k, rollout_batch):
-                repeats = min(rollout_batch, k - start)
-                sampled_inputs = (
-                    policy_inputs[0].repeat(repeats, 1, 1),
-                    [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
-                    policy_inputs[2].repeat(repeats, 1, 1, 1),
-                    policy_inputs[3],
+            if self.object_rl_tree_sampling:
+                sampled, trajectories, sampled_decisions, greedy = self._sample_rl_tree(
+                    policy_inputs
                 )
-                orders, _, actions = self.object_decoder.rollout(
-                    *sampled_inputs, sample=True, max_steps=self.object_rl_max_steps,
+            else:
+                for start in range(0, k, rollout_batch):
+                    repeats = min(rollout_batch, k - start)
+                    sampled_inputs = (
+                        policy_inputs[0].repeat(repeats, 1, 1),
+                        [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
+                        policy_inputs[2].repeat(repeats, 1, 1, 1),
+                        policy_inputs[3],
+                    )
+                    orders, _, actions = self.object_decoder.rollout(
+                        *sampled_inputs, sample=True, max_steps=self.object_rl_max_steps,
+                        return_actions=True,
+                        query_bias_logits=query_bias.repeat(repeats, 1) if query_bias is not None else None,
+                    )
+                    sampled.extend(orders)
+                    trajectories.extend(actions)
+                greedy, _, greedy_actions = self.object_decoder.rollout(
+                    *policy_inputs, sample=False, max_steps=self.object_rl_max_steps,
                     return_actions=True,
-                    query_bias_logits=query_bias.repeat(repeats, 1) if query_bias is not None else None,
+                    query_bias_logits=query_bias,
                 )
-                sampled.extend(orders)
-                trajectories.extend(actions)
-            greedy, _, greedy_actions = self.object_decoder.rollout(
-                *policy_inputs, sample=False, max_steps=self.object_rl_max_steps,
-                return_actions=True,
-                query_bias_logits=query_bias,
-            )
             sampled_reward = torch.stack([
                 self.object_reward(sampled[i * batch_size:(i + 1) * batch_size], outputs, targets)
                 for i in range(k)
             ])
             greedy_reward = self.object_reward(greedy, outputs, targets)
-        log_probabilities = []
-        for start in range(0, k, rollout_batch):
-            repeats = min(rollout_batch, k - start)
-            scored_inputs = (
-                policy_inputs[0].repeat(repeats, 1, 1),
-                [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
-                policy_inputs[2].repeat(repeats, 1, 1, 1),
-                policy_inputs[3],
+        if self.object_rl_tree_sampling:
+            log_probability = self.object_decoder.tree_log_probability(
+                *policy_inputs, trajectories, sampled_decisions,
+                proposal_mask=None,
             )
-            scores = self.object_decoder.autoregressive_log_probability(
-                *scored_inputs,
-                trajectories[start * batch_size:(start + repeats) * batch_size],
-                query_bias_logits=query_bias.repeat(repeats, 1) if query_bias is not None else None,
-            )
-            log_probabilities.append(scores.reshape(repeats, batch_size))
-        log_probability = torch.cat(log_probabilities)
+        else:
+            log_probabilities = []
+            for start in range(0, k, rollout_batch):
+                repeats = min(rollout_batch, k - start)
+                scored_inputs = (
+                    policy_inputs[0].repeat(repeats, 1, 1),
+                    [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
+                    policy_inputs[2].repeat(repeats, 1, 1, 1),
+                    policy_inputs[3],
+                )
+                scores = self.object_decoder.autoregressive_log_probability(
+                    *scored_inputs,
+                    trajectories[start * batch_size:(start + repeats) * batch_size],
+                    query_bias_logits=query_bias.repeat(repeats, 1) if query_bias is not None else None,
+                )
+                log_probabilities.append(scores.reshape(repeats, batch_size))
+            log_probability = torch.cat(log_probabilities)
         rl_loss, advantage = self._rl_policy_loss(
             sampled_reward, greedy_reward, log_probability
         )

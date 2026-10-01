@@ -221,6 +221,189 @@ class ObjectDecoder(nn.Module):
             for batch_index in range(batch_size)
         ]
 
+    def _cached_tree_step(self, embeddings, features, regions, exclusions,
+                          vocabulary, output_vocabulary, prefix, parent_cache):
+        """Decode one trie node, reusing projected self-attention K/V ancestors."""
+        token = prefix[-1] if prefix else -1
+        decoded = (self.bos if token < 0 else vocabulary[0, token])
+        decoded = (decoded + self.position.weight[len(prefix)])[None, None]
+        previous = torch.tensor([[-1, *prefix]], device=embeddings.device)
+        memory_masks = [self._memory_mask(region, previous)[:, -1:] for region in regions]
+        vocabulary_mask = self._vocabulary_mask(exclusions, previous)[:, -1:]
+        vocabulary_mask = vocabulary_mask.expand(self.num_heads, -1, -1)
+        cache = []
+        for index, layer in enumerate(self.layers.layers):
+            attention = layer.self_attn
+            residual = decoded
+            source = layer.norm1(decoded) if layer.norm_first else decoded
+            q, k, v = F.linear(source, attention.in_proj_weight,
+                               attention.in_proj_bias).chunk(3, dim=-1)
+            def heads(value):
+                return value.reshape(1, 1, self.num_heads, -1).transpose(1, 2)
+            q, k, v = heads(q), heads(k), heads(v)
+            if parent_cache is not None:
+                k = torch.cat((parent_cache[index][0], k), dim=2)
+                v = torch.cat((parent_cache[index][1], v), dim=2)
+            cache.append((k, v))
+            if hasattr(F, "scaled_dot_product_attention"):
+                attended = F.scaled_dot_product_attention(q, k, v)
+            else:
+                # Keep older training environments compatible with the cache.
+                weights = (q.float() @ k.float().transpose(-1, -2)) * (q.shape[-1] ** -0.5)
+                attended = weights.softmax(-1).to(v.dtype) @ v
+            attended = attended.transpose(1, 2).reshape_as(source)
+            decoded = residual + layer.dropout1(attention.out_proj(attended))
+            if not layer.norm_first:
+                decoded = layer.norm1(decoded)
+            level = index % len(features)
+            memory = torch.cat((features[level], self.null_image_token[level][None, None]), dim=1)
+            source = layer.norm2(decoded) if layer.norm_first else decoded
+            attended = layer.multihead_attn(source, memory, memory,
+                                            attn_mask=memory_masks[level], need_weights=False)[0]
+            decoded = decoded + layer.dropout2(attended)
+            if not layer.norm_first:
+                decoded = layer.norm2(decoded)
+            source = layer.norm3(decoded) if layer.norm_first else decoded
+            decoded = decoded + layer.dropout3(layer.linear2(layer.dropout(
+                layer.activation(layer.linear1(source)))))
+            if not layer.norm_first:
+                decoded = layer.norm3(decoded)
+            attended = self.vocabulary_attention[index](
+                decoded, vocabulary, vocabulary, attn_mask=vocabulary_mask,
+                need_weights=False)[0]
+            decoded = self.vocabulary_norm[index](decoded + attended)
+        logits = (self.norm(decoded) @ output_vocabulary.transpose(1, 2)) * self.scale
+        return logits[0, 0], cache
+
+    @torch.no_grad()
+    def rollout_tree(self, mask_embeddings, image_features, mask_logits, image_sizes,
+                     num_samples, branch_threshold=0.9, max_steps=101,
+                     proposal_mask=None):
+        """Sample at uncertain trie nodes; include a fully greedy baseline path.
+
+        Samples draw independently with replacement at each uncertain node.
+        Equal prefixes share one decoder evaluation and projected K/V cache.
+        Results use sample-major order, matching the reward code.
+        """
+        if num_samples < 1 or not 0 <= branch_threshold <= 1:
+            raise ValueError("Invalid tree sample count or branching threshold")
+        batch_size, num_queries = mask_embeddings.shape[:2]
+        if proposal_mask is not None and (proposal_mask.shape != (batch_size, num_queries)
+                                          or proposal_mask.dtype != torch.bool):
+            raise ValueError("proposal_mask must be boolean with shape [batch, queries]")
+        regions = self.prepare_regions(mask_logits, image_sizes)
+        exclusions = self.prepare_vocabulary_exclusions(mask_logits)
+        all_paths, all_decisions = [], []
+        for image in range(batch_size):
+            embeddings = mask_embeddings[image:image + 1]
+            features = [feature[image:image + 1] for feature in image_features]
+            image_regions = [region[image:image + 1] for region in regions]
+            excluded = exclusions[image:image + 1]
+            vocabulary = torch.cat((self.input_mask_projection(embeddings),
+                                    self.eof[None, None]), dim=1)
+            output_vocabulary = torch.cat((self.output_mask_projection(embeddings),
+                                           self.eof[None, None]), dim=1)
+            paths = [[] for _ in range(num_samples + 1)]
+            decisions = [[] for _ in paths]
+            frontier = {(): list(range(num_samples + 1))}
+            caches = {}
+            limit = num_queries + 1 if proposal_mask is not None else min(max_steps, num_queries + 1)
+            for _ in range(limit):
+                following = {}
+                next_caches = {}
+                for prefix, members in frontier.items():
+                    logits, cache = self._cached_tree_step(
+                        embeddings, features, image_regions, excluded, vocabulary,
+                        output_vocabulary, prefix, caches.get(prefix))
+                    selected = torch.zeros(num_queries, dtype=torch.bool, device=logits.device)
+                    if prefix:
+                        selected[list(prefix)] = True
+                    blocked = excluded[0, list(prefix)].any(0) if prefix else selected
+                    if proposal_mask is None:
+                        allowed = torch.cat((~blocked, selected.new_ones(1)))
+                    else:
+                        remaining = proposal_mask[image] & ~selected
+                        eligible = remaining & ~blocked
+                        if not eligible.any():
+                            eligible = remaining
+                        allowed = torch.cat((eligible, (~remaining.any()).reshape(1)))
+                    logits = logits.float().masked_fill(~allowed, -torch.inf)
+                    distribution = torch.distributions.Categorical(logits=logits)
+                    greedy = int(logits.argmax())
+                    branch = bool(distribution.probs.max() < branch_threshold)
+                    # One vector draw keeps sampling independent for paths sharing a node.
+                    draws = distribution.sample((len(members),)) if branch else None
+                    for slot, member in enumerate(members):
+                        stochastic = branch and member < num_samples
+                        token = int(draws[slot]) if stochastic else greedy
+                        paths[member].append(token)
+                        decisions[member].append(stochastic)
+                        if token != num_queries:
+                            child = (*prefix, token)
+                            following.setdefault(child, []).append(member)
+                            next_caches[child] = cache
+                frontier, caches = following, next_caches
+                if not frontier:
+                    break
+            all_paths.append(paths)
+            all_decisions.append(decisions)
+        trajectories = [all_paths[image][sample] for sample in range(num_samples)
+                        for image in range(batch_size)]
+        sampled_decisions = [all_decisions[image][sample] for sample in range(num_samples)
+                             for image in range(batch_size)]
+        orders = [[token for token in path if token != num_queries] for path in trajectories]
+        greedy = [[token for token in paths[-1] if token != num_queries] for paths in all_paths]
+        return orders, trajectories, sampled_decisions, greedy
+
+    def tree_log_probability(self, mask_embeddings, image_features, mask_logits,
+                             image_sizes, trajectories, sampled_decisions,
+                             proposal_mask=None):
+        """Score only stochastic edges, evaluating each shared prefix once."""
+        batch_size, num_queries = mask_embeddings.shape[:2]
+        if len(trajectories) != len(sampled_decisions) or len(trajectories) % batch_size:
+            raise ValueError("Tree trajectories must contain complete sample batches")
+        num_samples = len(trajectories) // batch_size
+        paths = [[trajectories[sample * batch_size + image] for sample in range(num_samples)]
+                 for image in range(batch_size)]
+        previous, positions, ancestors, _ = self.pack_prefix_trees(
+            [[path[:-1] if path and path[-1] == num_queries else path for path in group]
+             for group in paths], num_queries, mask_embeddings.device)
+        exclusions = self.prepare_vocabulary_exclusions(mask_logits)
+        regions = self.prepare_regions(mask_logits, image_sizes)
+        logits = self(mask_embeddings, image_features, regions, previous, exclusions,
+                      positions=positions, ancestors=ancestors).float()
+        if proposal_mask is not None:
+            identity = torch.eye(num_queries, dtype=torch.bool, device=logits.device)
+            selected = self._vocabulary_mask(identity[None].expand(batch_size, -1, -1),
+                                             previous, ancestors)[..., :num_queries]
+            blocked = self._vocabulary_mask(exclusions, previous, ancestors)[..., :num_queries]
+            remaining = proposal_mask[:, None] & ~selected
+            eligible = remaining & ~blocked
+            eligible = torch.where(eligible.any(-1, keepdim=True), eligible, remaining)
+            allowed = torch.cat((eligible, ~remaining.any(-1, keepdim=True)), dim=-1)
+        else:
+            allowed = ~self._vocabulary_mask(exclusions, previous, ancestors)
+        log_probs = F.log_softmax(logits.masked_fill(~allowed, -torch.inf), dim=-1)
+        scores = []
+        for sample in range(num_samples):
+            for image in range(batch_size):
+                path = paths[image][sample]
+                flags = sampled_decisions[sample * batch_size + image]
+                if len(path) != len(flags):
+                    raise ValueError("Each action needs a sampling flag")
+                node = 0
+                score = logits[image, 0, 0] * 0.0
+                for token, stochastic in zip(path, flags):
+                    if stochastic:
+                        score = score + log_probs[image, node, token]
+                    if token != num_queries:
+                        # Children have exactly their parent's ancestors plus themselves.
+                        children = (positions[image] == positions[image, node] + 1)
+                        children &= ancestors[image, :, node] & (previous[image] == token)
+                        node = int(children.nonzero(as_tuple=True)[0][0])
+                scores.append(score)
+        return torch.stack(scores).reshape(num_samples, batch_size)
+
     def rollout(self, mask_embeddings, image_features, mask_logits, image_sizes,
                 sample=True, max_steps=32, return_diagnostics=False,
                 return_actions=False, query_bias_logits=None):
