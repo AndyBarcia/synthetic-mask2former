@@ -45,11 +45,13 @@ class SyntheticScenePanopticEvaluator(DatasetEvaluator):
 
     @staticmethod
     def _oracle_assignment(gt_map, gt_info, proposals):
-        """Maximize total binary-mask IoU with a one-to-one GT/query assignment.
+        """Prioritize the number of one-to-one matches with binary IoU > 0.5.
 
         Classes and proposal selection are oracle decisions. Selected masks keep
         their predicted geometry; overlapping pixels go to the highest logit,
-        and pixels outside every selected binary mask remain void.
+        and pixels outside every selected binary mask remain void. Prune masks
+        that fail the same strict threshold after overlap resolution, repainting
+        after each removal. This is a heuristic, not a global PQ optimization.
         """
         proposals = proposals.detach()
         gt_map = gt_map.to(device=proposals.device, dtype=torch.int64)
@@ -67,21 +69,40 @@ class SyntheticScenePanopticEvaluator(DatasetEvaluator):
         intersection = gt_flat @ pred_flat.T
         union = gt_flat.sum(1)[:, None] + pred_flat.sum(1)[None] - intersection
         iou = intersection / union.clamp_min(1)
-        gt_indices, query_indices = linear_sum_assignment(-iou.cpu().numpy())
-        # Zero-overlap assignments add no useful proposal.
-        positive = iou[gt_indices, query_indices].cpu().numpy() > 0
-        gt_indices, query_indices = gt_indices[positive], query_indices[positive]
+        valid = iou > 0.5
+        # One extra valid match outweighs any possible gain in summed IoU.
+        bonus = min(iou.shape) + 1
+        quality = torch.where(valid, bonus + iou, 0)
+        gt_indices, query_indices = linear_sum_assignment(-quality.cpu().numpy())
+        accepted = valid[gt_indices, query_indices].cpu().numpy()
+        gt_indices, query_indices = gt_indices[accepted], query_indices[accepted]
         if len(query_indices) == 0:
             return panoptic_map, []
 
         selected = proposals[torch.as_tensor(query_indices, device=proposals.device)]
-        best_logits, winners = selected.max(dim=0)
-        panoptic_map[best_logits > 0] = winners[best_logits > 0] + 1
-        visible_ids = set(panoptic_map.unique().tolist())
+        assigned_gt = gt_masks[torch.as_tensor(gt_indices, device=proposals.device)]
+        while len(gt_indices):
+            best_logits, winners = selected.max(dim=0)
+            panoptic_map.zero_()
+            panoptic_map[best_logits > 0] = winners[best_logits > 0] + 1
+            final_ious = []
+            for index, target in enumerate(assigned_gt):
+                visible = (panoptic_map == index + 1) & (gt_map != 0)
+                intersection = (visible & target).sum()
+                union = (visible | target).sum()
+                final_ious.append(intersection.float() / union.clamp_min(1))
+            final_ious = torch.stack(final_ious)
+            if (final_ious > 0.5).all():
+                break
+            # Remove the worst failed mask first: repainting can rescue others.
+            keep = torch.arange(len(gt_indices), device=proposals.device) != final_ious.argmin()
+            selected, assigned_gt = selected[keep], assigned_gt[keep]
+            gt_indices = gt_indices[keep.cpu().numpy()]
+        else:
+            panoptic_map.zero_()
         segments = [
             {**gt_info[gt_index], "id": index + 1}
             for index, gt_index in enumerate(gt_indices)
-            if index + 1 in visible_ids
         ]
         return panoptic_map, segments
 
