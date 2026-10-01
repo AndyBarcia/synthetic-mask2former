@@ -7,10 +7,13 @@ from torch.nn import functional as F
 
 class ObjectDecoder(nn.Module):
     def __init__(self, mask_dim, hidden_dim, num_queries, num_layers, num_heads,
-                 dim_feedforward, mask_iou_threshold=0.8):
+                 dim_feedforward, mask_iou_threshold=0.8, prefix_tree_branches=4):
         super().__init__()
         if not 0 <= mask_iou_threshold <= 1:
             raise ValueError("mask_iou_threshold must be between 0 and 1")
+        if prefix_tree_branches < 1:
+            raise ValueError("prefix_tree_branches must be positive")
+        self.prefix_tree_branches = prefix_tree_branches
         self.num_queries = num_queries
         self.num_heads = num_heads
         self.mask_iou_threshold = mask_iou_threshold
@@ -37,6 +40,56 @@ class ObjectDecoder(nn.Module):
         self.scale = hidden_dim ** -0.5
 
     @staticmethod
+    def pack_prefix_trees(sequences, num_queries, device):
+        """Pack paths into context tries; edge counts preserve expanded-path CE.
+
+        Each node represents a prefix (root is BOS). Targets are outgoing edge
+        labels, including EOF. Shared nodes accumulate one count per path.
+        Padding attends only to itself and has no loss weight.
+        """
+        trees = []
+        for paths in sequences:
+            tokens, parents, depths, counts = [-1], [-1], [0], [{}]
+            children = {}
+            for path in paths:
+                node = 0
+                for token in list(path) + [num_queries]:
+                    token = int(token)
+                    counts[node][token] = counts[node].get(token, 0) + 1
+                    if token == num_queries:
+                        break
+                    key = (node, token)
+                    if key not in children:
+                        children[key] = len(tokens)
+                        tokens.append(token)
+                        parents.append(node)
+                        depths.append(depths[node] + 1)
+                        counts.append({})
+                    node = children[key]
+            trees.append((tokens, parents, depths, counts))
+        size = max(len(tree[0]) for tree in trees)
+        previous = torch.full((len(trees), size), -1, device=device, dtype=torch.long)
+        positions = torch.zeros_like(previous)
+        ancestors = torch.eye(size, device=device, dtype=torch.bool).expand(len(trees), -1, -1).clone()
+        weights = torch.zeros(len(trees), size, num_queries + 1, device=device)
+        for batch, (tokens, parents, depths, counts) in enumerate(trees):
+            previous[batch, :len(tokens)] = torch.tensor(tokens, device=device)
+            positions[batch, :len(tokens)] = torch.tensor(depths, device=device)
+            for node, parent in enumerate(parents):
+                if parent >= 0:
+                    ancestors[batch, node] |= ancestors[batch, parent]
+                for token, count in counts[node].items():
+                    weights[batch, node, token] = count
+        return previous, positions, ancestors, weights
+
+    @staticmethod
+    def _accumulate_prior(prior, valid, ancestors=None):
+        prior = prior & valid.unsqueeze(-1)
+        if ancestors is None:
+            return prior.cumsum(dim=1) > 0
+        return torch.bmm(ancestors.float(), prior.float()) > 0
+
+    @staticmethod
     def prepare_regions(mask_logits, image_sizes):
         """Threshold final query masks at each cross-attention feature scale."""
         with torch.no_grad():
@@ -58,17 +111,17 @@ class ObjectDecoder(nn.Module):
             return exclusions | identity
 
     @staticmethod
-    def _vocabulary_mask(exclusions, previous_tokens):
+    def _vocabulary_mask(exclusions, previous_tokens, ancestors=None):
         """Exclude selected masks and their IoU neighbors from later positions."""
         batch_size, num_queries, _ = exclusions.shape
         indices = previous_tokens.clamp(0, num_queries - 1)
         prior = exclusions.gather(1, indices.unsqueeze(-1).expand(-1, -1, num_queries))
         valid = (previous_tokens >= 0) & (previous_tokens < num_queries)
-        blocked = (prior & valid.unsqueeze(-1)).cumsum(dim=1) > 0
+        blocked = ObjectDecoder._accumulate_prior(prior, valid, ancestors)
         # EOF remains available even when every mask has been excluded.
         return F.pad(blocked, (0, 1), value=False)
 
-    def _memory_mask(self, regions, previous_tokens):
+    def _memory_mask(self, regions, previous_tokens, ancestors=None):
         """Block the union of masks emitted up to each autoregressive position."""
         batch_size, num_queries, spatial_tokens = regions.shape
         indices = previous_tokens.clamp(0, num_queries - 1)
@@ -76,7 +129,7 @@ class ObjectDecoder(nn.Module):
             1, indices.unsqueeze(-1).expand(-1, -1, spatial_tokens)
         )
         valid = (previous_tokens >= 0) & (previous_tokens < num_queries)
-        covered = (prior_regions & valid.unsqueeze(-1)).cumsum(dim=1) > 0
+        covered = self._accumulate_prior(prior_regions, valid, ancestors)
         # The learned null image key must never be masked, including at full coverage.
         covered = F.pad(covered, (0, 1), value=False)
         return covered[:, None].expand(-1, self.num_heads, -1, -1).reshape(
@@ -84,7 +137,7 @@ class ObjectDecoder(nn.Module):
         )
 
     def forward(self, mask_embeddings, image_features, image_regions, previous_tokens,
-                vocabulary_exclusions):
+                vocabulary_exclusions, *, positions=None, ancestors=None):
         """Return next-token logits with causal image and vocabulary attention."""
         if len(image_features) != 3 or len(image_regions) != 3:
             raise ValueError("Object decoder requires three image feature levels")
@@ -97,9 +150,13 @@ class ObjectDecoder(nn.Module):
             (previous_tokens < 0).unsqueeze(-1), self.bos, previous
         )
         steps = previous.shape[1]
-        previous = previous + self.position.weight[:steps]
+        previous = previous + (self.position.weight[:steps] if positions is None else self.position(positions))
         causal_mask = torch.ones(steps, steps, dtype=torch.bool, device=previous.device).triu(1)
-        vocabulary_mask = self._vocabulary_mask(vocabulary_exclusions, previous_tokens)
+        if ancestors is not None:
+            causal_mask = (~ancestors)[:, None].expand(-1, self.num_heads, -1, -1).reshape(
+                mask_tokens.shape[0] * self.num_heads, steps, steps
+            )
+        vocabulary_mask = self._vocabulary_mask(vocabulary_exclusions, previous_tokens, ancestors)
         vocabulary_mask = vocabulary_mask[:, None].expand(-1, self.num_heads, -1, -1).reshape(
             mask_tokens.shape[0] * self.num_heads, steps, self.num_queries + 1
         )
@@ -113,7 +170,7 @@ class ObjectDecoder(nn.Module):
             decoded = layer(
                 decoded, image_memory,
                 tgt_mask=causal_mask,
-                memory_mask=self._memory_mask(image_regions[level_index], previous_tokens),
+                memory_mask=self._memory_mask(image_regions[level_index], previous_tokens, ancestors),
             )
             attended = self.vocabulary_attention[layer_index](
                 decoded, vocabulary, vocabulary, attn_mask=vocabulary_mask,

@@ -163,6 +163,7 @@ class MaskFormer(nn.Module):
                 cfg.MODEL.MASK_FORMER.NHEADS,
                 cfg.MODEL.MASK_FORMER.DIM_FEEDFORWARD,
                 cfg.MODEL.MASK_FORMER.OBJECT_DEC_MASK_IOU_THRESHOLD,
+                cfg.MODEL.MASK_FORMER.OBJECT_DEC_PREFIX_TREE_BRANCHES,
             ) if use_object_decoder else None,
         )
 

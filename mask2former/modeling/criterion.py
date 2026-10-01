@@ -148,23 +148,25 @@ class SetCriterion(nn.Module):
         return {"loss_query_bias": (loss * weights).sum() / weights.sum().clamp_min(1.0)}
 
     def loss_object_decoder(self, outputs, indices):
-        """Teacher-force matched queries in a fresh random order, then EOF."""
+        """Teacher-force shared prefixes and permuted suffixes in one tree pass."""
         embeddings = outputs["mask_embeddings"]
-        batch_size, num_queries = embeddings.shape[:2]
-        ordered = []
-        for batch_index, (src_indices, _) in enumerate(indices):
+        num_queries = embeddings.shape[1]
+        paths_per_image = []
+        for src_indices, _ in indices:
             src_indices = src_indices.to(embeddings.device)
-            ordered.append(src_indices[torch.randperm(len(src_indices), device=embeddings.device)])
-        steps = max(len(indices_per_image) for indices_per_image in ordered) + 1
-        previous = torch.full((batch_size, steps), num_queries, dtype=torch.long, device=embeddings.device)
-        targets = torch.full((batch_size, steps), -100, dtype=torch.long, device=embeddings.device)
-        previous[:, 0] = -1  # beginning-of-sequence embedding
-        for batch_index, indices_per_image in enumerate(ordered):
-            count = len(indices_per_image)
-            targets[batch_index, :count] = indices_per_image
-            targets[batch_index, count] = num_queries
-            if count:
-                previous[batch_index, 1:count + 1] = indices_per_image
+            ordered = src_indices[torch.randperm(len(src_indices), device=embeddings.device)]
+            # Keep at least two suffix objects when possible, so branching can
+            # change the order. Empty and singleton scenes remain valid paths.
+            split = int(torch.randint(max(len(ordered) - 1, 1), (), device=embeddings.device))
+            prefix, suffix = ordered[:split], ordered[split:]
+            paths = [ordered.tolist()]
+            for _ in range(self.object_decoder.prefix_tree_branches - 1):
+                permutation = torch.randperm(len(suffix), device=embeddings.device)
+                paths.append(torch.cat((prefix, suffix[permutation])).tolist())
+            paths_per_image.append(paths)
+        previous, positions, ancestors, weights = self.object_decoder.pack_prefix_trees(
+            paths_per_image, num_queries, embeddings.device
+        )
         image_regions = self.object_decoder.prepare_regions(
             outputs["pred_masks"], outputs["object_decoder_image_sizes"]
         )
@@ -173,9 +175,10 @@ class SetCriterion(nn.Module):
         )
         logits = self.object_decoder(
             embeddings, outputs["object_decoder_image_features"], image_regions, previous,
-            vocabulary_exclusions,
+            vocabulary_exclusions, positions=positions, ancestors=ancestors,
         )
-        return {"loss_object_decoder": F.cross_entropy(logits.flatten(0, 1), targets.flatten())}
+        loss = -(F.log_softmax(logits.float(), dim=-1) * weights).sum() / weights.sum()
+        return {"loss_object_decoder": loss}
     
     def loss_masks(self, outputs, targets, indices, num_masks):
         """Compute the losses related to the masks: the focal loss and the dice loss.

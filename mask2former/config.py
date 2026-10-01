@@ -61,6 +61,8 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.DIM_FEEDFORWARD = 2048
     cfg.MODEL.MASK_FORMER.ENC_LAYERS = 0
     cfg.MODEL.MASK_FORMER.DEC_LAYERS = 6
+    # Number of suffix permutations sharing a randomly sampled training prefix.
+    cfg.MODEL.MASK_FORMER.OBJECT_DEC_PREFIX_TREE_BRANCHES = 4
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_LAYERS = 5
     # Exclude selected masks and other vocabulary masks above this predicted-mask IoU.
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_MASK_IOU_THRESHOLD = 0.8
