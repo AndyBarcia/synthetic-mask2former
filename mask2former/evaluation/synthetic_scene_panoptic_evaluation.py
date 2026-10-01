@@ -157,4 +157,11 @@ class SyntheticScenePanopticEvaluator(DatasetEvaluator):
             "PQ": pq, "SQ": sq, "RQ": rq,
             "PQ_th": pq_th, "SQ_th": sq_th, "RQ_th": rq_th,
             "PQ_st": pq_st, "SQ_st": sq_st, "RQ_st": rq_st,
+            # Raw segment counts summed over images and distributed workers.
+            "TP": int(stats[:, 1].sum().item()),
+            "FP": int(stats[:, 2].sum().item()),
+            "TP_th": int(stats[1:, 1].sum().item()),
+            "FP_th": int(stats[1:, 2].sum().item()),
+            "TP_st": int(stats[0, 1].item()),
+            "FP_st": int(stats[0, 2].item()),
         }
