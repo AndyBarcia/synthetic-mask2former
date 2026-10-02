@@ -10,6 +10,7 @@ from detectron2.layers import Conv2d
 from detectron2.utils.registry import Registry
 
 from .position_encoding import PositionEmbeddingSine
+from .gt_query_bias import GTQueryBias
 from .transformer import Transformer
 
 
@@ -91,9 +92,7 @@ class StandardTransformerDecoder(nn.Module):
         hidden_dim = transformer.d_model
 
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
-        self.query_bias_embed = nn.Linear(hidden_dim, num_queries)
-        nn.init.zeros_(self.query_bias_embed.weight)
-        nn.init.zeros_(self.query_bias_embed.bias)
+        self.query_bias_embed = GTQueryBias(mask_dim, hidden_dim, num_queries)
 
         if in_channels != hidden_dim or enforce_input_project:
             self.input_proj = Conv2d(in_channels, hidden_dim, kernel_size=1)
@@ -137,12 +136,11 @@ class StandardTransformerDecoder(nn.Module):
 
         src = x
         projected_src = self.input_proj(src)
-        query_bias_logits = self.query_bias_embed(projected_src.flatten(2).mean(-1))
         hs, memory = self.transformer(projected_src, mask, self.query_embed.weight, pos)
 
         if self.mask_classification:
             outputs_class = self.class_embed(hs)
-            out = {"pred_logits": outputs_class[-1], "query_bias_logits": query_bias_logits}
+            out = {"pred_logits": outputs_class[-1]}
         else:
             out = {}
 
@@ -153,7 +151,7 @@ class StandardTransformerDecoder(nn.Module):
             out["pred_masks"] = outputs_seg_masks[-1]
             out["aux_outputs"] = self._set_aux_loss(
                 outputs_class if self.mask_classification else None, outputs_seg_masks,
-                query_bias_logits
+                None
             )
         else:
             # FIXME h_boxes takes the last one computed, keep this in mind
@@ -161,6 +159,12 @@ class StandardTransformerDecoder(nn.Module):
             mask_embed = self.mask_embed(hs[-1])
             outputs_seg_masks = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
             out["pred_masks"] = outputs_seg_masks
+        out["query_bias_features"] = mask_features
+        out["query_bias_logits"] = self.query_bias_embed.predicted_query_logits(
+            mask_features, out["pred_masks"]
+        )
+        for aux in out.get("aux_outputs", []):
+            aux["query_bias_logits"] = out["query_bias_logits"]
         return out
 
     @torch.jit.unused

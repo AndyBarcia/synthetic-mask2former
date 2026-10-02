@@ -210,7 +210,24 @@ class SetCriterion(nn.Module):
         return {"loss_ce": F.cross_entropy(src_logits, target_classes_o)}
 
     def loss_query_bias(self, outputs, targets, indices, num_masks):
-        """Binary query-selection loss: matched queries are positive."""
+        """Supervise matched GT/query pairs as positives, other pairs as negatives."""
+        if "gt_query_bias_logits" in outputs:
+            numerator = outputs["pred_logits"].sum() * 0.0
+            denominator = numerator.detach().clone()
+            for logits, (src_indices, gt_indices) in zip(
+                outputs["gt_query_bias_logits"], indices
+            ):
+                logits = logits.float()
+                target = torch.zeros_like(logits)
+                target[gt_indices, src_indices] = 1.0
+                weights = torch.where(target.bool(), 1.0, self.eos_coef)
+                numerator = numerator + (
+                    F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+                    * weights
+                ).sum()
+                denominator = denominator + weights.sum()
+            return {"loss_query_bias": numerator / denominator.clamp_min(1.0)}
+
         assert "query_bias_logits" in outputs
         logits = outputs["query_bias_logits"].float()
         target = torch.zeros_like(logits)

@@ -72,3 +72,12 @@ RL diagnostics appear in the standard metrics files and console logs.
 For evaluation, point `MODEL.WEIGHTS` to the desired phase checkpoint and use
 `--eval-only`. In sequential mode, use the phase's output directory if you also
 use `--resume` for evaluation.
+
+The query-bias head encodes each GT mask's pooled pixel-decoder features and
+relative area into a `(GT, Q)` matrix. Hungarian matching uses the transpose of
+its sigmoid probabilities as a negative cost. The bias loss marks matched
+GT/query pairs positive and weights all other pairs by `NO_OBJECT_WEIGHT`.
+The same matrix is reused at every auxiliary decoder depth. At inference, each
+predicted soft mask is encoded and its corresponding query logit supplies the
+existing per-query confidence score. The new encoder replaces the old global
+linear bias head; its parameters must be trained when loading older checkpoints.

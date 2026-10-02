@@ -199,9 +199,11 @@ class HungarianMatcher(nn.Module):
                 + self.cost_class * cost_class
                 + self.cost_dice * cost_dice
             )
-            # This is a query-selection prior, so its row cost is shared by all
-            # targets. High activation makes a query cheaper to select.
-            if "query_bias_logits" in outputs:
+            # GT-conditioned logits are (GT, Q); matching costs are (Q, GT).
+            if "gt_query_bias_logits" in outputs:
+                query_bias_cost = -outputs["gt_query_bias_logits"][b].float().sigmoid().T
+                C = C + self.cost_query_bias * query_bias_cost
+            elif "query_bias_logits" in outputs:
                 query_bias_cost = -outputs["query_bias_logits"][b].float().sigmoid()
                 C = C + self.cost_query_bias * query_bias_cost[:, None]
             C = C.reshape(num_queries, -1).cpu()

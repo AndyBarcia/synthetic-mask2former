@@ -262,6 +262,15 @@ class MaskFormer(nn.Module):
             else:
                 targets = None
 
+            if targets is not None and not self.object_rl_only:
+                gt_query_bias_logits = [
+                    self.sem_seg_head.predictor.query_bias_embed(features, target["masks"])
+                    for features, target in zip(outputs["query_bias_features"], targets)
+                ]
+                outputs["gt_query_bias_logits"] = gt_query_bias_logits
+                for aux in outputs.get("aux_outputs", []):
+                    aux["gt_query_bias_logits"] = gt_query_bias_logits
+
             # bipartite matching-based loss
             losses = (self.criterion.loss_object_rl(outputs, targets)
                       if self.object_rl_only else self.criterion(outputs, targets))

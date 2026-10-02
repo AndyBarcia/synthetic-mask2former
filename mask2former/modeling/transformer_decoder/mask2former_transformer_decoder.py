@@ -11,6 +11,7 @@ from detectron2.config import configurable
 from detectron2.layers import Conv2d
 
 from .position_encoding import PositionEmbeddingSine
+from .gt_query_bias import GTQueryBias
 from .maskformer_transformer_decoder import TRANSFORMER_DECODER_REGISTRY
 
 
@@ -316,9 +317,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         self.query_feat = nn.Embedding(num_queries, hidden_dim)
         # learnable query p.e.
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
-        self.query_bias_embed = nn.Linear(hidden_dim, num_queries)
-        nn.init.zeros_(self.query_bias_embed.weight)
-        nn.init.zeros_(self.query_bias_embed.bias)
+        self.query_bias_embed = GTQueryBias(mask_dim, hidden_dim, num_queries)
 
         # level embedding (we always use 3 scales)
         self.num_feature_levels = 3
@@ -382,11 +381,6 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
             pos[-1] = pos[-1].permute(2, 0, 1)
             src[-1] = src[-1].permute(2, 0, 1)
 
-        # Pool all projected image tokens once. These logits are deliberately
-        # reused for matching and supervision at every decoder depth.
-        pooled_image = torch.cat(src, dim=0).mean(0)
-        query_bias_logits = self.query_bias_embed(pooled_image)
-
         _, bs, _ = src[0].shape
 
         # QxNxC
@@ -429,6 +423,9 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
 
         assert len(predictions_class) == self.num_layers + 1
 
+        query_bias_logits = self.query_bias_embed.predicted_query_logits(
+            mask_features, predictions_mask[-1]
+        )
         out = {
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
@@ -441,6 +438,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
             ],
             'object_decoder_image_sizes': size_list,
             'query_bias_logits': query_bias_logits,
+            'query_bias_features': mask_features,
             'aux_outputs': self._set_aux_loss(
                 predictions_class if self.mask_classification else None, predictions_mask,
                 query_bias_logits
