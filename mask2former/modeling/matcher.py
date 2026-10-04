@@ -148,6 +148,9 @@ class HungarianMatcher(nn.Module):
             # but approximate it in 1 - proba[target class].
             # The 1 is a constant that doesn't change the matching, it can be ommitted.
             cost_class = -out_prob[:, tgt_ids]
+            num_objects = targets[b].get("num_object_targets", len(tgt_ids))
+            # Union targets participate in one-to-one mask matching only.
+            cost_class[:, num_objects:] = 0
 
             out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
             # gt masks are already padded when preparing target
@@ -202,10 +205,10 @@ class HungarianMatcher(nn.Module):
             # GT-conditioned logits are (GT, Q); matching costs are (Q, GT).
             if "gt_query_bias_logits" in outputs:
                 query_bias_cost = -outputs["gt_query_bias_logits"][b].float().sigmoid().T
-                C = C + self.cost_query_bias * query_bias_cost
+                C[:, :num_objects] += self.cost_query_bias * query_bias_cost
             elif "query_bias_logits" in outputs:
                 query_bias_cost = -outputs["query_bias_logits"][b].float().sigmoid()
-                C = C + self.cost_query_bias * query_bias_cost[:, None]
+                C[:, :num_objects] += self.cost_query_bias * query_bias_cost[:, None]
             C = C.reshape(num_queries, -1).cpu()
 
             indices.append(linear_sum_assignment(C))

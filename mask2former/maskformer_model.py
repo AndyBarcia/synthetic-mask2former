@@ -165,6 +165,11 @@ class MaskFormer(nn.Module):
             oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
             mask_loss_type=cfg.MODEL.MASK_FORMER.MASK_LOSS_TYPE,
+            fused_thing_masks=cfg.MODEL.MASK_FORMER.FUSED_THING_MASKS,
+            thing_class_ids=getattr(
+                MetadataCatalog.get(cfg.DATASETS.TRAIN[0]),
+                "thing_dataset_id_to_contiguous_id", {},
+            ).values(),
             object_decoder=ObjectDecoder(
                 cfg.MODEL.SEM_SEG_HEAD.MASK_DIM,
                 cfg.MODEL.MASK_FORMER.HIDDEN_DIM,

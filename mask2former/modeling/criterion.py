@@ -146,7 +146,8 @@ class SetCriterion(nn.Module):
                  mask_loss_type="point", object_decoder=None, object_rl_weight=0.0,
                  object_rl_max_steps=101, object_rl_reward_size=0,
                  object_rl_num_samples=4, object_rl_train_eof=True,
-                 object_rl_baseline="rloo_greedy", object_rl_objective="policy_gradient"):
+                 object_rl_baseline="rloo_greedy", object_rl_objective="policy_gradient",
+                 fused_thing_masks=False, thing_class_ids=()):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -161,6 +162,8 @@ class SetCriterion(nn.Module):
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
         self.losses = losses
+        self.fused_thing_masks = fused_thing_masks
+        self.thing_class_ids = tuple(thing_class_ids)
         self.object_decoder = object_decoder
         self.object_rl_weight = object_rl_weight
         self.object_rl_max_steps = object_rl_max_steps
@@ -687,6 +690,32 @@ class SetCriterion(nn.Module):
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)
 
+    def _mask_targets(self, targets):
+        """Append mask-only unions without changing the object ground truth."""
+        if not self.fused_thing_masks:
+            return targets
+        result = []
+        for target in targets:
+            labels, masks = target["labels"], target["masks"]
+            fused_labels, fused_masks = [], []
+            for category in self.thing_class_ids:
+                members = labels == category
+                if members.sum().item() > 1:
+                    fused_labels.append(labels[members][:1])
+                    fused_masks.append(masks[members].bool().any(0).to(masks.dtype)[None])
+            result.append(dict(
+                target,
+                labels=torch.cat([labels] + fused_labels),
+                masks=torch.cat([masks] + fused_masks),
+                num_object_targets=len(labels),
+            ))
+        return result
+
+    @staticmethod
+    def _object_indices(indices, targets):
+        return [(src[tgt < len(target["labels"])], tgt[tgt < len(target["labels"])])
+                for (src, tgt), target in zip(indices, targets)]
+
     def forward(self, outputs, targets):
         """This performs the loss computation.
         Parameters:
@@ -695,12 +724,22 @@ class SetCriterion(nn.Module):
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
         outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
+        mask_targets = self._mask_targets(targets)
+        if self.fused_thing_masks and any(
+            len(target["labels"]) > outputs["pred_masks"].shape[1]
+            for target in mask_targets
+        ):
+            raise ValueError(
+                "Instance and fused mask targets exceed NUM_OBJECT_QUERIES; "
+                "increase it to supervise every target."
+            )
 
         # Retrieve the matching between the outputs of the last layer and the targets
-        indices = self.matcher(outputs_without_aux, targets)
+        indices = self.matcher(outputs_without_aux, mask_targets)
+        object_indices = self._object_indices(indices, targets)
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
-        num_masks = sum(len(t["labels"]) for t in targets)
+        num_masks = sum(len(t["labels"]) for t in mask_targets)
         num_masks = torch.as_tensor(
             [num_masks], dtype=torch.float, device=next(iter(outputs.values())).device
         )
@@ -711,18 +750,23 @@ class SetCriterion(nn.Module):
         # Compute all the requested losses
         losses = {}
         for loss in self.losses:
-            losses.update(self.get_loss(loss, outputs, targets, indices, num_masks))
+            loss_targets, loss_indices = ((mask_targets, indices) if loss == "masks"
+                                          else (targets, object_indices))
+            losses.update(self.get_loss(loss, outputs, loss_targets, loss_indices, num_masks))
         if self.object_decoder is not None:
-            losses.update(self.loss_object_decoder(outputs, indices))
+            losses.update(self.loss_object_decoder(outputs, object_indices))
             if self.object_rl_weight > 0:
                 losses.update(self.loss_object_rl(outputs, targets))
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if "aux_outputs" in outputs:
             for i, aux_outputs in enumerate(outputs["aux_outputs"]):
-                indices = self.matcher(aux_outputs, targets)
+                indices = self.matcher(aux_outputs, mask_targets)
+                object_indices = self._object_indices(indices, targets)
                 for loss in self.losses:
-                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_masks)
+                    loss_targets, loss_indices = ((mask_targets, indices) if loss == "masks"
+                                                  else (targets, object_indices))
+                    l_dict = self.get_loss(loss, aux_outputs, loss_targets, loss_indices, num_masks)
                     l_dict = {k + f"_{i}": v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
@@ -740,6 +784,7 @@ class SetCriterion(nn.Module):
             "oversample_ratio: {}".format(self.oversample_ratio),
             "importance_sample_ratio: {}".format(self.importance_sample_ratio),
             "mask_loss_type: {}".format(self.mask_loss_type),
+            "fused_thing_masks: {}".format(self.fused_thing_masks),
         ]
         _repr_indent = 4
         lines = [head] + [" " * _repr_indent + line for line in body]

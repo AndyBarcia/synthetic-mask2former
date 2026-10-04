@@ -54,6 +54,8 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.QUERY_BIAS_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.QUERY_BIAS_MATCHER_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.MASK_LOSS_TYPE = "point"
+    # Extra mask-only union target for each thing class with multiple instances.
+    cfg.MODEL.MASK_FORMER.FUSED_THING_MASKS = True
 
     # transformer config
     cfg.MODEL.MASK_FORMER.NHEADS = 8
