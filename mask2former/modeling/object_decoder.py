@@ -5,14 +5,35 @@ from torch import nn
 from torch.nn import functional as F
 
 
+class DepthAttention(nn.Module):
+    """Full AttnRes: a learned pseudo-query attends over RMS-normalized depth keys."""
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.query = nn.Parameter(torch.zeros(hidden_dim))
+        self.key_scale = nn.Parameter(torch.ones(hidden_dim))
+
+    def forward(self, history):
+        values = torch.stack(history, dim=0)
+        keys = values.float()
+        keys = keys * torch.rsqrt(keys.square().mean(-1, keepdim=True) + 1e-6)
+        scores = (keys * self.key_scale.float() * self.query.float()).sum(-1)
+        weights = scores.softmax(0).to(values.dtype)
+        return (weights.unsqueeze(-1) * values).sum(0)
+
+
 class ObjectDecoder(nn.Module):
     def __init__(self, mask_dim, hidden_dim, num_queries, num_layers, num_heads,
-                 dim_feedforward, mask_iou_threshold=0.8, prefix_tree_branches=4):
+                 dim_feedforward, mask_iou_threshold=0.8, prefix_tree_branches=4,
+                 variant="baseline"):
         super().__init__()
         if not 0 <= mask_iou_threshold <= 1:
             raise ValueError("mask_iou_threshold must be between 0 and 1")
         if prefix_tree_branches < 1:
             raise ValueError("prefix_tree_branches must be positive")
+        if variant not in ("baseline", "attnres"):
+            raise ValueError(f"Unknown object decoder variant: {variant}")
+        self.use_attnres = variant == "attnres"
         self.prefix_tree_branches = prefix_tree_branches
         self.num_queries = num_queries
         self.num_heads = num_heads
@@ -39,6 +60,10 @@ class ObjectDecoder(nn.Module):
         ])
         self.norm = nn.LayerNorm(hidden_dim)
         self.scale = hidden_dim ** -0.5
+        if self.use_attnres:
+            self.depth_attention = nn.ModuleList([
+                DepthAttention(hidden_dim) for _ in range(4 * num_layers + 1)
+            ])
 
     @staticmethod
     def pack_prefix_trees(sequences, num_queries, device):
@@ -162,22 +187,47 @@ class ObjectDecoder(nn.Module):
             mask_tokens.shape[0] * self.num_heads, steps, self.num_queries + 1
         )
         decoded = previous
+        history = [previous]
         for layer_index, layer in enumerate(self.layers.layers):
             level_index = layer_index % len(image_features)
             image_memory = torch.cat((
                 image_features[level_index],
                 self.null_image_token[level_index].expand(mask_tokens.shape[0], 1, -1),
             ), dim=1)
-            decoded = layer(
-                decoded, image_memory,
-                tgt_mask=causal_mask,
-                memory_mask=self._memory_mask(image_regions[level_index], previous_tokens, ancestors),
-            )
-            attended = self.vocabulary_attention[layer_index](
-                decoded, vocabulary, vocabulary, attn_mask=vocabulary_mask,
-                need_weights=False,
-            )[0]
-            decoded = self.vocabulary_norm[layer_index](decoded + attended)
+            memory_mask = self._memory_mask(image_regions[level_index], previous_tokens, ancestors)
+            if self.use_attnres:
+                # Attend over raw earlier sublayer outputs before each of the
+                # four PreNorm transformations in this decoder layer.
+                def source(sublayer):
+                    return self.depth_attention[4 * layer_index + sublayer](history)
+
+                def accumulate(contribution):
+                    history.append(contribution)
+                    return contribution
+
+                x = layer.norm1(source(0))
+                contribution = layer.self_attn(x, x, x, attn_mask=causal_mask, need_weights=False)[0]
+                decoded = accumulate(contribution)
+                x = layer.norm2(source(1))
+                contribution = layer.multihead_attn(x, image_memory, image_memory,
+                                                  attn_mask=memory_mask, need_weights=False)[0]
+                decoded = accumulate(contribution)
+                x = layer.norm3(source(2))
+                contribution = layer.linear2(layer.dropout(layer.activation(layer.linear1(x))))
+                decoded = accumulate(contribution)
+                x = self.vocabulary_norm[layer_index](source(3))
+                contribution = self.vocabulary_attention[layer_index](
+                    x, vocabulary, vocabulary, attn_mask=vocabulary_mask, need_weights=False,
+                )[0]
+                decoded = accumulate(contribution)
+            else:
+                decoded = layer(decoded, image_memory, tgt_mask=causal_mask, memory_mask=memory_mask)
+                attended = self.vocabulary_attention[layer_index](
+                    decoded, vocabulary, vocabulary, attn_mask=vocabulary_mask, need_weights=False,
+                )[0]
+                decoded = self.vocabulary_norm[layer_index](decoded + attended)
+        if self.use_attnres:
+            decoded = self.depth_attention[-1](history)
         decoded = self.norm(decoded)
         output_mask_tokens = self.output_mask_projection(mask_embeddings)
         output_vocabulary = torch.cat((
