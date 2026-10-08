@@ -66,6 +66,8 @@ def add_maskformer2_config(cfg):
     # Number of suffix permutations sharing a randomly sampled training prefix.
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_PREFIX_TREE_BRANCHES = 4
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_LAYERS = 5
+    cfg.MODEL.MASK_FORMER.OBJECT_DEC_POSITION_ENCODING = True
+    cfg.MODEL.MASK_FORMER.OBJECT_DEC_ROPE = False
     cfg.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT = 0.0
     cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY = False
     cfg.MODEL.MASK_FORMER.OBJECT_RL_MAX_STEPS = 101

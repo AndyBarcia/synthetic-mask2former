@@ -179,6 +179,8 @@ class MaskFormer(nn.Module):
                 cfg.MODEL.MASK_FORMER.DIM_FEEDFORWARD,
                 cfg.MODEL.MASK_FORMER.OBJECT_DEC_MASK_IOU_THRESHOLD,
                 cfg.MODEL.MASK_FORMER.OBJECT_DEC_PREFIX_TREE_BRANCHES,
+                position_encoding=cfg.MODEL.MASK_FORMER.OBJECT_DEC_POSITION_ENCODING,
+                rope=cfg.MODEL.MASK_FORMER.OBJECT_DEC_ROPE,
             ) if use_object_decoder else None,
             object_rl_weight=cfg.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT,
             object_rl_max_steps=cfg.MODEL.MASK_FORMER.OBJECT_RL_MAX_STEPS,

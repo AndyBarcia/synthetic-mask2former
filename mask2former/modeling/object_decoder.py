@@ -5,9 +5,49 @@ from torch import nn
 from torch.nn import functional as F
 
 
+def apply_rotary_positions(x, positions):
+    """Rotate adjacent head-dimension pairs; x has shape [B, H, T, D]."""
+    frequency = 10000.0 ** (-torch.arange(0, x.shape[-1], 2, device=x.device).float() / x.shape[-1])
+    angles = positions.float()[..., None] * frequency
+    cosine = angles.cos()[:, None].to(x.dtype)
+    sine = angles.sin()[:, None].to(x.dtype)
+    even, odd = x[..., 0::2], x[..., 1::2]
+    return torch.stack((even * cosine - odd * sine, even * sine + odd * cosine), dim=-1).flatten(-2)
+
+
+class RotaryDecoderLayer(nn.TransformerDecoderLayer):
+    """Post-norm decoder layer with RoPE on projected self-attention Q/K."""
+
+    def forward(self, tgt, memory, tgt_mask=None, memory_mask=None, *, positions):
+        batch, steps, width = tgt.shape
+        heads = self.self_attn.num_heads
+        query, key, value = F.linear(
+            tgt, self.self_attn.in_proj_weight, self.self_attn.in_proj_bias
+        ).chunk(3, dim=-1)
+        query, key, value = [
+            tensor.reshape(batch, steps, heads, width // heads).transpose(1, 2)
+            for tensor in (query, key, value)
+        ]
+        query = apply_rotary_positions(query, positions)
+        key = apply_rotary_positions(key, positions)
+        # MultiheadAttention bool masks mark blocked entries; SDPA marks allowed.
+        allowed = None
+        if tgt_mask is not None:
+            allowed = ~tgt_mask
+            if allowed.ndim == 3:
+                allowed = allowed.reshape(batch, heads, steps, steps)
+        attended = F.scaled_dot_product_attention(query, key, value, attn_mask=allowed)
+        attended = attended.transpose(1, 2).reshape(batch, steps, width)
+        attended = self.self_attn.out_proj(attended)
+        decoded = self.norm1(tgt + self.dropout1(attended))
+        decoded = self.norm2(decoded + self._mha_block(decoded, memory, memory_mask, None))
+        return self.norm3(decoded + self._ff_block(decoded))
+
+
 class ObjectDecoder(nn.Module):
     def __init__(self, mask_dim, hidden_dim, num_queries, num_layers, num_heads,
-                 dim_feedforward, mask_iou_threshold=0.8, prefix_tree_branches=4):
+                 dim_feedforward, mask_iou_threshold=0.8, prefix_tree_branches=4,
+                 position_encoding=True, rope=False):
         super().__init__()
         if not 0 <= mask_iou_threshold <= 1:
             raise ValueError("mask_iou_threshold must be between 0 and 1")
@@ -25,7 +65,13 @@ class ObjectDecoder(nn.Module):
         self.null_image_token = nn.Parameter(torch.zeros(3, hidden_dim))
         nn.init.normal_(self.null_image_token, std=0.02)
         self.position = nn.Embedding(num_queries + 1, hidden_dim)
-        layer = nn.TransformerDecoderLayer(
+        self.position_encoding = position_encoding
+        self.rope = rope
+        if rope and (hidden_dim // num_heads) % 2:
+            raise ValueError("RoPE requires an even attention head dimension")
+        self.position.requires_grad_(position_encoding and not rope)
+        layer_type = RotaryDecoderLayer if rope else nn.TransformerDecoderLayer
+        layer = layer_type(
             d_model=hidden_dim, nhead=num_heads, dim_feedforward=dim_feedforward,
             dropout=0.0, batch_first=True,
         )
@@ -151,7 +197,8 @@ class ObjectDecoder(nn.Module):
             (previous_tokens < 0).unsqueeze(-1), self.bos, previous
         )
         steps = previous.shape[1]
-        previous = previous + (self.position.weight[:steps] if positions is None else self.position(positions))
+        if self.position_encoding and not self.rope:
+            previous = previous + (self.position.weight[:steps] if positions is None else self.position(positions))
         causal_mask = torch.ones(steps, steps, dtype=torch.bool, device=previous.device).triu(1)
         if ancestors is not None:
             causal_mask = (~ancestors)[:, None].expand(-1, self.num_heads, -1, -1).reshape(
@@ -172,6 +219,9 @@ class ObjectDecoder(nn.Module):
                 decoded, image_memory,
                 tgt_mask=causal_mask,
                 memory_mask=self._memory_mask(image_regions[level_index], previous_tokens, ancestors),
+                **({"positions": positions if positions is not None else
+                    torch.arange(steps, device=decoded.device)[None].expand(decoded.shape[0], -1)}
+                   if self.rope else {}),
             )
             attended = self.vocabulary_attention[layer_index](
                 decoded, vocabulary, vocabulary, attn_mask=vocabulary_mask,
