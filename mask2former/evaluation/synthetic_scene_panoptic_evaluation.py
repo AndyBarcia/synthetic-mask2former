@@ -2,6 +2,8 @@
 
 from collections import OrderedDict
 import logging
+from pathlib import Path
+import sys
 
 import torch
 from scipy.optimize import linear_sum_assignment
@@ -14,33 +16,60 @@ from detectron2.utils import comm
 class SyntheticScenePanopticEvaluator(DatasetEvaluator):
     """Compute standard PQ/SQ/RQ without serializing predictions or ground truth."""
 
-    def __init__(self, num_classes=6):
+    def __init__(self, num_classes=6, device=None, class_names=None):
         self.num_classes = num_classes
+        self.class_names = class_names or [str(index) for index in range(num_classes)]
+        if len(self.class_names) != num_classes:
+            raise ValueError("class_names must match num_classes")
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        # Use the pinned submodule directly, including its in-place CUDA build.
+        submodule = Path(__file__).resolve().parents[2] / "panoptic-evaluator"
+        if not (submodule / "panoptic_evaluator").is_dir():
+            raise ImportError("Initialize the evaluator with git submodule update --init --recursive")
+        if str(submodule) not in sys.path:
+            sys.path.insert(0, str(submodule))
+        from panoptic_evaluator import PanopticBatch, PanopticEvaluator
+        self._batch_type = PanopticBatch
+        self._evaluator_type = PanopticEvaluator
 
     def reset(self):
-        # Columns are IoU sum, true positives, false positives, false negatives.
-        self._stats = torch.zeros((self.num_classes, 4), dtype=torch.float64)
-        self._oracle_stats = torch.zeros_like(self._stats)
+        options = dict(isthing=[False] + [True] * (self.num_classes - 1), device=self.device)
+        self._standard = self._evaluator_type(self.num_classes, **options)
+        self._oracle = self._evaluator_type(self.num_classes, **options)
+
+    @staticmethod
+    def _raw_stats(evaluator):
+        # Preserve the existing distributed reduction and metric schema.
+        return torch.stack((evaluator.iou_sum, evaluator.tp,
+                            evaluator.fp, evaluator.fn), dim=1).double().cpu()
+
+    @property
+    def _stats(self):
+        return self._raw_stats(self._standard)
+
+    @property
+    def _oracle_stats(self):
+        return self._raw_stats(self._oracle)
 
     def process(self, inputs, outputs):
         for input_record, output_record in zip(inputs, outputs):
             gt_map, gt_info = input_record["panoptic_ground_truth"]
             pred_map, pred_info = output_record["panoptic_seg"]
             self._accumulate_image(
-                gt_map.detach().to(device="cpu", dtype=torch.int64),
+                gt_map.detach().to(device=self.device, dtype=torch.int64),
                 gt_info,
-                pred_map.detach().to(device="cpu", dtype=torch.int64),
+                pred_map.detach().to(device=self.device, dtype=torch.int64),
                 pred_info,
             )
             oracle_map, oracle_info = self._oracle_assignment(
                 gt_map, gt_info, output_record["panoptic_proposals"]
             )
             self._accumulate_image(
-                gt_map.detach().to(device="cpu", dtype=torch.int64),
+                gt_map.detach().to(device=self.device, dtype=torch.int64),
                 gt_info,
-                oracle_map.cpu(),
+                oracle_map,
                 oracle_info,
-                stats=self._oracle_stats,
+                stats=self._oracle,
             )
 
     @staticmethod
@@ -107,54 +136,28 @@ class SyntheticScenePanopticEvaluator(DatasetEvaluator):
         return panoptic_map, segments
 
     def _accumulate_image(self, gt_map, gt_info, pred_map, pred_info, stats=None):
-        stats = self._stats if stats is None else stats
-        gt_segments = {segment["id"]: segment for segment in gt_info}
-        pred_segments = {segment["id"]: segment for segment in pred_info}
-        gt_area = torch.bincount(gt_map.flatten())
-        pred_area = torch.bincount(pred_map.flatten())
-        pair_base = max(int(pred_map.max().item()) + 1, 1)
-        intersections = torch.bincount((gt_map * pair_base + pred_map).flatten())
-
-        matched_gt = set()
-        matched_pred = set()
-        for pair_id in torch.nonzero(intersections, as_tuple=False).flatten().tolist():
-            gt_id, pred_id = divmod(pair_id, pair_base)
-            if gt_id == 0 or pred_id == 0:
-                continue
-            gt_segment = gt_segments.get(gt_id)
-            pred_segment = pred_segments.get(pred_id)
-            if gt_segment is None or pred_segment is None:
-                continue
-            category_id = gt_segment["category_id"]
-            if category_id != pred_segment["category_id"]:
-                continue
-            intersection = float(intersections[pair_id])
-            void_overlap = float(intersections[pred_id]) if pred_id < intersections.numel() else 0.0
-            union = float(gt_area[gt_id] + pred_area[pred_id]) - intersection - void_overlap
-            iou = intersection / union if union > 0 else 0.0
-            if iou > 0.5:
-                stats[category_id, 0] += iou
-                stats[category_id, 1] += 1
-                matched_gt.add(gt_id)
-                matched_pred.add(pred_id)
-
-        for gt_id, segment in gt_segments.items():
-            if gt_id not in matched_gt:
-                stats[segment["category_id"], 3] += 1
-        for pred_id, segment in pred_segments.items():
-            if pred_id in matched_pred:
-                continue
-            void_overlap = float(intersections[pred_id]) if pred_id < intersections.numel() else 0.0
-            if pred_id < pred_area.numel() and void_overlap / max(float(pred_area[pred_id]), 1.0) > 0.5:
-                continue
-            stats[segment["category_id"], 2] += 1
+        evaluator = self._standard if stats is None else stats
+        categories = list(range(self.num_classes))
+        target = self._batch_type.from_coco(
+            gt_map.detach().to(device=self.device, dtype=torch.int64)[None],
+            [gt_info], categories, compact=False,
+        )
+        prediction = self._batch_type.from_coco(
+            pred_map.detach().to(device=self.device, dtype=torch.int64)[None],
+            [pred_info], categories, compact=False,
+        )
+        evaluator.update(prediction, target)
 
     def evaluate(self):
         comm.synchronize()
-        gathered = comm.gather(torch.stack((self._stats, self._oracle_stats)))
+        gathered = comm.gather((
+            torch.stack((self._stats, self._oracle_stats)),
+            self._standard.confusion.cpu(),
+        ))
         if not comm.is_main_process():
             return None
-        stats = torch.stack(gathered).sum(dim=0)
+        stats = torch.stack([item[0] for item in gathered]).sum(dim=0)
+        confusion = torch.stack([item[1] for item in gathered]).sum(dim=0)
         results = OrderedDict({
             "panoptic_seg": self._summarize(stats[0]),
             "panoptic_seg_oracle": self._summarize(stats[1]),
@@ -177,7 +180,39 @@ class SyntheticScenePanopticEvaluator(DatasetEvaluator):
                 disable_numparse=True,
             ),
         )
+        results["sem_seg"] = self._summarize_semantic(confusion)
+        logging.getLogger(__name__).info(
+            "Semantic evaluation from panoptic predictions (percent): %s",
+            {key: round(results["sem_seg"][key], 4)
+             for key in ("mIoU", "fwIoU", "mACC", "pACC")},
+        )
         return results
+
+    def _summarize_semantic(self, confusion):
+        # Backend rows are GT classes; columns are predicted classes plus void.
+        # GT void/crowd pixels are excluded. Predicted void contributes to FN.
+        confusion = confusion.double()
+        tp = confusion[:, :self.num_classes].diagonal()
+        ground_truth = confusion.sum(dim=1)
+        predicted = confusion[:, :self.num_classes].sum(dim=0)
+        union = ground_truth + predicted - tp
+        valid_iou = union > 0
+        valid_accuracy = ground_truth > 0
+        iou = torch.where(valid_iou, tp / union.clamp_min(1), torch.nan)
+        accuracy = torch.where(valid_accuracy, tp / ground_truth.clamp_min(1), torch.nan)
+        total = ground_truth.sum()
+        result = {
+            "mIoU": 100.0 * iou[valid_iou].mean().item() if valid_iou.any() else 0.0,
+            "fwIoU": 100.0 * (torch.nan_to_num(iou) * ground_truth).sum().item()
+            / total.clamp_min(1).item(),
+            "mACC": 100.0 * accuracy[valid_accuracy].mean().item()
+            if valid_accuracy.any() else 0.0,
+            "pACC": 100.0 * tp.sum().item() / total.clamp_min(1).item(),
+        }
+        for index, name in enumerate(self.class_names):
+            result[f"IoU-{name}"] = 100.0 * iou[index].item()
+            result[f"ACC-{name}"] = 100.0 * accuracy[index].item()
+        return result
 
     def _summarize(self, stats):
         def metrics(category_ids):

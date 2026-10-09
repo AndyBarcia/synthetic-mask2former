@@ -9,7 +9,7 @@ MODEL:
       PANOPTIC_ON: True
 DATASETS:
   TRAIN: ("synthetic_scene_panoptic_train",)
-  TEST: ("synthetic_scene_panoptic_val","synthetic_scene_sem_seg_val",)
+  TEST: ("synthetic_scene_panoptic_val",)
 INPUT:
   DATASET_MAPPER_NAME: "synthetic_scene_panoptic_batch"
   SYNTHETIC_SCENE:
@@ -18,7 +18,7 @@ INPUT:
     SEED: 1234
     TEST_SEED: 4321
     TEST_SAMPLES: 1000
-    TEST_BATCH_SIZE: 4
+    TEST_BATCH_SIZE: 32
 DATALOADER:
   FILTER_EMPTY_ANNOTATIONS: False
   NUM_WORKERS: 0

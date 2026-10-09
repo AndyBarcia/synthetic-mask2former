@@ -31,7 +31,7 @@ def add_maskformer2_config(cfg):
     cfg.INPUT.SYNTHETIC_SCENE.PERSON_COUNT = 5
     cfg.INPUT.SYNTHETIC_SCENE.TEST_SEED = 4321
     cfg.INPUT.SYNTHETIC_SCENE.TEST_SAMPLES = 1000
-    cfg.INPUT.SYNTHETIC_SCENE.TEST_BATCH_SIZE = 4
+    cfg.INPUT.SYNTHETIC_SCENE.TEST_BATCH_SIZE = 32
 
     # solver config
     # weight decay on embedding
@@ -65,8 +65,11 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.DEC_LAYERS = 6
     # Number of suffix permutations sharing a randomly sampled training prefix.
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_PREFIX_TREE_BRANCHES = 4
+    cfg.MODEL.MASK_FORMER.OBJECT_PRETRAIN_PQ_TEMPERATURE = 0.0
+    cfg.MODEL.MASK_FORMER.OBJECT_PRETRAIN_PQ_REWARD = "terminal"
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_LAYERS = 5
-    cfg.MODEL.MASK_FORMER.OBJECT_DEC_POSITION_ENCODING = True
+    # NoPE by default; learned absolute positions and RoPE remain opt-in.
+    cfg.MODEL.MASK_FORMER.OBJECT_DEC_POSITION_ENCODING = False
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_ROPE = False
     cfg.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT = 0.0
     cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY = False

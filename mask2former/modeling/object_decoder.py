@@ -47,7 +47,7 @@ class RotaryDecoderLayer(nn.TransformerDecoderLayer):
 class ObjectDecoder(nn.Module):
     def __init__(self, mask_dim, hidden_dim, num_queries, num_layers, num_heads,
                  dim_feedforward, mask_iou_threshold=0.8, prefix_tree_branches=4,
-                 position_encoding=True, rope=False):
+                 position_encoding=False, rope=False):
         super().__init__()
         if not 0 <= mask_iou_threshold <= 1:
             raise ValueError("mask_iou_threshold must be between 0 and 1")
@@ -87,7 +87,7 @@ class ObjectDecoder(nn.Module):
         self.scale = hidden_dim ** -0.5
 
     @staticmethod
-    def pack_prefix_trees(sequences, num_queries, device):
+    def pack_prefix_trees(sequences, num_queries, device, path_weights=None):
         """Pack paths into context tries; edge counts preserve expanded-path CE.
 
         Each node represents a prefix (root is BOS). Targets are outgoing edge
@@ -95,14 +95,15 @@ class ObjectDecoder(nn.Module):
         Padding attends only to itself and has no loss weight.
         """
         trees = []
-        for paths in sequences:
+        for image, paths in enumerate(sequences):
             tokens, parents, depths, counts = [-1], [-1], [0], [{}]
             children = {}
-            for path in paths:
+            for path_index, path in enumerate(paths):
+                path_weight = 1.0 if path_weights is None else float(path_weights[image][path_index])
                 node = 0
                 for token in list(path) + [num_queries]:
                     token = int(token)
-                    counts[node][token] = counts[node].get(token, 0) + 1
+                    counts[node][token] = counts[node].get(token, 0) + path_weight
                     if token == num_queries:
                         break
                     key = (node, token)
@@ -285,8 +286,7 @@ class ObjectDecoder(nn.Module):
         unavailable = torch.zeros(batch_size, num_queries, dtype=torch.bool, device=mask_embeddings.device)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=mask_embeddings.device)
         previous = torch.full((batch_size, 1), -1, dtype=torch.long, device=mask_embeddings.device)
-        orders = [[] for _ in range(batch_size)]
-        actions = [[] for _ in range(batch_size)] if return_actions else None
+        action_steps = []
         log_probability = mask_embeddings.new_zeros(batch_size)
         diagnostics = {
             key: torch.zeros(batch_size, device=mask_embeddings.device)
@@ -310,12 +310,7 @@ class ObjectDecoder(nn.Module):
                 log_probability = log_probability + torch.where(
                     active, distribution.log_prob(token), 0.0
                 )
-            for index in range(batch_size):
-                if active[index]:
-                    if actions is not None:
-                        actions[index].append(int(token[index]))
-                    if token[index] != num_queries:
-                        orders[index].append(int(token[index]))
+            action_steps.append(torch.where(active, token, -1).detach())
             chosen = active & (token != num_queries)
             chosen_batch = torch.arange(batch_size, device=unavailable.device)[chosen]
             unavailable[chosen_batch] |= exclusions[chosen_batch, token[chosen]]
@@ -323,6 +318,10 @@ class ObjectDecoder(nn.Module):
             if finished.all():
                 break
             previous = torch.cat((previous, torch.where(finished, num_queries, token)[:, None]), dim=1)
+        # Transfer the complete ragged trajectories once, rather than each token.
+        rows = torch.stack(action_steps, 1).tolist() if action_steps else [[] for _ in range(batch_size)]
+        actions = [[token for token in row if token >= 0] for row in rows]
+        orders = [[token for token in row if token != num_queries] for row in actions]
         if diagnostics is not None:
             diagnostics["length"] = torch.tensor([len(order) for order in orders], device=finished.device).float()
             diagnostics["truncated"] = (~finished).float()
@@ -479,7 +478,7 @@ class ObjectDecoder(nn.Module):
         excluded_neighbors = torch.zeros_like(proposal_mask)
         counts = proposal_mask.sum(-1)
         previous = torch.full((batch_size, 1), -1, dtype=torch.long, device=mask_embeddings.device)
-        orders = [[] for _ in range(batch_size)]
+        action_steps = []
         log_probability = mask_embeddings.new_zeros(batch_size)
         for step in range(int(counts.max().item())):
             active = counts > step
@@ -499,13 +498,13 @@ class ObjectDecoder(nn.Module):
                 log_probability = log_probability + torch.where(
                     active, distribution.log_prob(token), 0.0
                 )
-            for index in range(batch_size):
-                if active[index]:
-                    orders[index].append(int(token[index]))
+            action_steps.append(torch.where(active, token, -1).detach())
             chosen = active.nonzero(as_tuple=True)[0]
             selected[chosen, token[chosen]] = True
             excluded_neighbors[chosen] |= exclusions[chosen, token[chosen]]
             previous = torch.cat((previous, token[:, None]), dim=1)
+        rows = torch.stack(action_steps, 1).tolist() if action_steps else [[] for _ in range(batch_size)]
+        orders = [[token for token in row if token >= 0] for row in rows]
         return orders, log_probability
 
     def permutation_log_probability(self, mask_embeddings, image_features, mask_logits,

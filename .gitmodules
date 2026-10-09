@@ -1,3 +1,6 @@
 [submodule "mask2former/data/datasets/synthetic-scene"]
 	path = mask2former/data/datasets/synthetic-scene
 	url = git@github.com:AndyBarcia/synthetic-scene.git
+[submodule "panoptic-evaluator"]
+	path = panoptic-evaluator
+	url = https://github.com/AndyBarcia/panoptic-evaluator.git

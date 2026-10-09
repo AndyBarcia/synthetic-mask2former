@@ -4,6 +4,8 @@
 MaskFormer criterion.
 """
 import logging
+from pathlib import Path
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -128,8 +130,8 @@ def select_best_of_n(sampled_rewards, greedy_rewards, trajectories):
         raise ValueError("trajectories must contain K batches in sample-major order")
     best_rewards, best_indices = sampled_rewards.max(0)
     best_trajectories = [
-        trajectories[int(best_indices[image]) * batch_size + image]
-        for image in range(batch_size)
+        trajectories[index * batch_size + image]
+        for image, index in enumerate(best_indices.tolist())
     ]
     return best_trajectories, best_rewards, best_rewards > greedy_rewards
 
@@ -276,82 +278,88 @@ class SetCriterion(nn.Module):
 
     @torch.no_grad()
     def object_reward(self, orders, outputs, targets):
-        """Per-image mean class PQ with the inference paint and evaluation rules.
+        """Per-image PQ rewards via the submodule's stateless batched API.
 
-        A reward size of zero renders at the ground-truth mask resolution.
+        Training targets share padded image dimensions and are scored together.
+        Preserve reward resolution, stuff merging and painting order.
         """
-        classes = outputs["pred_logits"][..., :-1].argmax(-1)
-        rewards = []
-        for batch_index, order in enumerate(orders):
-            target_masks = targets[batch_index]["masks"]
-            size = (self.object_rl_reward_size,) * 2 if self.object_rl_reward_size else target_masks.shape[-2:]
-            masks = F.interpolate(
-                outputs["pred_masks"][batch_index:batch_index + 1].float(),
-                size=size, mode="bilinear", align_corners=False,
-            )[0] > 0
-            painted = torch.zeros(size, dtype=torch.long, device=masks.device)
-            segments = []
-            stuff_id = None
-            paint_order = reversed(order) if self.object_rl_paint_order == "reverse" else order
-            for query in paint_order:
-                if not masks[query].any():
-                    continue
-                category = int(classes[batch_index, query])
-                if category == 0 and stuff_id is not None:
-                    segment_id = stuff_id
-                else:
-                    segment_id = len(segments) + 1
-                    segments.append(category)
-                    if category == 0:
-                        stuff_id = segment_id
-                painted[masks[query]] = segment_id
-            gt_masks = (
-                F.interpolate(target_masks[:, None].float(), size=size, mode="nearest")[:, 0] > 0
-                if len(target_masks) else masks.new_zeros((0, *size))
-            )
-            gt_classes = targets[batch_index]["labels"]
-            gt_map = torch.zeros(size, dtype=torch.long, device=masks.device)
-            for target_index, target_mask in enumerate(gt_masks, start=1):
-                gt_map[target_mask] = target_index
+        submodule = str(Path(__file__).resolve().parents[2] / "panoptic-evaluator")
+        if submodule not in sys.path:
+            sys.path.insert(0, submodule)
+        from panoptic_evaluator import PanopticBatch, panoptic_quality
 
-            num_gt = len(gt_masks)
-            num_pred = len(segments)
-            pair_base = num_pred + 1
-            intersections = torch.bincount(
-                (gt_map * pair_base + painted).flatten(),
-                minlength=(num_gt + 1) * pair_base,
-            ).reshape(num_gt + 1, pair_base)
-            pred_area = intersections.sum(0)[1:]
-            gt_area = intersections.sum(1)[1:]
-            void_overlap = intersections[0, 1:]
-            pred_classes = gt_classes.new_tensor(segments)
-            if num_gt and num_pred:
-                overlap = intersections[1:, 1:].float()
-                union = gt_area[:, None] + pred_area[None, :] - overlap - void_overlap[None, :]
-                iou = overlap / union.clamp_min(1)
-                matches = (iou > 0.5) & (gt_classes[:, None] == pred_classes[None, :])
-                matched_gt, matched_pred = matches.nonzero(as_tuple=True)
-                iou_sum = torch.bincount(
-                    gt_classes[matched_gt], weights=iou[matched_gt, matched_pred],
-                    minlength=self.num_classes,
-                )
-                matched_predictions = matches.any(0)
-            else:
-                iou_sum = masks.new_zeros(self.num_classes, dtype=torch.float)
-                matched_predictions = torch.zeros(num_pred, dtype=torch.bool, device=masks.device)
-            counted_predictions = (pred_area > 0) & (
-                matched_predictions | (void_overlap.float() / pred_area.clamp_min(1) <= 0.5)
-            )
-            gt_count = torch.bincount(gt_classes, minlength=self.num_classes)
-            pred_count = torch.bincount(
-                pred_classes[counted_predictions], minlength=self.num_classes,
-            )
-            denominator = 0.5 * (gt_count + pred_count)
-            active_classes = denominator > 0
-            class_pq = iou_sum / denominator.clamp_min(1)
-            rewards.append(class_pq[active_classes].mean() if active_classes.any()
-                           else iou_sum.new_zeros(()))
-        return torch.stack(rewards)
+        device = outputs["pred_masks"].device
+        if not orders:
+            return torch.empty(0, device=device, dtype=torch.float32)
+        batch_size, num_queries = outputs["pred_masks"].shape[:2]
+        if len(orders) % batch_size:
+            raise ValueError("orders must contain whole batches in sample-major order")
+        size = ((self.object_rl_reward_size,) * 2 if self.object_rl_reward_size
+                else targets[0]["masks"].shape[-2:])
+        masks = F.interpolate(outputs["pred_masks"].float(), size=size,
+                              mode="bilinear", align_corners=False) > 0
+        classes = outputs["pred_logits"][..., :-1].argmax(-1).to(torch.int32)
+
+        # Only ragged target packing needs an image loop. Resize all GT masks once.
+        counts = [len(target["labels"]) for target in targets]
+        capacity = max(counts) + 1
+        gt_labels = torch.full((batch_size, capacity), -1, device=device, dtype=torch.int32)
+        gt_maps = torch.zeros((batch_size, *size), device=device, dtype=torch.int32)
+        if sum(counts):
+            resized = F.interpolate(torch.cat([t["masks"] for t in targets])[:, None].float(),
+                                    size=size, mode="nearest")[:, 0] > 0
+            for image, target_masks in enumerate(resized.split(counts)):
+                count = counts[image]
+                gt_labels[image, 1:count + 1] = targets[image]["labels"]
+                if count:
+                    ids = torch.arange(1, count + 1, device=device, dtype=torch.int32)
+                    gt_maps[image] = (target_masks * ids[:, None, None]).amax(0)
+
+        # A query's last occurrence wins, including repeated queries. Segment IDs
+        # can be query IDs: PQ ignores unused slots. Merge all stuff into slot Q+1.
+        paint_orders = [list(reversed(order)) if self.object_rl_paint_order == "reverse"
+                        else list(order) for order in orders]
+        steps = max(map(len, paint_orders))
+        padded = torch.tensor([order + [num_queries] * (steps - len(order))
+                               for order in paint_orders], device=device, dtype=torch.long)
+        ranks = torch.zeros((len(orders), num_queries + 1), device=device, dtype=torch.long)
+        if steps:
+            ranks.scatter_reduce_(1, padded,
+                                  torch.arange(1, steps + 1, device=device)[None].expand_as(padded),
+                                  reduce="amax", include_self=True)
+        pred_labels = torch.cat((torch.full((batch_size, 1), -1, device=device, dtype=torch.int32),
+                                 classes.masked_fill(classes == 0, -1),
+                                 torch.zeros((batch_size, 1), device=device, dtype=torch.int32)), 1)
+        # Bound the temporary [rollouts*images, queries, pixels] rank tensor.
+        chunk_size = max(1, 16_000_000 // max(1, num_queries * size[0] * size[1]))
+        rewards = []
+        for start in range(0, len(orders), chunk_size):
+            stop = min(start + chunk_size, len(orders))
+            images = torch.arange(start, stop, device=device) % batch_size
+            winning_rank, query = (masks[images] * ranks[start:stop, :num_queries, None, None]).max(1)
+            categories = classes[images].gather(1, query.flatten(1)).reshape_as(query)
+            painted = torch.where(categories == 0, num_queries + 1, query + 1)
+            painted = painted.masked_fill(winning_rank == 0, 0).to(torch.int32)
+            rewards.append(panoptic_quality(
+                PanopticBatch(painted, pred_labels[images]),
+                PanopticBatch(gt_maps[images], gt_labels[images]),
+                self.num_classes, validate=False,
+            ).float())
+        return torch.cat(rewards)
+
+    @staticmethod
+    def _repeat_policy_inputs(policy_inputs, repeats):
+        """Pack rollout copies in sample-major order for decoding and scoring."""
+        embeddings, features, masks, image_sizes = policy_inputs
+        return (embeddings.repeat(repeats, 1, 1),
+                [feature.repeat(repeats, 1, 1) for feature in features],
+                masks.repeat(repeats, 1, 1, 1), image_sizes)
+
+    def _object_rollout_rewards(self, sampled, greedy, outputs, targets):
+        """Reuse rendering inputs for all samples and the greedy baseline."""
+        batch_size = outputs["pred_masks"].shape[0]
+        rewards = self.object_reward(sampled + greedy, outputs, targets)
+        return rewards[:-batch_size].reshape(-1, batch_size), rewards[-batch_size:]
 
     def loss_object_rl(self, outputs, targets):
         if self.object_rl_objective in ("best_of_n_ft", "best_of_n_set"):
@@ -390,12 +398,7 @@ class SetCriterion(nn.Module):
         with torch.no_grad():
             for start in range(0, k, rollout_batch):
                 repeats = min(rollout_batch, k - start)
-                sampled_inputs = (
-                    policy_inputs[0].repeat(repeats, 1, 1),
-                    [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
-                    policy_inputs[2].repeat(repeats, 1, 1, 1),
-                    policy_inputs[3],
-                )
+                sampled_inputs = self._repeat_policy_inputs(policy_inputs, repeats)
                 orders, _ = self.object_decoder.rollout_permutation(
                     *sampled_inputs, proposal_mask.repeat(repeats, 1), sample=True
                 )
@@ -403,22 +406,15 @@ class SetCriterion(nn.Module):
             greedy, _ = self.object_decoder.rollout_permutation(
                 *policy_inputs, proposal_mask, sample=False
             )
-            sampled_reward = torch.stack([
-                self.object_reward(sampled[i * batch_size:(i + 1) * batch_size], outputs, targets)
-                for i in range(k)
-            ])
-            greedy_reward = self.object_reward(greedy, outputs, targets)
+            sampled_reward, greedy_reward = self._object_rollout_rewards(
+                sampled, greedy, outputs, targets
+            )
         # Sampling needs no graph. A full causal pass scores each fixed order,
         # avoiding a growing-prefix autograd graph for every sampled action.
         log_probabilities = []
         for start in range(0, k, rollout_batch):
             repeats = min(rollout_batch, k - start)
-            scored_inputs = (
-                policy_inputs[0].repeat(repeats, 1, 1),
-                [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
-                policy_inputs[2].repeat(repeats, 1, 1, 1),
-                policy_inputs[3],
-            )
+            scored_inputs = self._repeat_policy_inputs(policy_inputs, repeats)
             scores = self.object_decoder.permutation_log_probability(
                 *scored_inputs, proposal_mask.repeat(repeats, 1),
                 sampled[start * batch_size:(start + repeats) * batch_size],
@@ -456,12 +452,7 @@ class SetCriterion(nn.Module):
         with torch.no_grad():
             for start in range(0, k, rollout_batch):
                 repeats = min(rollout_batch, k - start)
-                sampled_inputs = (
-                    policy_inputs[0].repeat(repeats, 1, 1),
-                    [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
-                    policy_inputs[2].repeat(repeats, 1, 1, 1),
-                    policy_inputs[3],
-                )
+                sampled_inputs = self._repeat_policy_inputs(policy_inputs, repeats)
                 orders, _, actions = self.object_decoder.rollout(
                     *sampled_inputs, sample=True, max_steps=self.object_rl_max_steps,
                     return_actions=True,
@@ -474,13 +465,9 @@ class SetCriterion(nn.Module):
                 return_actions=True,
                 query_bias_logits=query_bias,
             )
-            sampled_reward = torch.stack([
-                self.object_reward(
-                    sampled_orders[i * batch_size:(i + 1) * batch_size], outputs, targets
-                )
-                for i in range(k)
-            ])
-            greedy_reward = self.object_reward(greedy_orders, outputs, targets)
+            sampled_reward, greedy_reward = self._object_rollout_rewards(
+                sampled_orders, greedy_orders, outputs, targets
+            )
             best_trajectories, best_reward, winners = select_best_of_n(
                 sampled_reward, greedy_reward, trajectories
             )
@@ -536,12 +523,7 @@ class SetCriterion(nn.Module):
         with torch.no_grad():
             for start in range(0, k, rollout_batch):
                 repeats = min(rollout_batch, k - start)
-                sampled_inputs = (
-                    policy_inputs[0].repeat(repeats, 1, 1),
-                    [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
-                    policy_inputs[2].repeat(repeats, 1, 1, 1),
-                    policy_inputs[3],
-                )
+                sampled_inputs = self._repeat_policy_inputs(policy_inputs, repeats)
                 orders, _, actions = self.object_decoder.rollout(
                     *sampled_inputs, sample=True, max_steps=self.object_rl_max_steps,
                     return_actions=True,
@@ -554,20 +536,13 @@ class SetCriterion(nn.Module):
                 return_actions=True,
                 query_bias_logits=query_bias,
             )
-            sampled_reward = torch.stack([
-                self.object_reward(sampled[i * batch_size:(i + 1) * batch_size], outputs, targets)
-                for i in range(k)
-            ])
-            greedy_reward = self.object_reward(greedy, outputs, targets)
+            sampled_reward, greedy_reward = self._object_rollout_rewards(
+                sampled, greedy, outputs, targets
+            )
         log_probabilities = []
         for start in range(0, k, rollout_batch):
             repeats = min(rollout_batch, k - start)
-            scored_inputs = (
-                policy_inputs[0].repeat(repeats, 1, 1),
-                [feature.repeat(repeats, 1, 1) for feature in policy_inputs[1]],
-                policy_inputs[2].repeat(repeats, 1, 1, 1),
-                policy_inputs[3],
-            )
+            scored_inputs = self._repeat_policy_inputs(policy_inputs, repeats)
             scores = self.object_decoder.autoregressive_log_probability(
                 *scored_inputs,
                 trajectories[start * batch_size:(start + repeats) * batch_size],

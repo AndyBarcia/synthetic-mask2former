@@ -132,7 +132,8 @@ class Trainer(DefaultTrainer):
                 ignore_label=metadata.ignore_label,
             )
         if evaluator_type == "synthetic_scene_panoptic_seg":
-            return SyntheticScenePanopticEvaluator()
+            from mask2former.data.datasets.register_synthetic_scene import SYNTHETIC_SCENE_CLASSES
+            return SyntheticScenePanopticEvaluator(class_names=SYNTHETIC_SCENE_CLASSES)
         # semantic segmentation
         if evaluator_type in ["sem_seg", "ade20k_panoptic_seg"]:
             evaluator_list.append(
@@ -359,6 +360,12 @@ def setup(args):
     add_maskformer2_config(cfg)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
+    # Panoptic evaluation includes semantic metrics for the same validation seed stream.
+    # Also handle saved configs that still request the former separate semantic pass.
+    if "synthetic_scene_panoptic_val" in cfg.DATASETS.TEST:
+        cfg.DATASETS.TEST = tuple(
+            name for name in cfg.DATASETS.TEST if name != "synthetic_scene_sem_seg_val"
+        )
     if not args.eval_only:
         validate_training_mode(cfg)
     cfg.freeze()
