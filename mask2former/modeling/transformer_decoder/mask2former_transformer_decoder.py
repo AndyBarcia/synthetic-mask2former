@@ -248,6 +248,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         pre_norm: bool,
         mask_dim: int,
         enforce_input_project: bool,
+        inference_mask_optimization: bool = True,
     ):
         """
         NOTE: this interface is experimental.
@@ -270,6 +271,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
 
         assert mask_classification, "Only support mask classification model"
         self.mask_classification = mask_classification
+        self.inference_mask_optimization = inference_mask_optimization
 
         # positional encoding
         N_steps = hidden_dim // 2
@@ -359,10 +361,11 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         ret["enforce_input_project"] = cfg.MODEL.MASK_FORMER.ENFORCE_INPUT_PROJ
 
         ret["mask_dim"] = cfg.MODEL.SEM_SEG_HEAD.MASK_DIM
+        ret["inference_mask_optimization"] = cfg.MODEL.MASK_FORMER.INFERENCE_MASK_OPTIMIZATION
 
         return ret
 
-    def forward(self, x, mask_features, mask = None):
+    def forward(self, x, mask_features, mask=None, *, optimize_inference=None, defer_mask_predictions=False):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []
@@ -390,10 +393,20 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         predictions_class = []
         predictions_mask = []
 
-        # prediction heads on learnable query features
-        outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[0])
-        predictions_class.append(outputs_class)
-        predictions_mask.append(outputs_mask)
+        efficient = (not self.training and self.inference_mask_optimization
+                     and optimize_inference is not False)
+        resized_features = {}
+        if efficient:
+            # Resize C feature planes once per scale instead of Q masks per layer.
+            resized_features = {tuple(size): F.interpolate(mask_features, size=size,
+                                                          mode="bilinear", align_corners=False)
+                                for size in set(map(tuple, size_list))}
+            attn_mask = self.forward_attention_mask(output, resized_features[tuple(size_list[0])])
+        else:
+            outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(
+                output, mask_features, attn_mask_target_size=size_list[0])
+            predictions_class.append(outputs_class)
+            predictions_mask.append(outputs_mask)
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
@@ -417,19 +430,38 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
                 output
             )
 
-            outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels])
-            predictions_class.append(outputs_class)
-            predictions_mask.append(outputs_mask)
+            if efficient:
+                # The final layer has no next cross-attention mask to build.
+                if i + 1 < self.num_layers:
+                    attn_mask = self.forward_attention_mask(
+                        output, resized_features[tuple(size_list[(i + 1) % self.num_feature_levels])])
+            else:
+                outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(
+                    output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels])
+                predictions_class.append(outputs_class)
+                predictions_mask.append(outputs_mask)
 
-        assert len(predictions_class) == self.num_layers + 1
-
-        query_bias_logits = self.query_bias_embed.predicted_query_logits(
-            mask_features, predictions_mask[-1]
-        )
+        mask_embeddings = self.mask_embed(self.decoder_norm(output).transpose(0, 1))
+        image_regions = None
+        if efficient:
+            predictions_class = [self.class_embed(self.decoder_norm(output).transpose(0, 1))]
+            if defer_mask_predictions:
+                # The largest image-attention scale supplies cheap overlap masks.
+                size = max(resized_features, key=lambda size: size[0] * size[1])
+                masks_by_size = {size: torch.einsum("bqc,bchw->bqhw", mask_embeddings, features)
+                                 for size, features in resized_features.items()}
+                predictions_mask = [masks_by_size[size]]
+                image_regions = [masks_by_size[tuple(size)].flatten(2) > 0 for size in size_list]
+            else:
+                predictions_mask = [torch.einsum("bqc,bchw->bqhw", mask_embeddings, mask_features)]
+        # Object-ordered semantic/panoptic inference does not use query priors.
+        query_bias_logits = (mask_embeddings.new_zeros(bs, self.num_queries)
+                             if efficient and defer_mask_predictions else
+                             self.query_bias_embed.predicted_query_logits(mask_features, predictions_mask[-1]))
         out = {
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
-            'mask_embeddings': self.mask_embed(self.decoder_norm(output).transpose(0, 1)),
+            'mask_embeddings': mask_embeddings,
             # Reuse the main decoder's projected features and spatial positions.
             # The object decoder cross-attends to one scale per layer.
             'object_decoder_image_features': [
@@ -444,7 +476,16 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
                 query_bias_logits
             )
         }
+        if efficient and defer_mask_predictions:
+            out['mask_features'] = mask_features
+            out['object_decoder_image_regions'] = image_regions
         return out
+
+    def forward_attention_mask(self, output, resized_features):
+        mask_embeddings = self.mask_embed(self.decoder_norm(output).transpose(0, 1))
+        logits = torch.einsum("bqc,bchw->bqhw", mask_embeddings, resized_features)
+        return (logits.sigmoid().flatten(2)[:, None].expand(-1, self.num_heads, -1, -1)
+                .flatten(0, 1) < 0.5).detach()
 
     def forward_prediction_heads(self, output, mask_features, attn_mask_target_size):
         decoder_output = self.decoder_norm(output)

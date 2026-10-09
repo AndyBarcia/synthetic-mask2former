@@ -236,11 +236,132 @@ class ObjectDecoder(nn.Module):
         ), dim=1)
         return torch.matmul(decoded, output_vocabulary.transpose(1, 2)) * self.scale
 
+    @staticmethod
+    def _attention_heads(tensor, num_heads):
+        batch, steps, width = tensor.shape
+        return tensor.reshape(batch, steps, num_heads, width // num_heads).transpose(1, 2)
+
+    def _project_attention_kv(self, attention, memory):
+        width = attention.embed_dim
+        bias = attention.in_proj_bias
+        key, value = F.linear(memory, attention.in_proj_weight[width:],
+                              bias[width:] if bias is not None else None).chunk(2, dim=-1)
+        return (self._attention_heads(key, attention.num_heads),
+                self._attention_heads(value, attention.num_heads))
+
+    def _cached_cross_attention(self, attention, query, kv, blocked):
+        width = attention.embed_dim
+        bias = attention.in_proj_bias
+        query = F.linear(query, attention.in_proj_weight[:width],
+                         bias[:width] if bias is not None else None)
+        query = self._attention_heads(query, attention.num_heads)
+        # SDPA uses True for allowed keys, unlike MultiheadAttention.
+        attended = F.scaled_dot_product_attention(
+            query, *kv, attn_mask=(~blocked)[:, None, None, :],
+        )
+        attended = attended.transpose(1, 2).reshape(query.shape[0], 1, width)
+        return attention.out_proj(attended)
+
+    def _prepare_decode_cache(self, mask_embeddings, image_features, regions,
+                              exclusions, max_steps):
+        """Cache fixed projections and allocate incremental, rollout-local state.
+
+        Only use under no_grad: sampled trajectories are scored separately in a
+        full causal pass with gradients. No cache survives a rollout or update.
+        """
+        if torch.is_grad_enabled():
+            raise RuntimeError("Incremental decoding caches require no_grad")
+        if len(image_features) != 3 or len(regions) != 3:
+            raise ValueError("Object decoder requires three image feature levels")
+        batch_size = mask_embeddings.shape[0]
+        vocabulary = torch.cat((self.input_mask_projection(mask_embeddings),
+                                self.eof.expand(batch_size, 1, -1)), dim=1)
+        output_vocabulary = torch.cat((self.output_mask_projection(mask_embeddings),
+                                       self.eof.expand(batch_size, 1, -1)), dim=1)
+        image_memory = [torch.cat((feature, self.null_image_token[level].expand(batch_size, 1, -1)), 1)
+                        for level, feature in enumerate(image_features)]
+        return {
+            "vocabulary": vocabulary,
+            "output_vocabulary": output_vocabulary,
+            "image_kv": [self._project_attention_kv(layer.multihead_attn, image_memory[index % 3])
+                         for index, layer in enumerate(self.layers.layers)],
+            "vocabulary_kv": [self._project_attention_kv(attention, vocabulary)
+                              for attention in self.vocabulary_attention],
+            "self_kv": [None for _ in self.layers.layers],
+            "regions": regions,
+            "exclusions": exclusions,
+            "covered": [region.new_zeros(batch_size, region.shape[-1] + 1) for region in regions],
+            "blocked": exclusions.new_zeros(batch_size, self.num_queries + 1),
+            "max_steps": max_steps,
+            "step": 0,
+        }
+
+    def _decode_step(self, previous_token, cache):
+        """Consume one token (BOS=-1), returning logits for the next action."""
+        if torch.is_grad_enabled():
+            raise RuntimeError("Incremental decoding caches require no_grad")
+        step = cache["step"]
+        if step >= cache["max_steps"]:
+            raise ValueError("Decode cache capacity exceeded")
+        vocabulary = cache["vocabulary"]
+        batch_size, _, width = vocabulary.shape
+        rows = torch.arange(batch_size, device=previous_token.device)
+        valid = (previous_token >= 0) & (previous_token < self.num_queries)
+        query_index = previous_token.clamp(0, self.num_queries - 1)
+        cache["blocked"][:, :-1] |= cache["exclusions"][rows, query_index] & valid[:, None]
+        for covered, regions in zip(cache["covered"], cache["regions"]):
+            covered[:, :-1] |= regions[rows, query_index] & valid[:, None]
+        decoded = vocabulary[rows, previous_token.clamp_min(0)][:, None]
+        decoded = torch.where((previous_token < 0)[:, None, None], self.bos, decoded)
+        if self.position_encoding and not self.rope:
+            decoded = decoded + self.position.weight[step]
+        positions = torch.full((batch_size, 1), step, device=decoded.device, dtype=torch.long)
+        for index, layer in enumerate(self.layers.layers):
+            query, key, value = F.linear(
+                decoded, layer.self_attn.in_proj_weight, layer.self_attn.in_proj_bias,
+            ).chunk(3, dim=-1)
+            query, key, value = [self._attention_heads(tensor, self.num_heads)
+                                 for tensor in (query, key, value)]
+            if self.rope:
+                query = apply_rotary_positions(query, positions)
+                key = apply_rotary_positions(key, positions)
+            if cache["self_kv"][index] is None:
+                shape = (batch_size, self.num_heads, cache["max_steps"], width // self.num_heads)
+                cache["self_kv"][index] = (key.new_empty(shape), value.new_empty(shape))
+            keys, values = cache["self_kv"][index]
+            keys[:, :, step:step + 1] = key
+            values[:, :, step:step + 1] = value
+            # The current query may attend to every cached token, including itself.
+            # is_causal=True would incorrectly align a length-one query to BOS.
+            attended = F.scaled_dot_product_attention(query, keys[:, :, :step + 1],
+                                                      values[:, :, :step + 1])
+            attended = attended.transpose(1, 2).reshape(batch_size, 1, width)
+            decoded = layer.norm1(decoded + layer.dropout1(layer.self_attn.out_proj(attended)))
+            attended = self._cached_cross_attention(layer.multihead_attn, decoded,
+                                                     cache["image_kv"][index], cache["covered"][index % 3])
+            decoded = layer.norm2(decoded + layer.dropout2(attended))
+            decoded = layer.norm3(decoded + layer._ff_block(decoded))
+            attended = self._cached_cross_attention(self.vocabulary_attention[index], decoded,
+                                                     cache["vocabulary_kv"][index], cache["blocked"])
+            decoded = self.vocabulary_norm[index](decoded + attended)
+        cache["step"] += 1
+        return (self.norm(decoded) @ cache["output_vocabulary"].transpose(1, 2))[:, 0] * self.scale
+
+    def _rollout_cache(self, use_cache, mask_embeddings, image_features, regions,
+                       exclusions, max_steps):
+        # Preserve differentiable rollouts and custom forward implementations.
+        if (use_cache and not torch.is_grad_enabled()
+                and getattr(self.forward, "__func__", None) is ObjectDecoder.forward):
+            return self._prepare_decode_cache(mask_embeddings, image_features, regions,
+                                              exclusions, max_steps)
+        return None
+
     @torch.no_grad()
-    def generate(self, mask_embeddings, image_features, mask_logits, image_sizes):
+    def generate(self, mask_embeddings, image_features, mask_logits, image_sizes, *, use_cache=True, image_regions=None):
         """Return ordered queries, mask-versus-EOF logits, and probabilities."""
         batch_size, num_queries, _ = mask_embeddings.shape
-        image_regions = self.prepare_regions(mask_logits, image_sizes)
+        if image_regions is None:
+            image_regions = self.prepare_regions(mask_logits, image_sizes)
         exclusions = self.prepare_vocabulary_exclusions(mask_logits)
         unavailable = torch.zeros(batch_size, num_queries, dtype=torch.bool, device=mask_embeddings.device)
         order = torch.full((batch_size, num_queries), -1, dtype=torch.long, device=mask_embeddings.device)
@@ -249,8 +370,10 @@ class ObjectDecoder(nn.Module):
         lengths = torch.zeros(batch_size, dtype=torch.long, device=mask_embeddings.device)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=mask_embeddings.device)
         tokens = torch.full((batch_size, 1), -1, dtype=torch.long, device=mask_embeddings.device)
+        cache = self._rollout_cache(use_cache, mask_embeddings, image_features, image_regions, exclusions, num_queries)
         for _ in range(num_queries):
-            logits = self(mask_embeddings, image_features, image_regions, tokens, exclusions)[:, -1]
+            logits = (self._decode_step(tokens[:, -1], cache) if cache is not None else
+                      self(mask_embeddings, image_features, image_regions, tokens, exclusions)[:, -1])
             logits[:, :num_queries].masked_fill_(unavailable, -torch.inf)
             next_token = logits.argmax(-1)
             active = ~finished & (next_token != num_queries)
@@ -264,7 +387,8 @@ class ObjectDecoder(nn.Module):
             finished |= next_token == num_queries
             if finished.all():
                 break
-            tokens = torch.cat((tokens, torch.where(finished, num_queries, next_token)[:, None]), dim=1)
+            next_input = torch.where(finished, num_queries, next_token)[:, None]
+            tokens = next_input if cache is not None else torch.cat((tokens, next_input), dim=1)
         return [
             (order[batch_index, :lengths[batch_index]],
              log_odds[batch_index, :lengths[batch_index]],
@@ -274,7 +398,7 @@ class ObjectDecoder(nn.Module):
 
     def rollout(self, mask_embeddings, image_features, mask_logits, image_sizes,
                 sample=True, max_steps=32, return_diagnostics=False,
-                return_actions=False, query_bias_logits=None):
+                return_actions=False, query_bias_logits=None, *, use_cache=True):
         """Generate query orders and sequence log probabilities for policy gradients.
 
         A capped rollout is treated as an implicit EOF after the last selected query.
@@ -292,8 +416,10 @@ class ObjectDecoder(nn.Module):
             key: torch.zeros(batch_size, device=mask_embeddings.device)
             for key in ("actions", "entropy", "top1_probability", "eof_probability", "available_masks")
         } if return_diagnostics else None
+        cache = self._rollout_cache(use_cache, mask_embeddings, image_features, regions, exclusions, max_steps)
         for _ in range(max_steps):
-            logits = self(mask_embeddings, image_features, regions, previous, exclusions)[:, -1].clone()
+            logits = (self._decode_step(previous[:, -1], cache) if cache is not None else
+                      self(mask_embeddings, image_features, regions, previous, exclusions)[:, -1]).clone()
             logits[:, :num_queries].masked_fill_(unavailable.clone(), -torch.inf)
             distribution = torch.distributions.Categorical(logits=logits)
             token = distribution.sample() if sample else logits.argmax(-1)
@@ -317,7 +443,8 @@ class ObjectDecoder(nn.Module):
             finished = finished | (token == num_queries)
             if finished.all():
                 break
-            previous = torch.cat((previous, torch.where(finished, num_queries, token)[:, None]), dim=1)
+            next_input = torch.where(finished, num_queries, token)[:, None]
+            previous = next_input if cache is not None else torch.cat((previous, next_input), dim=1)
         # Transfer the complete ragged trajectories once, rather than each token.
         rows = torch.stack(action_steps, 1).tolist() if action_steps else [[] for _ in range(batch_size)]
         actions = [[token for token in row if token >= 0] for row in rows]
@@ -377,7 +504,7 @@ class ObjectDecoder(nn.Module):
         ).sum(-1)
 
     def set_imitation_loss(self, mask_embeddings, image_features, mask_logits,
-                           image_sizes, target_sets):
+                           image_sizes, target_sets, *, use_cache=True):
         """Imitate an unordered query set using constrained greedy roll-in.
 
         The roll-in chooses its own order among target queries under no_grad.
@@ -405,13 +532,15 @@ class ObjectDecoder(nn.Module):
             unavailable = torch.zeros_like(target)
             previous = torch.full((batch_size, 1), -1, dtype=torch.long, device=device)
             rollin = [[] for _ in range(batch_size)]
-            for _ in range(int(target.sum(-1).max().item())):
+            max_steps = int(target.sum(-1).max().item())
+            cache = self._rollout_cache(use_cache, mask_embeddings, image_features, regions, exclusions, max_steps)
+            for _ in range(max_steps):
                 active = remaining.any(-1)
                 eligible = remaining & ~unavailable
                 if (active & ~eligible.any(-1)).any():
                     raise ValueError("Target set contains mutually excluded queries")
-                logits = self(mask_embeddings, image_features, regions, previous,
-                              exclusions)[:, -1].float()
+                logits = (self._decode_step(previous[:, -1], cache) if cache is not None else
+                          self(mask_embeddings, image_features, regions, previous, exclusions)[:, -1]).float()
                 logits[:, :num_queries].masked_fill_(~eligible, -torch.inf)
                 logits[active, num_queries] = -torch.inf
                 logits[~active, num_queries] = 0
@@ -422,7 +551,7 @@ class ObjectDecoder(nn.Module):
                 active_rows = active.nonzero(as_tuple=True)[0]
                 remaining[active_rows, chosen[active_rows]] = False
                 unavailable[active_rows] |= exclusions[active_rows, chosen[active_rows]]
-                previous = torch.cat((previous, chosen[:, None]), dim=1)
+                previous = chosen[:, None] if cache is not None else torch.cat((previous, chosen[:, None]), dim=1)
 
         steps = max(map(len, rollin)) + 1
         actions = torch.full((batch_size, steps), num_queries, dtype=torch.long, device=device)
@@ -465,7 +594,7 @@ class ObjectDecoder(nn.Module):
         return loss, mask_loss_sum.detach(), eof_loss_sum.detach(), token_count, mask_count
 
     def rollout_permutation(self, mask_embeddings, image_features, mask_logits,
-                            image_sizes, proposal_mask, sample=True):
+                            image_sizes, proposal_mask, sample=True, *, use_cache=True):
         """Select every allowed proposal once; EOF is forced after the last mask."""
         batch_size, num_queries = mask_embeddings.shape[:2]
         if proposal_mask.shape != (batch_size, num_queries):
@@ -480,9 +609,12 @@ class ObjectDecoder(nn.Module):
         previous = torch.full((batch_size, 1), -1, dtype=torch.long, device=mask_embeddings.device)
         action_steps = []
         log_probability = mask_embeddings.new_zeros(batch_size)
-        for step in range(int(counts.max().item())):
+        max_steps = int(counts.max().item())
+        cache = self._rollout_cache(use_cache, mask_embeddings, image_features, regions, exclusions, max_steps)
+        for step in range(max_steps):
             active = counts > step
-            logits = self(mask_embeddings, image_features, regions, previous, exclusions)[:, -1].clone()
+            logits = (self._decode_step(previous[:, -1], cache) if cache is not None else
+                      self(mask_embeddings, image_features, regions, previous, exclusions)[:, -1]).clone()
             remaining = proposal_mask & ~selected
             eligible = remaining & ~excluded_neighbors
             # IoU exclusions defer overlapping proposals. Once every remaining
@@ -502,7 +634,7 @@ class ObjectDecoder(nn.Module):
             chosen = active.nonzero(as_tuple=True)[0]
             selected[chosen, token[chosen]] = True
             excluded_neighbors[chosen] |= exclusions[chosen, token[chosen]]
-            previous = torch.cat((previous, token[:, None]), dim=1)
+            previous = token[:, None] if cache is not None else torch.cat((previous, token[:, None]), dim=1)
         rows = torch.stack(action_steps, 1).tolist() if action_steps else [[] for _ in range(batch_size)]
         orders = [[token for token in row if token >= 0] for row in rows]
         return orders, log_probability

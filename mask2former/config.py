@@ -63,6 +63,7 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.DIM_FEEDFORWARD = 2048
     cfg.MODEL.MASK_FORMER.ENC_LAYERS = 0
     cfg.MODEL.MASK_FORMER.DEC_LAYERS = 6
+    cfg.MODEL.MASK_FORMER.INFERENCE_MASK_OPTIMIZATION = True
     # Number of suffix permutations sharing a randomly sampled training prefix.
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_PREFIX_TREE_BRANCHES = 4
     cfg.MODEL.MASK_FORMER.OBJECT_PRETRAIN_PQ_TEMPERATURE = 0.0
@@ -97,6 +98,8 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.TEST = CN()
     cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON = True
     cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON = False
+    # Oracle assignment is a separate diagnostic, not the PQ metric kernel.
+    cfg.TEST.SYNTHETIC_PANOPTIC_ORACLE = True
     cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON = False
     cfg.MODEL.MASK_FORMER.TEST.OBJECT_MASK_THRESHOLD = 0.0
     cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_PAINT_ORDER = "forward"

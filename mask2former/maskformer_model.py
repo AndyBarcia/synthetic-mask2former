@@ -16,6 +16,8 @@ from detectron2.utils.memory import retry_if_cuda_oom
 from .modeling.criterion import SetCriterion
 from .modeling.matcher import HungarianMatcher
 from .modeling.object_decoder import ObjectDecoder
+from .modeling.deferred_masks import DeferredMaskProposals, render_selected_masks
+from .modeling.panoptic_paint import paint_panoptic_masks
 
 
 @META_ARCH_REGISTRY.register()
@@ -46,6 +48,7 @@ class MaskFormer(nn.Module):
         instance_on: bool,
         test_topk_per_image: int,
         object_rl_only: bool = False,
+        inference_mask_optimization: bool = True,
     ):
         """
         Args:
@@ -77,6 +80,7 @@ class MaskFormer(nn.Module):
         self.sem_seg_head = sem_seg_head
         self.criterion = criterion
         self.object_rl_only = object_rl_only
+        self.inference_mask_optimization = inference_mask_optimization
         if object_rl_only:
             if criterion.object_decoder is None or criterion.object_rl_weight <= 0:
                 raise ValueError("RL requires an object decoder and positive RL weight")
@@ -215,6 +219,7 @@ class MaskFormer(nn.Module):
             "panoptic_on": cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON,
             "test_topk_per_image": cfg.TEST.DETECTIONS_PER_IMAGE,
             "object_rl_only": cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY,
+            "inference_mask_optimization": cfg.MODEL.MASK_FORMER.INFERENCE_MASK_OPTIMIZATION,
         }
 
     @property
@@ -251,15 +256,22 @@ class MaskFormer(nn.Module):
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
 
+        predictor = self.sem_seg_head.predictor
+        supports_optimization = hasattr(predictor, "inference_mask_optimization")
+        efficient = (not self.training and self.inference_mask_optimization
+                     and supports_optimization and predictor.inference_mask_optimization)
+        deferred = efficient and self.criterion.object_decoder is not None and not self.instance_on
+        head_options = (dict(optimize_inference=efficient, defer_mask_predictions=deferred)
+                        if supports_optimization else {})
         if self.training and self.object_rl_only:
             self.backbone.eval()
             self.sem_seg_head.eval()
             with torch.no_grad():
                 features = self.backbone(images.tensor)
-                outputs = self.sem_seg_head(features)
+                outputs = self.sem_seg_head(features, **head_options)
         else:
             features = self.backbone(images.tensor)
-            outputs = self.sem_seg_head(features)
+            outputs = self.sem_seg_head(features, **head_options)
 
         if self.training:
             # mask classification target
@@ -297,29 +309,34 @@ class MaskFormer(nn.Module):
                 self.criterion.object_decoder.generate(
                     outputs["mask_embeddings"], outputs["object_decoder_image_features"],
                     outputs["pred_masks"], outputs["object_decoder_image_sizes"],
+                    **({"image_regions": outputs["object_decoder_image_regions"]} if deferred else {}),
                 )
                 if self.criterion.object_decoder is not None
                 else [(None, None, None)] * len(batched_inputs)
             )
-            # upsample masks
-            mask_pred_results = F.interpolate(
-                mask_pred_results,
-                size=(images.tensor.shape[-2], images.tensor.shape[-1]),
-                mode="bilinear",
-                align_corners=False,
-            )
-
+            padded_size = images.tensor.shape[-2:]
+            if deferred:
+                mask_embeddings, mask_features = outputs["mask_embeddings"], outputs["mask_features"]
+                mask_pred_results = render_selected_masks(
+                    mask_embeddings, mask_features, [order for order, _, _ in generated_objects], padded_size)
+            else:
+                mask_pred_results = F.interpolate(mask_pred_results, size=padded_size,
+                                                  mode="bilinear", align_corners=False)
             del outputs
 
             processed_results = []
-            for mask_cls_result, mask_pred_result, query_bias_result, generated, input_per_image, image_size in zip(
+            panoptic_inputs = []
+            # Analysis tools can still override the per-image painter.
+            batch_paint = (self.panoptic_on and
+                           getattr(self.panoptic_inference, "__func__", None) is MaskFormer.panoptic_inference)
+            for image_index, (mask_cls_result, mask_pred_result, query_bias_result, generated, input_per_image, image_size) in enumerate(zip(
                 mask_cls_results,
                 mask_pred_results,
                 query_bias_results,
                 generated_objects,
                 batched_inputs,
                 images.image_sizes,
-            ):
+            )):
                 object_order, object_log_odds, object_probabilities = generated
                 height = input_per_image.get("height", image_size[0])
                 width = input_per_image.get("width", image_size[1])
@@ -331,10 +348,18 @@ class MaskFormer(nn.Module):
                         "mask_vs_eof_probabilities": object_probabilities,
                     }
 
+                if deferred:
+                    mask_pred_result = mask_pred_result[:len(object_order)]
+                    mask_cls_result = mask_cls_result[object_order]
+                    query_bias_result = query_bias_result[object_order]
+                    # The rendered masks follow the selected order; keep original
+                    # query IDs in object_decoder metadata, use local IDs to paint.
+                    object_order = torch.arange(len(object_order), device=mask_pred_result.device)
+
                 if self.sem_seg_postprocess_before_inference:
-                    mask_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
+                    mask_pred_result = (retry_if_cuda_oom(sem_seg_postprocess)(
                         mask_pred_result, image_size, height, width
-                    )
+                    ) if mask_pred_result.shape[0] else mask_pred_result.new_empty((0, height, width)))
                     mask_cls_result = mask_cls_result.to(mask_pred_result)
                     query_bias_result = query_bias_result.to(mask_pred_result)
 
@@ -353,14 +378,19 @@ class MaskFormer(nn.Module):
 
                 # panoptic segmentation inference
                 if self.panoptic_on:
-                    panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(
-                        mask_cls_result, mask_pred_result, query_bias_result, object_order
-                    )
-                    processed_results[-1]["panoptic_seg"] = panoptic_r
+                    if batch_paint:
+                        panoptic_inputs.append((mask_cls_result, mask_pred_result, query_bias_result, object_order))
+                    else:
+                        processed_results[-1]["panoptic_seg"] = retry_if_cuda_oom(self.panoptic_inference)(
+                            mask_cls_result, mask_pred_result, query_bias_result, object_order)
                     if "panoptic_ground_truth" in input_per_image:
                         # Keep every query, before object-decoder/score selection,
                         # for the synthetic evaluator's oracle assignment.
-                        processed_results[-1]["panoptic_proposals"] = mask_pred_result
+                        processed_results[-1]["panoptic_proposals"] = (
+                            DeferredMaskProposals(mask_embeddings[image_index], mask_features[image_index],
+                                                  padded_size, image_size, (height, width),
+                                                  self.sem_seg_postprocess_before_inference)
+                            if deferred else mask_pred_result)
                 
                 # instance segmentation inference
                 if self.instance_on:
@@ -369,6 +399,17 @@ class MaskFormer(nn.Module):
                     )
                     processed_results[-1]["instances"] = instance_r
 
+            if batch_paint:
+                # Batch uniform canvases; mixed output dimensions form small groups.
+                groups = {}
+                for index, item in enumerate(panoptic_inputs):
+                    groups.setdefault(tuple(item[1].shape[-2:]), []).append(index)
+                for indices in groups.values():
+                    painted = self.panoptic_batch_inference([panoptic_inputs[index] for index in indices],
+                                                            ordered=deferred)
+                    for index, (panoptic, classes) in zip(indices, painted):
+                        processed_results[index]["panoptic_seg"] = panoptic
+                        processed_results[index]["panoptic_classes"] = classes
             return processed_results
 
     def prepare_targets(self, targets, images):
@@ -393,43 +434,36 @@ class MaskFormer(nn.Module):
         semseg = torch.einsum("qc,qhw->chw", mask_cls, mask_pred)
         return semseg
 
-    def panoptic_inference(self, mask_cls, mask_pred, query_bias, object_order=None):
-        class_scores, labels = F.softmax(mask_cls[..., :-1], dim=-1).max(-1)
-        if object_order is None:
-            # Compatibility with a transformer that has no object decoder.
-            scores = class_scores * query_bias
-            kept = torch.where(scores > self.object_mask_threshold)[0]
-            object_order = kept[torch.argsort(scores[kept], descending=True)]
-
-        panoptic_seg = torch.zeros(mask_pred.shape[-2:], dtype=torch.int32, device=mask_pred.device)
-        segments_info = []
-        stuff_ids = {}
-        thing_classes = set(self.metadata.thing_dataset_id_to_contiguous_id.values())
-
-        paint_order = object_order.flip(0) if self.panoptic_paint_order == "reverse" else object_order
-        for query_index in paint_order.tolist():
-            mask = mask_pred[query_index] > 0
-            if not mask.any():
-                continue
-            category_id = int(labels[query_index])
-            isthing = category_id in thing_classes
-            if not isthing and category_id in stuff_ids:
-                segment_id = stuff_ids[category_id]
+    def panoptic_batch_inference(self, inputs, *, ordered=False):
+        masks, labels = [], []
+        for mask_cls, mask_pred, query_bias, object_order in inputs:
+            if object_order is None:
+                class_scores, categories = F.softmax(mask_cls[..., :-1], dim=-1).max(-1)
+                scores = class_scores * query_bias
+                kept = torch.where(scores > self.object_mask_threshold)[0]
+                object_order = kept[torch.argsort(scores[kept], descending=True)]
             else:
-                segment_id = len(segments_info) + 1
-                segments_info.append({
-                    "id": segment_id,
-                    "isthing": isthing,
-                    "category_id": category_id,
-                })
-                if not isthing:
-                    stuff_ids[category_id] = segment_id
-            panoptic_seg[mask] = segment_id
+                categories = mask_cls[..., :-1].argmax(-1)
+            masks.append(mask_pred if ordered else mask_pred[object_order])
+            labels.append(categories if ordered else categories[object_order])
+        masks = torch.nn.utils.rnn.pad_sequence(masks, batch_first=True, padding_value=-torch.inf)
+        labels_padded = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=0)
+        lengths = torch.tensor([len(row) for row in labels], device=masks.device)
+        valid = torch.arange(masks.shape[1], device=masks.device)[None] < lengths[:, None]
+        thing_ids = set(self.metadata.thing_dataset_id_to_contiguous_id.values())
+        isthing = torch.tensor([category in thing_ids for category in range(inputs[0][0].shape[-1] - 1)],
+                               device=masks.device, dtype=torch.bool)
+        maps, classes = paint_panoptic_masks(masks, labels_padded, valid, isthing,
+                                            reverse=self.panoptic_paint_order == "reverse")
+        # One small transfer for the legacy segments_info dictionaries; the
+        # evaluator consumes the class tensors directly without uploading them.
+        class_rows = classes.tolist()
+        return [((maps[image], [{"id": slot, "category_id": category, "isthing": category in thing_ids}
+                               for slot, category in enumerate(row) if slot and category >= 0]), classes[image])
+                for image, row in enumerate(class_rows)]
 
-        # A later front mask may have covered an earlier segment completely.
-        visible_ids = set(panoptic_seg.unique().tolist())
-        segments_info = [segment for segment in segments_info if segment["id"] in visible_ids]
-        return panoptic_seg, segments_info
+    def panoptic_inference(self, mask_cls, mask_pred, query_bias, object_order=None):
+        return self.panoptic_batch_inference([(mask_cls, mask_pred, query_bias, object_order)])[0][0]
 
     def instance_inference(self, mask_cls, mask_pred, query_bias):
         # mask_pred is already processed to have the same shape as original input

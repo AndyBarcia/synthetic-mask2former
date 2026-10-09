@@ -16,8 +16,9 @@ from detectron2.utils import comm
 class SyntheticScenePanopticEvaluator(DatasetEvaluator):
     """Compute standard PQ/SQ/RQ without serializing predictions or ground truth."""
 
-    def __init__(self, num_classes=6, device=None, class_names=None):
+    def __init__(self, num_classes=6, device=None, class_names=None, evaluate_oracle=True):
         self.num_classes = num_classes
+        self.evaluate_oracle = evaluate_oracle
         self.class_names = class_names or [str(index) for index in range(num_classes)]
         if len(self.class_names) != num_classes:
             raise ValueError("class_names must match num_classes")
@@ -52,25 +53,40 @@ class SyntheticScenePanopticEvaluator(DatasetEvaluator):
         return self._raw_stats(self._oracle)
 
     def process(self, inputs, outputs):
-        for input_record, output_record in zip(inputs, outputs):
-            gt_map, gt_info = input_record["panoptic_ground_truth"]
-            pred_map, pred_info = output_record["panoptic_seg"]
-            self._accumulate_image(
-                gt_map.detach().to(device=self.device, dtype=torch.int64),
-                gt_info,
-                pred_map.detach().to(device=self.device, dtype=torch.int64),
-                pred_info,
-            )
-            oracle_map, oracle_info = self._oracle_assignment(
-                gt_map, gt_info, output_record["panoptic_proposals"]
-            )
-            self._accumulate_image(
-                gt_map.detach().to(device=self.device, dtype=torch.int64),
-                gt_info,
-                oracle_map,
-                oracle_info,
-                stats=self._oracle,
-            )
+        # Uniform canvases share one native evaluator update, not one per image.
+        groups = {}
+        for index, record in enumerate(inputs):
+            groups.setdefault(tuple(record["panoptic_ground_truth"][0].shape), []).append(index)
+        for indices in groups.values():
+            records = [inputs[index] for index in indices]
+            predictions = [outputs[index] for index in indices]
+            target = self._pack_ground_truth(records)
+            self._accumulate_batch(predictions, target, self._standard)
+            if self.evaluate_oracle:
+                oracle = [self._oracle_assignment(record["panoptic_ground_truth"][0],
+                                                   record["panoptic_ground_truth"][1],
+                                                   prediction["panoptic_proposals"])
+                          for record, prediction in zip(records, predictions)]
+                self._accumulate_batch([{"panoptic_seg": result} for result in oracle], target, self._oracle)
+
+    def _pack_ground_truth(self, records):
+        maps, infos = zip(*(record["panoptic_ground_truth"] for record in records))
+        return self._batch_type.from_coco(
+            torch.stack(maps).to(device=self.device, dtype=torch.int64),
+            infos, list(range(self.num_classes)), compact=False)
+
+    def _accumulate_batch(self, predictions, target, evaluator):
+        maps, infos = zip(*(prediction["panoptic_seg"] for prediction in predictions))
+        maps = torch.stack(maps).to(device=self.device, dtype=torch.int32)
+        if all("panoptic_classes" in prediction for prediction in predictions):
+            classes = torch.nn.utils.rnn.pad_sequence(
+                [prediction["panoptic_classes"].to(self.device) for prediction in predictions],
+                batch_first=True, padding_value=-1)
+            prediction = self._batch_type(maps, classes)
+        else:
+            prediction = self._batch_type.from_coco(
+                maps, infos, list(range(self.num_classes)), compact=False)
+        evaluator.update(prediction, target)
 
     @staticmethod
     def _oracle_assignment(gt_map, gt_info, proposals):
@@ -82,6 +98,8 @@ class SyntheticScenePanopticEvaluator(DatasetEvaluator):
         that fail the same strict threshold after overlap resolution, repainting
         after each removal. This is a heuristic, not a global PQ optimization.
         """
+        if hasattr(proposals, "materialize"):
+            proposals = proposals.materialize()
         proposals = proposals.detach()
         gt_map = gt_map.to(device=proposals.device, dtype=torch.int64)
         if proposals.ndim != 3 or proposals.shape[-2:] != gt_map.shape:
@@ -114,13 +132,13 @@ class SyntheticScenePanopticEvaluator(DatasetEvaluator):
             best_logits, winners = selected.max(dim=0)
             panoptic_map.zero_()
             panoptic_map[best_logits > 0] = winners[best_logits > 0] + 1
-            final_ious = []
-            for index, target in enumerate(assigned_gt):
-                visible = (panoptic_map == index + 1) & (gt_map != 0)
-                intersection = (visible & target).sum()
-                union = (visible | target).sum()
-                final_ious.append(intersection.float() / union.clamp_min(1))
-            final_ious = torch.stack(final_ious)
+            # Score all assigned masks in one reduction instead of launching
+            # several kernels per GT segment during every pruning round.
+            ids = torch.arange(1, len(gt_indices) + 1, device=proposals.device)
+            visible = (panoptic_map[None] == ids[:, None, None]) & (gt_map != 0)[None]
+            intersection = (visible & assigned_gt).flatten(1).sum(1)
+            union = visible.flatten(1).sum(1) + assigned_gt.flatten(1).sum(1) - intersection
+            final_ious = intersection.float() / union.clamp_min(1)
             if (final_ious > 0.5).all():
                 break
             # Remove the worst failed mask first: repainting can rescue others.
@@ -158,10 +176,9 @@ class SyntheticScenePanopticEvaluator(DatasetEvaluator):
             return None
         stats = torch.stack([item[0] for item in gathered]).sum(dim=0)
         confusion = torch.stack([item[1] for item in gathered]).sum(dim=0)
-        results = OrderedDict({
-            "panoptic_seg": self._summarize(stats[0]),
-            "panoptic_seg_oracle": self._summarize(stats[1]),
-        })
+        results = OrderedDict({"panoptic_seg": self._summarize(stats[0])})
+        if self.evaluate_oracle:
+            results["panoptic_seg_oracle"] = self._summarize(stats[1])
         rows = []
         for name, values in results.items():
             mode = "Oracle" if name.endswith("_oracle") else "Standard"
