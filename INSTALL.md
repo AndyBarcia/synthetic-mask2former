@@ -46,3 +46,18 @@ pip install -r requirements.txt
 cd mask2former/modeling/pixel_decoder/ops
 sh make.sh
 ```
+
+Combined COCO and synthetic evaluation uses `SegmentationEvaluator` when
+`MODEL.MASK_FORMER.TEST.INSTANCE_ON` is enabled alongside panoptic inference.
+The evaluator reports `panoptic_seg`, `sem_seg` (when enabled for COCO), and
+`segm` AP/AR, sharing panoptic ground truth. Semantic metrics use the final
+panoptic labels; AP ground truth is the panoptic thing segments, which can
+differ from the separate overlapping COCO instance annotations. COCO annotation
+areas are preserved for AP size filtering. Distributed evaluation merges match
+records before computing dataset AP, rather than averaging worker AP values.
+
+When an object decoder is present, instance predictions use its selected queries
+and their confidence `P(mask) / (P(mask) + P(EOF))`, equivalently
+`sigmoid(mask_logit - EOF_logit)`. This score is used directly, without class or
+pixel-confidence multipliers. Models without an object decoder retain proposal
+scoring. Rebuild the CUDA extension after updating the evaluator submodule.

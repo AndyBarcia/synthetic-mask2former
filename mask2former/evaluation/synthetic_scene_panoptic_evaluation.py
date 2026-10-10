@@ -16,8 +16,9 @@ from detectron2.utils import comm
 class SyntheticScenePanopticEvaluator(DatasetEvaluator):
     """Compute standard PQ/SQ/RQ without serializing predictions or ground truth."""
 
-    def __init__(self, num_classes=6, device=None, class_names=None, evaluate_oracle=True):
+    def __init__(self, num_classes=6, device=None, class_names=None, evaluate_oracle=True, evaluate_instance=False):
         self.num_classes = num_classes
+        self.evaluate_instance = evaluate_instance
         self.evaluate_oracle = evaluate_oracle
         self.class_names = class_names or [str(index) for index in range(num_classes)]
         if len(self.class_names) != num_classes:
@@ -29,13 +30,17 @@ class SyntheticScenePanopticEvaluator(DatasetEvaluator):
             raise ImportError("Initialize the evaluator with git submodule update --init --recursive")
         if str(submodule) not in sys.path:
             sys.path.insert(0, str(submodule))
-        from panoptic_evaluator import PanopticBatch, PanopticEvaluator
+        from panoptic_evaluator import PanopticBatch, PanopticEvaluator, SegmentationEvaluator, InstanceBatch
+        self._combined_type = SegmentationEvaluator
+        self._instance_batch_type = InstanceBatch
         self._batch_type = PanopticBatch
         self._evaluator_type = PanopticEvaluator
 
     def reset(self):
         options = dict(isthing=[False] + [True] * (self.num_classes - 1), device=self.device)
-        self._standard = self._evaluator_type(self.num_classes, **options)
+        self._combined = self._combined_type(self.num_classes, **options) if self.evaluate_instance else None
+        self._standard = (self._combined.panoptic if self._combined is not None
+                          else self._evaluator_type(self.num_classes, **options))
         self._oracle = self._evaluator_type(self.num_classes, **options)
 
     @staticmethod
@@ -61,7 +66,7 @@ class SyntheticScenePanopticEvaluator(DatasetEvaluator):
             records = [inputs[index] for index in indices]
             predictions = [outputs[index] for index in indices]
             target = self._pack_ground_truth(records)
-            self._accumulate_batch(predictions, target, self._standard)
+            self._accumulate_batch(predictions, target, self._combined or self._standard)
             if self.evaluate_oracle:
                 oracle = [self._oracle_assignment(record["panoptic_ground_truth"][0],
                                                    record["panoptic_ground_truth"][1],
@@ -86,7 +91,12 @@ class SyntheticScenePanopticEvaluator(DatasetEvaluator):
         else:
             prediction = self._batch_type.from_coco(
                 maps, infos, list(range(self.num_classes)), compact=False)
-        evaluator.update(prediction, target)
+        if evaluator is self._combined:
+            from mask2former.evaluation.combined_evaluation import instance_batch
+            evaluator.update(prediction, instance_batch(
+                predictions, self._instance_batch_type, self.device), target)
+        else:
+            evaluator.update(prediction, target)
 
     @staticmethod
     def _oracle_assignment(gt_map, gt_info, proposals):
@@ -171,6 +181,7 @@ class SyntheticScenePanopticEvaluator(DatasetEvaluator):
         gathered = comm.gather((
             torch.stack((self._stats, self._oracle_stats)),
             self._standard.confusion.cpu(),
+            self._instance_state(),
         ))
         if not comm.is_main_process():
             return None
@@ -203,7 +214,16 @@ class SyntheticScenePanopticEvaluator(DatasetEvaluator):
             {key: round(results["sem_seg"][key], 4)
              for key in ("mIoU", "fwIoU", "mACC", "pACC")},
         )
+        if self.evaluate_instance:
+            from mask2former.evaluation.combined_evaluation import summarize_instances
+            results["segm"] = summarize_instances([item[2] for item in gathered], self.num_classes, self.device)
         return results
+
+    def _instance_state(self):
+        if not self.evaluate_instance:
+            return None
+        from mask2former.evaluation.combined_evaluation import instance_state
+        return instance_state(self._combined.instance)
 
     def _summarize_semantic(self, confusion):
         # Backend rows are GT classes; columns are predicted classes plus void.

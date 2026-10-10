@@ -73,6 +73,7 @@ from mask2former.evaluation.synthetic_scene_sem_seg_evaluation import (
     SyntheticSceneSemSegEvaluator,
 )
 
+from mask2former.evaluation.coco_panoptic_evaluation import OptimizedCOCOPanopticEvaluator
 
 class Trainer(DefaultTrainer):
     """
@@ -133,7 +134,16 @@ class Trainer(DefaultTrainer):
             )
         if evaluator_type == "synthetic_scene_panoptic_seg":
             from mask2former.data.datasets.register_synthetic_scene import SYNTHETIC_SCENE_CLASSES
-            return SyntheticScenePanopticEvaluator(class_names=SYNTHETIC_SCENE_CLASSES)
+            return SyntheticScenePanopticEvaluator(
+                class_names=SYNTHETIC_SCENE_CLASSES,
+                evaluate_instance=cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON,
+            )
+        if evaluator_type == "coco_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON:
+            return OptimizedCOCOPanopticEvaluator(
+                dataset_name, output_folder,
+                evaluate_instance=cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON,
+                evaluate_semantic=cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON,
+            )
         # semantic segmentation
         if evaluator_type in ["sem_seg", "ade20k_panoptic_seg"]:
             evaluator_list.append(

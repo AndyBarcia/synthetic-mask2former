@@ -395,7 +395,8 @@ class MaskFormer(nn.Module):
                 # instance segmentation inference
                 if self.instance_on:
                     instance_r = retry_if_cuda_oom(self.instance_inference)(
-                        mask_cls_result, mask_pred_result, query_bias_result
+                        mask_cls_result, mask_pred_result, query_bias_result,
+                        object_order, object_probabilities
                     )
                     processed_results[-1]["instances"] = instance_r
 
@@ -465,13 +466,16 @@ class MaskFormer(nn.Module):
     def panoptic_inference(self, mask_cls, mask_pred, query_bias, object_order=None):
         return self.panoptic_batch_inference([(mask_cls, mask_pred, query_bias, object_order)])[0][0]
 
-    def instance_inference(self, mask_cls, mask_pred, query_bias):
+    def instance_inference(self, mask_cls, mask_pred, query_bias,
+                           object_order=None, object_probabilities=None):
         # mask_pred is already processed to have the same shape as original input
         image_size = mask_pred.shape[-2:]
 
         class_scores, labels_per_image = F.softmax(mask_cls[:, :-1], dim=-1).max(-1)
-        order = torch.argsort(query_bias, descending=True, stable=True)
-        scores_per_image = class_scores[order] * query_bias[order]
+        order = (torch.argsort(query_bias, descending=True, stable=True)
+                 if object_order is None else object_order)
+        scores_per_image = (class_scores[order] * query_bias[order]
+                            if object_order is None else object_probabilities.to(mask_pred))
         labels_per_image = labels_per_image[order]
         mask_pred = mask_pred[order]
 
@@ -492,8 +496,12 @@ class MaskFormer(nn.Module):
         # Uncomment the following to get boxes from masks (this is slow)
         # result.pred_boxes = BitMasks(mask_pred > 0).get_bounding_boxes()
 
-        # calculate average mask prob
-        mask_scores_per_image = (mask_pred.sigmoid().flatten(1) * result.pred_masks.flatten(1)).sum(1) / (result.pred_masks.flatten(1).sum(1) + 1e-6)
-        result.scores = scores_per_image * mask_scores_per_image
+        if object_order is None:
+            mask_scores = (mask_pred.sigmoid().flatten(1) * result.pred_masks.flatten(1)).sum(1)
+            mask_scores /= result.pred_masks.flatten(1).sum(1) + 1e-6
+            result.scores = scores_per_image * mask_scores
+        else:
+            # P(mask) / (P(mask) + P(EOF)) from the generation step.
+            result.scores = scores_per_image
         result.pred_classes = labels_per_image
         return result
