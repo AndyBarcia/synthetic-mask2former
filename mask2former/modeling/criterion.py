@@ -316,7 +316,8 @@ class SetCriterion(nn.Module):
                     gt_maps[image] = (target_masks * ids[:, None, None]).amax(0)
 
         # A query's last occurrence wins, including repeated queries. Segment IDs
-        # can be query IDs: PQ ignores unused slots. Merge all stuff into slot Q+1.
+        # can be query IDs: PQ ignores unused slots. Reserve one additional slot
+        # per stuff category; category 0 can be a thing (e.g. COCO person).
         paint_orders = [list(reversed(order)) if self.object_rl_paint_order == "reverse"
                         else list(order) for order in orders]
         steps = max(map(len, paint_orders))
@@ -327,9 +328,12 @@ class SetCriterion(nn.Module):
             ranks.scatter_reduce_(1, padded,
                                   torch.arange(1, steps + 1, device=device)[None].expand_as(padded),
                                   reduce="amax", include_self=True)
+        isthing = torch.zeros(self.num_classes, device=device, dtype=torch.bool)
+        isthing[list(self.thing_class_ids)] = True
         pred_labels = torch.cat((torch.full((batch_size, 1), -1, device=device, dtype=torch.int32),
-                                 classes.masked_fill(classes == 0, -1),
-                                 torch.zeros((batch_size, 1), device=device, dtype=torch.int32)), 1)
+                                 classes.masked_fill(~isthing[classes], -1),
+                                 torch.arange(self.num_classes, device=device, dtype=torch.int32)
+                                 .expand(batch_size, -1)), 1)
         # Bound the temporary [rollouts*images, queries, pixels] rank tensor.
         chunk_size = max(1, 16_000_000 // max(1, num_queries * size[0] * size[1]))
         rewards = []
@@ -338,7 +342,8 @@ class SetCriterion(nn.Module):
             images = torch.arange(start, stop, device=device) % batch_size
             winning_rank, query = (masks[images] * ranks[start:stop, :num_queries, None, None]).max(1)
             categories = classes[images].gather(1, query.flatten(1)).reshape_as(query)
-            painted = torch.where(categories == 0, num_queries + 1, query + 1)
+            painted = torch.where(isthing[categories], query + 1,
+                                  num_queries + 1 + categories)
             painted = painted.masked_fill(winning_rank == 0, 0).to(torch.int32)
             rewards.append(panoptic_quality(
                 PanopticBatch(painted, pred_labels[images]),
