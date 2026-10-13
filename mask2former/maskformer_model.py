@@ -190,6 +190,7 @@ class MaskFormer(nn.Module):
             object_rl_max_steps=cfg.MODEL.MASK_FORMER.OBJECT_RL_MAX_STEPS,
             object_rl_reward_size=cfg.MODEL.MASK_FORMER.OBJECT_RL_REWARD_SIZE,
             object_rl_num_samples=cfg.MODEL.MASK_FORMER.OBJECT_RL_NUM_SAMPLES,
+            object_rl_reward=cfg.MODEL.MASK_FORMER.OBJECT_RL_REWARD,
             object_rl_baseline=cfg.MODEL.MASK_FORMER.OBJECT_RL_BASELINE,
             object_rl_objective=cfg.MODEL.MASK_FORMER.OBJECT_RL_OBJECTIVE,
             object_rl_train_eof=cfg.MODEL.MASK_FORMER.OBJECT_RL_TRAIN_EOF,

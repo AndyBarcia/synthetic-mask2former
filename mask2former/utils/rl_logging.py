@@ -1,4 +1,4 @@
-"""Distributed RL diagnostics; rewards are reported in PQ points (0–100)."""
+"""Distributed RL diagnostics; absolute PQ and signed reward changes are distinct."""
 
 import logging
 
@@ -10,7 +10,7 @@ from detectron2.utils.events import EventWriter, get_event_storage
 @torch.no_grad()
 def record_rl_diagnostics(sampled_reward, greedy_reward, advantage,
                           log_probability, rl_loss, sampled_lengths=None,
-                          greedy_lengths=None):
+                          greedy_lengths=None, reward_mode="image_pq"):
     # Keep criterion calls outside a training EventStorage usable (e.g. diagnostics).
     try:
         storage = get_event_storage()
@@ -53,6 +53,8 @@ def record_rl_diagnostics(sampled_reward, greedy_reward, advantage,
     second_moment = metrics.pop("advantage/second_moment")
     metrics["advantage/std_pq"] = max(0, second_moment - metrics["advantage/mean_pq"] ** 2) ** 0.5
     for key, value in metrics.items():
+        if reward_mode == "batch_pq" and key.startswith("reward/"):
+            key = key.replace("_pq", "_scaled_delta_pq")
         storage.put_scalar(f"rl/{key}", value)
 
 
@@ -60,7 +62,8 @@ def record_rl_diagnostics(sampled_reward, greedy_reward, advantage,
 def record_best_of_n_diagnostics(sampled_reward, greedy_reward, best_reward,
                                  winners, greedy_orders, best_trajectories,
                                  loss, token_count, metric_group="best_of_n",
-                                 mask_nll=None, eof_nll=None, mask_count=None):
+                                 mask_nll=None, eof_nll=None, mask_count=None,
+                                 reward_mode="image_pq"):
     try:
         storage = get_event_storage()
     except AssertionError:
@@ -108,7 +111,26 @@ def record_best_of_n_diagnostics(sampled_reward, greedy_reward, best_reward,
             denominator = max(mask_tokens, 1)
         else:
             denominator = count
+        if reward_mode == "batch_pq" and key.startswith("reward/"):
+            key = key.replace("_pq", "_scaled_delta_pq")
         storage.put_scalar(f"rl/{key}", value / denominator)
+
+
+@torch.no_grad()
+def record_batch_pq_diagnostics(stats, batch_size):
+    """Absolute PQ for greedy and complete sampled distributed batches."""
+    try:
+        storage = get_event_storage()
+    except AssertionError:
+        return
+    totals = stats.reshape(-1, batch_size, stats.shape[-2], 4).double().sum(1)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(totals)
+    iou, tp, fp, fn = totals.unbind(-1)
+    denominator = tp + .5 * (fp + fn)
+    pq = (iou / denominator.clamp_min(1)).sum(-1) / (denominator > 0).sum(-1).clamp_min(1)
+    storage.put_scalar("rl/pq/greedy_batch_pq", pq[-1].item() * 100)
+    storage.put_scalar("rl/pq/sample_batch_pq", pq[:-1].mean().item() * 100)
 
 
 class RLMetricPrinter(EventWriter):
@@ -126,7 +148,7 @@ class RLMetricPrinter(EventWriter):
         if not names:
             return
         logger = logging.getLogger("mask2former.rl")
-        for group in ("reward", "advantage", "policy", "sequence", "best_of_n",
+        for group in ("pq", "reward", "advantage", "policy", "sequence", "best_of_n",
                       "set_imitation"):
             fields = [f"{name.split('/')[-1]}={storage.history(name).median(self.window_size):.4g}"
                       for name in names if name.startswith(f"rl/{group}/")]

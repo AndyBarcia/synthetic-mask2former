@@ -76,6 +76,7 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY = False
     cfg.MODEL.MASK_FORMER.OBJECT_RL_MAX_STEPS = 101
     cfg.MODEL.MASK_FORMER.OBJECT_RL_NUM_SAMPLES = 4
+    cfg.MODEL.MASK_FORMER.OBJECT_RL_REWARD = "image_pq"
     cfg.MODEL.MASK_FORMER.OBJECT_RL_BASELINE = "rloo_greedy"
     # policy_gradient uses RLOO/SCST; Best-of-N variants imitate a trajectory
     # (best_of_n_ft) or its unordered selected-query set (best_of_n_set).

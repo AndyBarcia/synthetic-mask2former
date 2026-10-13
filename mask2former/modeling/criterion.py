@@ -18,8 +18,35 @@ from detectron2.projects.point_rend.point_features import (
 )
 
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
-from ..utils.rl_logging import record_best_of_n_diagnostics, record_rl_diagnostics
+from ..utils.rl_logging import record_best_of_n_diagnostics, record_rl_diagnostics, record_batch_pq_diagnostics
 from .utils import compute_mask_block_counts
+
+
+@torch.no_grad()
+def batch_pq_counterfactual_rewards(stats, batch_size):
+    """Replace one greedy image at a time in the distributed batch's PQ totals.
+
+    Multiplication by global batch size compensates for the mean policy loss.
+    Other images remain independent of this image's sampled actions.
+    """
+    stats = stats.reshape(-1, batch_size, stats.shape[-2], 4).double()
+    greedy = stats[-1]
+    total = greedy.sum(0)
+    world_size = 1
+    if is_dist_avail_and_initialized():
+        torch.distributed.all_reduce(total)
+        world_size = torch.distributed.get_world_size()
+
+    def pq(values):
+        iou, tp, fp, fn = values.unbind(-1)
+        denominator = tp + 0.5 * (fp + fn)
+        active = denominator > 0
+        return (iou / denominator.clamp_min(1)).sum(-1) / active.sum(-1).clamp_min(1)
+
+    baseline = pq(total)
+    replacement = total[None, None] - greedy[None] + stats[:-1]
+    rewards = (pq(replacement) - baseline) * (batch_size * world_size)
+    return rewards.float(), torch.zeros(batch_size, device=stats.device)
 
 
 def dice_loss(
@@ -149,7 +176,7 @@ class SetCriterion(nn.Module):
                  object_rl_max_steps=101, object_rl_reward_size=0,
                  object_rl_num_samples=4, object_rl_train_eof=True,
                  object_rl_baseline="rloo_greedy", object_rl_objective="policy_gradient",
-                 fused_thing_masks=False, thing_class_ids=()):
+                 fused_thing_masks=False, thing_class_ids=(), object_rl_reward="image_pq"):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -167,6 +194,9 @@ class SetCriterion(nn.Module):
         self.fused_thing_masks = fused_thing_masks
         self.thing_class_ids = tuple(thing_class_ids)
         self.object_decoder = object_decoder
+        if object_rl_reward not in ("image_pq", "batch_pq"):
+            raise ValueError("OBJECT_RL_REWARD must be image_pq or batch_pq")
+        self.object_rl_reward = object_rl_reward
         self.object_rl_weight = object_rl_weight
         self.object_rl_max_steps = object_rl_max_steps
         if object_rl_num_samples < 1:
@@ -277,7 +307,7 @@ class SetCriterion(nn.Module):
         return {"loss_object_decoder": loss}
 
     @torch.no_grad()
-    def object_reward(self, orders, outputs, targets):
+    def object_reward(self, orders, outputs, targets, *, return_stats=False):
         """Per-image PQ rewards via the submodule's stateless batched API.
 
         Training targets share padded image dimensions and are scored together.
@@ -348,7 +378,7 @@ class SetCriterion(nn.Module):
             rewards.append(panoptic_quality(
                 PanopticBatch(painted, pred_labels[images]),
                 PanopticBatch(gt_maps[images], gt_labels[images]),
-                self.num_classes, validate=False,
+                self.num_classes, validate=False, return_stats=return_stats,
             ).float())
         return torch.cat(rewards)
 
@@ -363,8 +393,12 @@ class SetCriterion(nn.Module):
     def _object_rollout_rewards(self, sampled, greedy, outputs, targets):
         """Reuse rendering inputs for all samples and the greedy baseline."""
         batch_size = outputs["pred_masks"].shape[0]
-        rewards = self.object_reward(sampled + greedy, outputs, targets)
-        return rewards[:-batch_size].reshape(-1, batch_size), rewards[-batch_size:]
+        if getattr(self, "object_rl_reward", "image_pq") == "image_pq":
+            rewards = self.object_reward(sampled + greedy, outputs, targets)
+            return rewards[:-batch_size].reshape(-1, batch_size), rewards[-batch_size:]
+        stats = self.object_reward(sampled + greedy, outputs, targets, return_stats=True)
+        record_batch_pq_diagnostics(stats, batch_size)
+        return batch_pq_counterfactual_rewards(stats, batch_size)
 
     def loss_object_rl(self, outputs, targets):
         if self.object_rl_objective in ("best_of_n_ft", "best_of_n_set"):
@@ -432,7 +466,7 @@ class SetCriterion(nn.Module):
         # An all-empty batch still needs a graph-connected zero for RL-only runs.
         rl_loss = rl_loss + self.object_decoder.bos.sum() * 0.0
         record_rl_diagnostics(sampled_reward, greedy_reward, advantage,
-                              log_probability, rl_loss)
+                              log_probability, rl_loss, reward_mode=self.object_rl_reward)
         return {"loss_object_rl": rl_loss}
 
     def _rl_policy_loss(self, sampled_reward, greedy_reward, log_probability):
@@ -506,7 +540,7 @@ class SetCriterion(nn.Module):
             sampled_reward, greedy_reward, best_reward, winners,
             greedy_orders, best_trajectories, loss, token_count,
             metric_group=metric_group, mask_nll=mask_nll, eof_nll=eof_nll,
-            mask_count=mask_count,
+            mask_count=mask_count, reward_mode=self.object_rl_reward,
         )
         return {"loss_object_rl": loss}
 
@@ -566,7 +600,7 @@ class SetCriterion(nn.Module):
         record_rl_diagnostics(sampled_reward, greedy_reward, advantage,
                               log_probability, rl_loss,
                               sampled_lengths=sampled_lengths,
-                              greedy_lengths=greedy_lengths)
+                              greedy_lengths=greedy_lengths, reward_mode=self.object_rl_reward)
         return {"loss_object_rl": rl_loss}
 
     def loss_masks(self, outputs, targets, indices, num_masks):

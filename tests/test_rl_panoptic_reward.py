@@ -200,3 +200,57 @@ def test_coco_reward_matches_inference_painter_for_overlap_and_repeated_queries(
         expected = panoptic_quality(PanopticBatch(gt_maps, gt_labels),
                                    PanopticBatch(gt_maps, gt_labels), 133).float()
         torch.testing.assert_close(actual, expected)
+
+
+def test_batch_pq_uses_global_counts_and_counterfactual_credit():
+    from mask2former.modeling.criterion import batch_pq_counterfactual_rewards
+    # Greedy: class 0 has one TP plus three FN; class 1 has one TP.
+    # Fixing the three FN improves global PQ by .3, whereas image PQ
+    # improves by .5. Batch-size scaling gives a reward difference of .6.
+    stats = torch.tensor([
+        [[1., 1., 0., 0.], [0., 0., 0., 0.]],
+        [[3., 3., 0., 0.], [1., 1., 0., 0.]],
+        [[1., 1., 0., 0.], [0., 0., 0., 0.]],
+        [[0., 0., 0., 3.], [1., 1., 0., 0.]],
+    ])
+    sampled, baseline = batch_pq_counterfactual_rewards(stats, 2)
+    torch.testing.assert_close(sampled, torch.tensor([[0., .6]]))
+    torch.testing.assert_close(baseline, torch.zeros(2))
+    # Distributed greedy context includes an identical second rank.
+    with patch('mask2former.modeling.criterion.is_dist_avail_and_initialized', return_value=True), \
+         patch('torch.distributed.get_world_size', return_value=2), \
+         patch('torch.distributed.all_reduce', side_effect=lambda x: x.mul_(2)):
+        sampled, _ = batch_pq_counterfactual_rewards(stats, 2)
+    # Global class 0: (2+3)/(5+.5*3) versus 2/5.
+    torch.testing.assert_close(sampled, torch.tensor([[0., (5/6.5-.4)*2]]))
+
+
+def test_reward_statistics_reproduce_image_pq():
+    evaluator = criterion(0, 'forward')
+    outputs = dict(pred_masks=torch.ones(2, 1, 2, 2),
+                   pred_logits=torch.tensor([0., 10., 0., -10.]).expand(2, 1, 4))
+    targets = [dict(masks=torch.ones(1, 2, 2, dtype=torch.bool), labels=torch.tensor([1]))] * 2
+    stats = evaluator.object_reward([[0], []], outputs, targets, return_stats=True)
+    assert stats.shape == (2, 3, 4)
+    torch.testing.assert_close(stats[:, 1], torch.tensor([[1., 1., 0., 0.], [0., 0., 0., 1.]]))
+    evaluator.object_rl_reward = 'batch_pq'
+    sampled, baseline = evaluator._object_rollout_rewards([[0], []], [[0], [0]], outputs, targets)
+    torch.testing.assert_close(sampled, torch.tensor([[0., -2/3]]))
+    torch.testing.assert_close(baseline, torch.zeros(2))
+
+
+def test_batch_pq_logs_absolute_scores_separately_from_signed_rewards():
+    from detectron2.utils.events import EventStorage
+    from mask2former.utils.rl_logging import record_batch_pq_diagnostics, record_rl_diagnostics
+    stats = torch.tensor([[[0., 0., 0., 1.]], [[1., 1., 0., 0.]]])
+    with EventStorage() as storage:
+        record_batch_pq_diagnostics(stats, 1)
+        record_rl_diagnostics(torch.tensor([[-1.]]), torch.zeros(1),
+                              torch.tensor([[-1.]]), torch.zeros(1, 1), torch.tensor(0.),
+                              reward_mode='batch_pq')
+        metrics = storage.latest()
+        assert metrics['rl/pq/greedy_batch_pq'][0] == 100
+        assert metrics['rl/pq/sample_batch_pq'][0] == 0
+        assert metrics['rl/reward/sample_scaled_delta_pq'][0] == -100
+        assert metrics['rl/reward/greedy_scaled_delta_pq'][0] == 0
+        assert 'rl/reward/greedy_pq' not in metrics

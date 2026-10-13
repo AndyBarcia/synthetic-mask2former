@@ -81,3 +81,16 @@ The same matrix is reused at every auxiliary decoder depth. At inference, each
 predicted soft mask is encoded and its corresponding query logit supplies the
 existing per-query confidence score. The new encoder replaces the old global
 linear bias head; its parameters must be trained when loading older checkpoints.
+
+Set `MODEL.MASK_FORMER.OBJECT_RL_REWARD batch_pq` to use distributed
+batch PQ counterfactual rewards. Each sampled image replaces its greedy
+prediction in the full batch's per-class IoU/TP/FP/FN totals. Its reward is
+the resulting change in mean class PQ, multiplied by the global batch size
+(to compensate for the policy loss's image mean). The greedy reward is zero.
+This accounts for both class frequency and changes in the PQ denominator;
+`image_pq` remains the default. Batch PQ is still a finite-batch proxy for
+dataset PQ, and training augmentation/resolution differences still apply.
+In this mode `rl/reward/*_scaled_delta_pq` logs signed PQ changes multiplied
+by global batch size. Greedy has zero relative reward by definition.
+`rl/pq/greedy_batch_pq` and `rl/pq/sample_batch_pq` separately report absolute
+PQ (0–100) for the greedy batch and the mean of complete sampled batches.
