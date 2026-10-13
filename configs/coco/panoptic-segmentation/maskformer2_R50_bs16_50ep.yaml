@@ -1,25 +1,31 @@
+# Default COCO R50: 100k supervised iterations followed by 20k decoder RL.
 _BASE_: Base-COCO-PanopticSegmentation.yaml
 MODEL:
-  META_ARCHITECTURE: "MaskFormer"
+  META_ARCHITECTURE: MaskFormer
   SEM_SEG_HEAD:
-    NAME: "MaskFormerHead"
-    IN_FEATURES: ["res2", "res3", "res4", "res5"]
+    NAME: MaskFormerHead
+    IN_FEATURES:
+    - res2
+    - res3
+    - res4
+    - res5
     IGNORE_VALUE: 255
     NUM_CLASSES: 133
     LOSS_WEIGHT: 1.0
     CONVS_DIM: 256
     MASK_DIM: 256
-    NORM: "GN"
-    # pixel decoder
-    PIXEL_DECODER_NAME: "MSDeformAttnPixelDecoder"
-    IN_FEATURES: ["res2", "res3", "res4", "res5"]
-    DEFORMABLE_TRANSFORMER_ENCODER_IN_FEATURES: ["res3", "res4", "res5"]
+    NORM: GN
+    PIXEL_DECODER_NAME: MSDeformAttnPixelDecoder
+    DEFORMABLE_TRANSFORMER_ENCODER_IN_FEATURES:
+    - res3
+    - res4
+    - res5
     COMMON_STRIDE: 4
     TRANSFORMER_ENC_LAYERS: 6
   MASK_FORMER:
-    TRANSFORMER_DECODER_NAME: "MultiScaleMaskedTransformerDecoder"
-    TRANSFORMER_IN_FEATURE: "multi_scale_pixel_decoder"
-    DEEP_SUPERVISION: True
+    TRANSFORMER_DECODER_NAME: MultiScaleMaskedTransformerDecoder
+    TRANSFORMER_IN_FEATURE: multi_scale_pixel_decoder
+    DEEP_SUPERVISION: true
     NO_OBJECT_WEIGHT: 0.1
     CLASS_WEIGHT: 2.0
     MASK_WEIGHT: 5.0
@@ -30,17 +36,57 @@ MODEL:
     DROPOUT: 0.0
     DIM_FEEDFORWARD: 2048
     ENC_LAYERS: 0
-    PRE_NORM: False
-    ENFORCE_INPUT_PROJ: False
+    PRE_NORM: false
+    ENFORCE_INPUT_PROJ: false
     SIZE_DIVISIBILITY: 32
-    DEC_LAYERS: 6  # 5 mask decoder layers, plus the initial query prediction
+    DEC_LAYERS: 6
     OBJECT_DEC_LAYERS: 5
     TRAIN_NUM_POINTS: 12544
     OVERSAMPLE_RATIO: 3.0
     IMPORTANCE_SAMPLE_RATIO: 0.75
     TEST:
-      SEMANTIC_ON: True
-      INSTANCE_ON: True
-      PANOPTIC_ON: True
+      SEMANTIC_ON: true
+      INSTANCE_ON: true
+      PANOPTIC_ON: true
+      PANOPTIC_PAINT_ORDER: forward
       OVERLAP_THRESHOLD: 0.8
       OBJECT_MASK_THRESHOLD: 0.8
+    FUSED_THING_MASKS: true
+    QUERY_BIAS_WEIGHT: 1.0
+    QUERY_BIAS_MATCHER_WEIGHT: 1.0
+    OBJECT_DEC_PREFIX_TREE_BRANCHES: 4
+    OBJECT_DEC_POSITION_ENCODING: false
+    OBJECT_DEC_ROPE: false
+    OBJECT_RL_REWARD: batch_pq
+    OBJECT_RL_BASELINE: rloo_greedy
+    OBJECT_RL_OBJECTIVE: policy_gradient
+    OBJECT_RL_NUM_SAMPLES: 4
+    OBJECT_RL_MAX_STEPS: 101
+    OBJECT_RL_TRAIN_EOF: true
+    OBJECT_RL_REWARD_SIZE: 0
+    OBJECT_RL_ONLY: false
+    OBJECT_RL_WEIGHT: 0.0
+SOLVER:
+  IMS_PER_BATCH: 16
+  CHECKPOINT_PERIOD: 5000
+  LR_SCHEDULER_NAME: WarmupMultiStepLR
+  BASE_LR: 0.0001
+  MAX_ITER: 100000
+  STEPS:
+  - 80000
+  - 95000
+  WARMUP_ITERS: 0
+TRAINING:
+  MODE: supervised_then_rl
+  RL:
+    MAX_ITER: 20000
+    BASE_LR: 0.00001
+    STEPS: [16000, 19000]
+    WARMUP_ITERS: 0
+INPUT:
+  IMAGE_SIZE: 512
+  MAX_SIZE_TEST: 2048
+  MIN_SIZE_TEST: 512
+TEST:
+  EVAL_PERIOD: 5000
+OUTPUT_DIR: output/coco_pan_R50_bs16_100kpre_20krl_batch_pq

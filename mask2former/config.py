@@ -76,7 +76,7 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY = False
     cfg.MODEL.MASK_FORMER.OBJECT_RL_MAX_STEPS = 101
     cfg.MODEL.MASK_FORMER.OBJECT_RL_NUM_SAMPLES = 4
-    cfg.MODEL.MASK_FORMER.OBJECT_RL_REWARD = "image_pq"
+    cfg.MODEL.MASK_FORMER.OBJECT_RL_REWARD = "batch_pq"
     cfg.MODEL.MASK_FORMER.OBJECT_RL_BASELINE = "rloo_greedy"
     # policy_gradient uses RLOO/SCST; Best-of-N variants imitate a trajectory
     # (best_of_n_ft) or its unordered selected-query set (best_of_n_set).
@@ -165,9 +165,9 @@ def add_maskformer2_config(cfg):
     cfg.TRAINING = CN()
     cfg.TRAINING.MODE = "supervised"
     cfg.TRAINING.RL = CN()
-    cfg.TRAINING.RL.MAX_ITER = 10000
+    cfg.TRAINING.RL.MAX_ITER = 20000
     cfg.TRAINING.RL.BASE_LR = 0.00001
     cfg.TRAINING.RL.WARMUP_ITERS = 0
-    cfg.TRAINING.RL.STEPS = (8000, 9500)
+    cfg.TRAINING.RL.STEPS = (16000, 19000)
     cfg.TRAINING.RL.LR_SCHEDULER_NAME = "WarmupMultiStepLR"
     cfg.TRAINING.RL.WEIGHT = 1.0
