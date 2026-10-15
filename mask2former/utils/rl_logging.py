@@ -53,8 +53,10 @@ def record_rl_diagnostics(sampled_reward, greedy_reward, advantage,
     second_moment = metrics.pop("advantage/second_moment")
     metrics["advantage/std_pq"] = max(0, second_moment - metrics["advantage/mean_pq"] ** 2) ** 0.5
     for key, value in metrics.items():
-        if reward_mode == "batch_pq" and key.startswith("reward/"):
+        if reward_mode in ("batch_pq", "batch_rq") and key.startswith("reward/"):
             key = key.replace("_pq", "_scaled_delta_pq")
+        if reward_mode == "batch_rq":
+            key = key.replace("_pq", "_rq")
         storage.put_scalar(f"rl/{key}", value)
 
 
@@ -111,8 +113,10 @@ def record_best_of_n_diagnostics(sampled_reward, greedy_reward, best_reward,
             denominator = max(mask_tokens, 1)
         else:
             denominator = count
-        if reward_mode == "batch_pq" and key.startswith("reward/"):
+        if reward_mode in ("batch_pq", "batch_rq") and key.startswith("reward/"):
             key = key.replace("_pq", "_scaled_delta_pq")
+        if reward_mode == "batch_rq":
+            key = key.replace("_pq", "_rq")
         storage.put_scalar(f"rl/{key}", value / denominator)
 
 
@@ -131,6 +135,9 @@ def record_batch_pq_diagnostics(stats, batch_size):
     pq = (iou / denominator.clamp_min(1)).sum(-1) / (denominator > 0).sum(-1).clamp_min(1)
     storage.put_scalar("rl/pq/greedy_batch_pq", pq[-1].item() * 100)
     storage.put_scalar("rl/pq/sample_batch_pq", pq[:-1].mean().item() * 100)
+    rq = (tp / denominator.clamp_min(1)).sum(-1) / (denominator > 0).sum(-1).clamp_min(1)
+    storage.put_scalar("rl/rq/greedy_batch_rq", rq[-1].item() * 100)
+    storage.put_scalar("rl/rq/sample_batch_rq", rq[:-1].mean().item() * 100)
 
 
 class RLMetricPrinter(EventWriter):
@@ -148,7 +155,7 @@ class RLMetricPrinter(EventWriter):
         if not names:
             return
         logger = logging.getLogger("mask2former.rl")
-        for group in ("pq", "reward", "advantage", "policy", "sequence", "best_of_n",
+        for group in ("pq", "rq", "reward", "advantage", "policy", "sequence", "best_of_n",
                       "set_imitation"):
             fields = [f"{name.split('/')[-1]}={storage.history(name).median(self.window_size):.4g}"
                       for name in names if name.startswith(f"rl/{group}/")]

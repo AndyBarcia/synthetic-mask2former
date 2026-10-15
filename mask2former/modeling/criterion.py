@@ -23,12 +23,14 @@ from .utils import compute_mask_block_counts
 
 
 @torch.no_grad()
-def batch_pq_counterfactual_rewards(stats, batch_size):
+def batch_pq_counterfactual_rewards(stats, batch_size, metric="pq"):
     """Replace one greedy image at a time in the distributed batch's PQ totals.
 
     Multiplication by global batch size compensates for the mean policy loss.
     Other images remain independent of this image's sampled actions.
     """
+    if metric not in ("pq", "rq"):
+        raise ValueError(f"Unknown batch reward metric: {metric}")
     stats = stats.reshape(-1, batch_size, stats.shape[-2], 4).double()
     greedy = stats[-1]
     total = greedy.sum(0)
@@ -41,7 +43,8 @@ def batch_pq_counterfactual_rewards(stats, batch_size):
         iou, tp, fp, fn = values.unbind(-1)
         denominator = tp + 0.5 * (fp + fn)
         active = denominator > 0
-        return (iou / denominator.clamp_min(1)).sum(-1) / active.sum(-1).clamp_min(1)
+        numerator = tp if metric == "rq" else iou
+        return (numerator / denominator.clamp_min(1)).sum(-1) / active.sum(-1).clamp_min(1)
 
     baseline = pq(total)
     replacement = total[None, None] - greedy[None] + stats[:-1]
@@ -194,8 +197,8 @@ class SetCriterion(nn.Module):
         self.fused_thing_masks = fused_thing_masks
         self.thing_class_ids = tuple(thing_class_ids)
         self.object_decoder = object_decoder
-        if object_rl_reward not in ("image_pq", "batch_pq"):
-            raise ValueError("OBJECT_RL_REWARD must be image_pq or batch_pq")
+        if object_rl_reward not in ("image_pq", "batch_pq", "batch_rq"):
+            raise ValueError("OBJECT_RL_REWARD must be image_pq, batch_pq, or batch_rq")
         self.object_rl_reward = object_rl_reward
         self.object_rl_weight = object_rl_weight
         self.object_rl_max_steps = object_rl_max_steps
@@ -398,7 +401,8 @@ class SetCriterion(nn.Module):
             return rewards[:-batch_size].reshape(-1, batch_size), rewards[-batch_size:]
         stats = self.object_reward(sampled + greedy, outputs, targets, return_stats=True)
         record_batch_pq_diagnostics(stats, batch_size)
-        return batch_pq_counterfactual_rewards(stats, batch_size)
+        metric = "rq" if self.object_rl_reward == "batch_rq" else "pq"
+        return batch_pq_counterfactual_rewards(stats, batch_size, metric=metric)
 
     def loss_object_rl(self, outputs, targets):
         if self.object_rl_objective in ("best_of_n_ft", "best_of_n_set"):
