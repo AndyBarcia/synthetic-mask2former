@@ -27,6 +27,9 @@ def phase_config(cfg, phase, weights=None):
     result = cfg.clone()
     result.defrost()
     rl = phase in ("rl", "hybrid")
+    # Selected-map supervision applies only to hybrid training.
+    if phase != "hybrid":
+        result.MODEL.MASK_FORMER.HYBRID_SELECTED_PANOPTIC_SUPERVISION = False
     result.MODEL.MASK_FORMER.OBJECT_RL_ONLY = phase == "rl"
     result.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT = cfg.TRAINING.RL.WEIGHT if rl else 0.0
     if cfg.TRAINING.MODE in ("supervised_then_rl", "supervised_then_hybrid"):
@@ -36,5 +39,16 @@ def phase_config(cfg, phase, weights=None):
     if rl:
         for key in ("MAX_ITER", "BASE_LR", "WARMUP_ITERS", "STEPS", "LR_SCHEDULER_NAME"):
             setattr(result.SOLVER, key, getattr(cfg.TRAINING.RL, key))
+    result.freeze()
+    return result
+
+
+def evaluation_config(cfg):
+    """Disable training objectives without changing checkpoint/output paths."""
+    result = cfg.clone()
+    result.defrost()
+    result.MODEL.MASK_FORMER.OBJECT_RL_ONLY = False
+    result.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT = 0.0
+    result.MODEL.MASK_FORMER.HYBRID_SELECTED_PANOPTIC_SUPERVISION = False
     result.freeze()
     return result

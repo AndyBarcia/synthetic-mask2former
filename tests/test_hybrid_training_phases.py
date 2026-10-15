@@ -35,3 +35,34 @@ def test_sequential_hybrid_checkpoint_handoff():
     assert hybrid.OUTPUT_DIR == 'output/example/hybrid'
     assert not hybrid.MODEL.MASK_FORMER.OBJECT_RL_ONLY
     assert hybrid.MODEL.WEIGHTS == 'output/example/supervised/model_final.pth'
+
+
+def test_hybrid_supervision_flags_are_isolated_to_hybrid_phase():
+    cfg = get_cfg()
+    add_maskformer2_config(cfg)
+    cfg.TRAINING.MODE = 'supervised_then_hybrid'
+    cfg.MODEL.MASK_FORMER.HYBRID_SELECTED_PANOPTIC_SUPERVISION = True
+    cfg.freeze()
+    for phase in ('supervised', 'rl'):
+        result = phases['phase_config'](cfg, phase)
+        assert not result.MODEL.MASK_FORMER.HYBRID_SELECTED_PANOPTIC_SUPERVISION
+    hybrid = phases['phase_config'](cfg, 'hybrid')
+    assert hybrid.MODEL.MASK_FORMER.HYBRID_SELECTED_PANOPTIC_SUPERVISION
+    assert cfg.MODEL.MASK_FORMER.HYBRID_SELECTED_PANOPTIC_SUPERVISION
+
+
+def test_evaluation_disables_training_flags_without_changing_paths():
+    cfg = get_cfg()
+    add_maskformer2_config(cfg)
+    cfg.TRAINING.MODE = 'supervised_then_hybrid'
+    cfg.MODEL.WEIGHTS = 'output/example/hybrid/model_final.pth'
+    cfg.OUTPUT_DIR = 'output/example/hybrid'
+    cfg.MODEL.MASK_FORMER.HYBRID_SELECTED_PANOPTIC_SUPERVISION = True
+    cfg.freeze()
+    result = phases['evaluation_config'](cfg)
+    assert not result.MODEL.MASK_FORMER.HYBRID_SELECTED_PANOPTIC_SUPERVISION
+    assert not result.MODEL.MASK_FORMER.OBJECT_RL_ONLY
+    assert result.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT == 0
+    assert result.MODEL.WEIGHTS == cfg.MODEL.WEIGHTS
+    assert result.OUTPUT_DIR == cfg.OUTPUT_DIR
+    assert cfg.MODEL.MASK_FORMER.HYBRID_SELECTED_PANOPTIC_SUPERVISION

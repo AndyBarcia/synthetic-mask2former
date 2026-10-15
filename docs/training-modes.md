@@ -45,9 +45,9 @@ teacher forcing and the current matcher and inference behavior.
 
 RL phase solver overrides are `TRAINING.RL.MAX_ITER`, `BASE_LR`, `WARMUP_ITERS`,
 `STEPS`, and `LR_SCHEDULER_NAME`. Other solver settings, including batch size,
-checkpoint period, optimizer type, and AMP, are shared. Defaults are 10,000 RL
-iterations, learning rate 1e-5, no warmup, and a multistep schedule at 8,000 and
-9,500. Adjust `TRAINING.RL.STEPS` when changing the iteration budget.
+checkpoint period, optimizer type, and AMP, are shared. Defaults are 20,000 RL
+iterations, learning rate 1e-5, no warmup, and a multistep schedule at 16,000 and
+19,000. Adjust `TRAINING.RL.STEPS` when changing the iteration budget.
 
 `TRAINING.RL.WEIGHT` controls the RL loss scale (default 1). The mode sets
 `MODEL.MASK_FORMER.OBJECT_RL_ONLY` and `OBJECT_RL_WEIGHT` automatically.
@@ -66,7 +66,8 @@ it through `MODEL.MASK_FORMER.OBJECT_RL_*`:
 - `OBJECTIVE`: `policy_gradient`, `best_of_n_ft`, or `best_of_n_set`. The latter
   two imitate the best sampled trajectory or set and require EOF training.
 
-Rewards use per-image mean class PQ and the configured panoptic paint order.
+Rewards use distributed batch PQ by default and the configured panoptic paint
+order. Use OBJECT_RL_REWARD image_pq for per-image mean class PQ.
 RL diagnostics appear in the standard metrics files and console logs.
 
 For evaluation, point `MODEL.WEIGHTS` to the desired phase checkpoint and use
@@ -88,7 +89,7 @@ prediction in the full batch's per-class IoU/TP/FP/FN totals. Its reward is
 the resulting change in mean class PQ, multiplied by the global batch size
 (to compensate for the policy loss's image mean). The greedy reward is zero.
 This accounts for both class frequency and changes in the PQ denominator;
-`image_pq` remains the default. Batch PQ is still a finite-batch proxy for
+`batch_pq` is the default. Batch PQ is still a finite-batch proxy for
 dataset PQ, and training augmentation/resolution differences still apply.
 In this mode `rl/reward/*_scaled_delta_pq` logs signed PQ changes multiplied
 by global batch size. Greedy has zero relative reward by definition.
@@ -112,3 +113,38 @@ pixel decoder, mask decoder, and query-bias head remain trainable. Policy inputs
 retain their gradients; sampling, hard mask thresholds, and rewards do not.
 `supervised_then_hybrid` hands off supervised weights to a fresh hybrid optimizer
 and scheduler in `hybrid/`, using the `TRAINING.RL` schedule and loss weight.
+
+In hybrid policy-gradient training, set
+`MODEL.MASK_FORMER.HYBRID_SELECTED_PANOPTIC_SUPERVISION True` to replace
+all-proposal supervision with supervision of the best sampled panoptic map
+(including greedy as a candidate, chosen by the configured reward). Hungarian
+matching uses visible hard painted segments; class, mask, and query-bias losses
+use the corresponding selected predictions. Stuff queries merge by predicted
+class; their soft masks use differentiable last-wins compositing and their class
+and GT-conditioned query-bias logits are averaged. Occluded segments and unused
+proposals receive no direct supervised target. Auxiliary layers reuse the final
+assignment. This mode excludes extra fused targets and object-decoder teacher
+forcing, and does not add coverage supervision for omitted GT objects.
+
+To reproduce the reference 80k supervised + 20k selected-map RQ hybrid recipe:
+
+```bash
+python train_net.py --num-gpus 1 \
+  --config-file configs/coco/panoptic-segmentation/maskformer2_R50_bs16_80kpre_20khybrid_selected_rq.yaml \
+  OUTPUT_DIR output/coco_80kpre_20khybrid_reproduction
+```
+
+`supervised_then_hybrid` disables selected-map supervision
+flags for pretraining. The supervised phase keeps all-proposal Hungarian
+matching, raw-mask losses, per-layer auxiliary matching, and object-decoder
+teacher forcing. Only the hybrid phase enables the configured selected-map
+matching and painted-mask losses. The handoff loads supervised model weights into a fresh optimizer
+and scheduler. Hybrid LR drops at 16k/19k local iterations (96k/99k total).
+`--resume` restores the appropriate phase checkpoint. This reproduces the
+training recipe, not identical random sampling or the reference run's GPU
+preemption and change from two GPUs to one.
+
+For evaluation, the reproduction config can be used with `--eval-only` and an
+explicit `MODEL.WEIGHTS`. Training-only objectives are disabled without changing
+checkpoint or output paths. Class/query-bias losses average per image; selected
+mask losses normalize by the distributed matched-segment count.

@@ -196,6 +196,14 @@ class MaskFormer(nn.Module):
             object_rl_objective=cfg.MODEL.MASK_FORMER.OBJECT_RL_OBJECTIVE,
             object_rl_train_eof=cfg.MODEL.MASK_FORMER.OBJECT_RL_TRAIN_EOF,
         )
+        criterion.hybrid_selected_panoptic_supervision = cfg.MODEL.MASK_FORMER.HYBRID_SELECTED_PANOPTIC_SUPERVISION
+        if criterion.hybrid_selected_panoptic_supervision and (
+            cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY
+            or cfg.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT <= 0
+            or not cfg.MODEL.MASK_FORMER.OBJECT_RL_TRAIN_EOF
+            or cfg.MODEL.MASK_FORMER.OBJECT_RL_OBJECTIVE != "policy_gradient"
+        ):
+            raise ValueError("Selected panoptic supervision requires hybrid policy-gradient RL with EOF")
         criterion.object_rl_detach_inputs = cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY
         for module in sem_seg_head.modules():
             if hasattr(module, "detach_predicted_masks"):

@@ -38,7 +38,7 @@ from detectron2.engine import (
 from detectron2.engine.defaults import create_ddp_model
 from detectron2.engine.train_loop import TrainerBase
 from mask2former.utils.rl_logging import RLMetricPrinter
-from mask2former.utils.training_phases import phase_config, validate_training_mode
+from mask2former.utils.training_phases import evaluation_config, phase_config, validate_training_mode
 from detectron2.evaluation import (
     CityscapesInstanceEvaluator,
     CityscapesSemSegEvaluator,
@@ -399,6 +399,7 @@ def main(args):
     cfg = setup(args)
 
     if args.eval_only:
+        cfg = evaluation_config(cfg)
         model = Trainer.build_model(cfg)
         DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
             cfg.MODEL.WEIGHTS, resume=args.resume

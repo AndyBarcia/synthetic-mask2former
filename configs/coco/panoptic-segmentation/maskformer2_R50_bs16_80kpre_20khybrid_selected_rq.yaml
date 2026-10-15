@@ -1,0 +1,32 @@
+# Reference recipe: 80k standard supervised iterations, then 20k hybrid.
+_BASE_: maskformer2_R50_bs16_50ep.yaml
+MODEL:
+  WEIGHTS: detectron2://ImageNetPretrained/torchvision/R-50.pkl
+  MASK_FORMER:
+    OBJECT_RL_ONLY: false
+    OBJECT_RL_WEIGHT: 0.0
+    OBJECT_RL_REWARD: batch_rq
+    OBJECT_RL_BASELINE: rloo_greedy
+    OBJECT_RL_OBJECTIVE: policy_gradient
+    OBJECT_RL_NUM_SAMPLES: 4
+    OBJECT_RL_TRAIN_EOF: true
+    HYBRID_SELECTED_PANOPTIC_SUPERVISION: true
+SOLVER:
+  IMS_PER_BATCH: 16
+  BASE_LR: 0.0001
+  MAX_ITER: 80000
+  # Preserve the original pretraining schedule through its 80k checkpoint.
+  STEPS: [80000, 95000]
+  WARMUP_ITERS: 0
+  CHECKPOINT_PERIOD: 5000
+TRAINING:
+  MODE: supervised_then_hybrid
+  RL:
+    MAX_ITER: 20000
+    BASE_LR: 0.00001
+    STEPS: [16000, 19000]
+    WARMUP_ITERS: 0
+    WEIGHT: 1.0
+TEST:
+  EVAL_PERIOD: 5000
+OUTPUT_DIR: output/coco_pan_R50_bs16_80kpre_20khybrid_selected_rq

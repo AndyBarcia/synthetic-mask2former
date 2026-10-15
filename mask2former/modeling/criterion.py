@@ -20,6 +20,7 @@ from detectron2.projects.point_rend.point_features import (
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
 from ..utils.rl_logging import record_best_of_n_diagnostics, record_rl_diagnostics, record_batch_pq_diagnostics
 from .utils import compute_mask_block_counts
+from .selected_panoptic_supervision import selected_segments, segment_predictions
 
 
 @torch.no_grad()
@@ -587,6 +588,15 @@ class SetCriterion(nn.Module):
             sampled_reward, greedy_reward = self._object_rollout_rewards(
                 sampled, greedy, outputs, targets
             )
+        if getattr(self, "hybrid_selected_panoptic_supervision", False):
+            # Choose per image from the exact sampled rewards used by RL, with
+            # greedy included. No second rollout or imitation objective.
+            candidates = torch.cat((sampled_reward, greedy_reward[None]), 0)
+            winners = candidates.argmax(0).tolist()
+            outputs["selected_panoptic_orders"] = [
+                (sampled[winner * batch_size + image] if winner < k else greedy[image])
+                for image, winner in enumerate(winners)
+            ]
         log_probabilities = []
         for start in range(0, k, rollout_batch):
             repeats = min(rollout_batch, k - start)
@@ -743,6 +753,44 @@ class SetCriterion(nn.Module):
         return [(src[tgt < len(target["labels"])], tgt[tgt < len(target["labels"])])
                 for (src, tgt), target in zip(indices, targets)]
 
+    def loss_selected_panoptic(self, outputs, targets):
+        """Match the best painted map, supervise only its visible segments."""
+        rl_losses = self.loss_object_rl(outputs, targets)
+        batch_size = len(targets)
+        plans = []
+        for image, (order, target) in enumerate(zip(outputs["selected_panoptic_orders"], targets)):
+            paint_order, groups, hard_masks = selected_segments(
+                outputs["pred_masks"][image], outputs["pred_logits"][image], order,
+                self.thing_class_ids, target["masks"].shape[-2:],
+                reverse=self.object_rl_paint_order == "reverse",
+            )
+            predictions = segment_predictions(outputs, image, paint_order, groups)
+            if groups and len(target["labels"]):
+                matching = dict(predictions, pred_masks=(hard_masks * 20 - 10)[None])
+                indices = self.matcher(matching, [target])
+            else:
+                empty = torch.empty(0, dtype=torch.long, device=outputs["pred_masks"].device)
+                indices = [(empty, empty)]
+            plans.append((paint_order, groups, indices))
+        count = outputs["pred_masks"].new_tensor([sum(len(p[2][0][0]) for p in plans)])
+        if is_dist_avail_and_initialized():
+            torch.distributed.all_reduce(count)
+        num_masks = (count / get_world_size()).clamp_min(1).item()
+        losses = dict(rl_losses)
+        for depth, layer in enumerate([outputs] + outputs.get("aux_outputs", [])):
+            suffix = "" if depth == 0 else f"_{depth - 1}"
+            for image, (order, groups, indices) in enumerate(plans):
+                predictions = segment_predictions(layer, image, order, groups)
+                for loss in self.losses:
+                    values = self.get_loss(loss, predictions, [targets[image]], indices, num_masks)
+                    for key, value in values.items():
+                        # Mask losses already use the distributed matched count.
+                        value = value if loss == "masks" else value / batch_size
+                        key += suffix
+                        losses[key] = losses.get(key, 0) + value
+        return losses
+
+
     def forward(self, outputs, targets):
         """This performs the loss computation.
         Parameters:
@@ -750,6 +798,9 @@ class SetCriterion(nn.Module):
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
+        if getattr(self, "hybrid_selected_panoptic_supervision", False):
+            return self.loss_selected_panoptic(outputs, targets)
+
         outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
         mask_targets = self._mask_targets(targets, num_queries=outputs["pred_masks"].shape[1])
         if self.fused_thing_masks and any(
