@@ -708,15 +708,19 @@ class SetCriterion(nn.Module):
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)
 
-    def _mask_targets(self, targets):
-        """Append mask-only unions without changing the object ground truth."""
+    def _mask_targets(self, targets, num_queries=None):
+        """Append mask-only unions using query slots left by original objects."""
         if not self.fused_thing_masks:
             return targets
         result = []
         for target in targets:
             labels, masks = target["labels"], target["masks"]
+            fusion_budget = (max(0, num_queries - len(labels))
+                             if num_queries is not None else len(self.thing_class_ids))
             fused_labels, fused_masks = [], []
             for category in self.thing_class_ids:
+                if len(fused_labels) >= fusion_budget:
+                    break
                 members = labels == category
                 if members.sum().item() > 1:
                     fused_labels.append(labels[members][:1])
@@ -742,13 +746,13 @@ class SetCriterion(nn.Module):
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
         outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
-        mask_targets = self._mask_targets(targets)
+        mask_targets = self._mask_targets(targets, num_queries=outputs["pred_masks"].shape[1])
         if self.fused_thing_masks and any(
             len(target["labels"]) > outputs["pred_masks"].shape[1]
             for target in mask_targets
         ):
             raise ValueError(
-                "Instance and fused mask targets exceed NUM_OBJECT_QUERIES; "
+                "Original instance targets exceed NUM_OBJECT_QUERIES; "
                 "increase it to supervise every target."
             )
 

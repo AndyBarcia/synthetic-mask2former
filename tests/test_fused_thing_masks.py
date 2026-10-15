@@ -67,8 +67,49 @@ def test_disabled_and_insufficient_queries():
     assert criterion._mask_targets(targets) is targets
     criterion.fused_thing_masks = True
     try:
-        criterion({"pred_masks": torch.zeros(1, 2, 1, 2)}, targets)
+        criterion({"pred_masks": torch.zeros(1, 1, 1, 2)}, targets)
     except ValueError as error:
         assert "NUM_OBJECT_QUERIES" in str(error)
     else:
         raise AssertionError("Insufficient queries must not silently drop targets")
+
+
+def test_fused_targets_use_only_spare_queries():
+    criterion = make_criterion()
+    labels = torch.tensor([1, 1, 2, 2])
+    masks = torch.eye(4).reshape(4, 1, 4)
+    targets = [{"labels": labels, "masks": masks}]
+    augmented = criterion._mask_targets(targets, num_queries=5)[0]
+    assert augmented["labels"].tolist() == [1, 1, 2, 2, 1]
+    torch.testing.assert_close(augmented["masks"][:4], masks)
+    torch.testing.assert_close(augmented["masks"][4], masks[:2].bool().any(0).float())
+    assert augmented["num_object_targets"] == 4
+    full = criterion._mask_targets(targets, num_queries=4)[0]
+    torch.testing.assert_close(full["labels"], labels)
+    torch.testing.assert_close(full["masks"], masks)
+    assert len(criterion._mask_targets(targets, num_queries=6)[0]["labels"]) == 6
+
+
+def test_overflow_fused_targets_preserve_all_original_matching_and_backward():
+    criterion = make_criterion()
+    targets = [{"labels": torch.tensor([1, 1, 2, 2]),
+                "masks": torch.eye(4).reshape(4, 1, 4)}]
+    outputs = {
+        "pred_masks": torch.randn(1, 5, 1, 4, requires_grad=True),
+        "pred_logits": torch.randn(1, 5, 4, requires_grad=True),
+        "gt_query_bias_logits": [torch.zeros(4, 5, requires_grad=True)],
+    }
+    captured = []
+    original = criterion._object_indices
+    def capture(indices, targets):
+        result = original(indices, targets)
+        captured.append(result)
+        return result
+    criterion._object_indices = capture
+    outputs["aux_outputs"] = [dict(outputs)]
+    losses = criterion(outputs, targets)
+    assert len(captured) == 2
+    for indices in captured:
+        assert sorted(indices[0][1].tolist()) == [0, 1, 2, 3]
+    sum(losses.values()).backward()
+    assert torch.isfinite(outputs["pred_masks"].grad).all()

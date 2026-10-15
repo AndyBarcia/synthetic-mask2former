@@ -100,3 +100,7 @@ batch recognition quality: mean per-class `TP / (TP + 0.5 * (FP + FN))`.
 It uses the same greedy-image counterfactual replacement and global-batch-size
 scaling as batch PQ, with the same strict IoU matching. Rewards and advantages
 are logged as RQ; absolute batch PQ and RQ are both logged for comparison.
+
+Fused mask supervision uses only query slots left after all original targets.
+If unions would exceed the query count, retain unions in thing-class order up
+to that budget; preserve every original target.
