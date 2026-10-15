@@ -404,16 +404,21 @@ class SetCriterion(nn.Module):
         metric = "rq" if self.object_rl_reward == "batch_rq" else "pq"
         return batch_pq_counterfactual_rewards(stats, batch_size, metric=metric)
 
+    def _rl_input(self, value):
+        """Keep upstream gradients in hybrid training; isolate decoder-only RL."""
+        return value.detach() if getattr(self, "object_rl_detach_inputs", True) else value
+
+
     def loss_object_rl(self, outputs, targets):
         if self.object_rl_objective in ("best_of_n_ft", "best_of_n_set"):
             return self.loss_object_best_of_n(outputs, targets)
         if self.object_rl_train_eof:
             return self.loss_object_rl_eof(outputs, targets)
-        # Detaching all policy inputs confines this loss to the object decoder.
+        # Decoder-only RL detaches policy inputs; hybrid training preserves them.
         policy_inputs = (
-            outputs["mask_embeddings"].detach(),
-            [feature.detach() for feature in outputs["object_decoder_image_features"]],
-            outputs["pred_masks"].detach(),
+            self._rl_input(outputs["mask_embeddings"]),
+            [self._rl_input(feature) for feature in outputs["object_decoder_image_features"]],
+            self._rl_input(outputs["pred_masks"]),
             outputs["object_decoder_image_sizes"],
         )
         batch_size, num_queries = policy_inputs[0].shape[:2]
@@ -480,11 +485,11 @@ class SetCriterion(nn.Module):
     def loss_object_best_of_n(self, outputs, targets):
         """Imitate the best sample's ordered trajectory or unordered mask set."""
         query_bias = outputs.get("query_bias_logits")
-        query_bias = query_bias.detach() if query_bias is not None else None
+        query_bias = self._rl_input(query_bias) if query_bias is not None else None
         policy_inputs = (
-            outputs["mask_embeddings"].detach(),
-            [feature.detach() for feature in outputs["object_decoder_image_features"]],
-            outputs["pred_masks"].detach(),
+            self._rl_input(outputs["mask_embeddings"]),
+            [self._rl_input(feature) for feature in outputs["object_decoder_image_features"]],
+            self._rl_input(outputs["pred_masks"]),
             outputs["object_decoder_image_sizes"],
         )
         batch_size = policy_inputs[0].shape[0]
@@ -551,11 +556,11 @@ class SetCriterion(nn.Module):
     def loss_object_rl_eof(self, outputs, targets):
         """RLOO over free decoding, including the sampled EOF action."""
         query_bias = outputs.get("query_bias_logits")
-        query_bias = query_bias.detach() if query_bias is not None else None
+        query_bias = self._rl_input(query_bias) if query_bias is not None else None
         policy_inputs = (
-            outputs["mask_embeddings"].detach(),
-            [feature.detach() for feature in outputs["object_decoder_image_features"]],
-            outputs["pred_masks"].detach(),
+            self._rl_input(outputs["mask_embeddings"]),
+            [self._rl_input(feature) for feature in outputs["object_decoder_image_features"]],
+            self._rl_input(outputs["pred_masks"]),
             outputs["object_decoder_image_sizes"],
         )
         batch_size = policy_inputs[0].shape[0]
@@ -776,7 +781,8 @@ class SetCriterion(nn.Module):
                                           else (targets, object_indices))
             losses.update(self.get_loss(loss, outputs, loss_targets, loss_indices, num_masks))
         if self.object_decoder is not None:
-            losses.update(self.loss_object_decoder(outputs, object_indices))
+            if self.object_rl_weight <= 0:
+                losses.update(self.loss_object_decoder(outputs, object_indices))
             if self.object_rl_weight > 0:
                 losses.update(self.loss_object_rl(outputs, targets))
 

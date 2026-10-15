@@ -81,7 +81,7 @@ class Trainer(DefaultTrainer):
     """
 
     def __init__(self, cfg):
-        if not cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY:
+        if cfg.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT <= 0:
             super().__init__(cfg)
             return
         # Sampling invokes the decoder without gradients before the scored
@@ -109,7 +109,7 @@ class Trainer(DefaultTrainer):
 
     def build_writers(self):
         writers = super().build_writers()
-        if self.cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY:
+        if self.cfg.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT > 0:
             writers.append(RLMetricPrinter())
         return writers
 
@@ -416,10 +416,11 @@ def main(args):
         trainer.resume_or_load(resume=args.resume)
         return trainer.train()
 
-    if mode == "supervised_then_rl":
+    rl_phase = "hybrid" if mode in ("hybrid", "supervised_then_hybrid") else "rl"
+    if mode in ("supervised_then_rl", "supervised_then_hybrid"):
         supervised_cfg = phase_config(cfg, "supervised")
         checkpoint = os.path.join(supervised_cfg.OUTPUT_DIR, "model_final.pth")
-        rl_cfg = phase_config(cfg, "rl", checkpoint)
+        rl_cfg = phase_config(cfg, rl_phase, checkpoint)
         # Resume RL directly once it has a checkpoint. Otherwise resume the
         # supervised phase, or use its completed final checkpoint for handoff.
         rl_started = args.resume and os.path.isfile(os.path.join(rl_cfg.OUTPUT_DIR, "last_checkpoint"))
@@ -435,7 +436,7 @@ def main(args):
         if not rl_started and not os.path.isfile(checkpoint):
             raise FileNotFoundError(f"Supervised phase did not produce {checkpoint}")
     else:
-        rl_cfg = phase_config(cfg, "rl")
+        rl_cfg = phase_config(cfg, rl_phase)
 
     prepare_phase_output(rl_cfg)
     trainer = Trainer(rl_cfg)

@@ -146,7 +146,8 @@ class MaskFormer(nn.Module):
             cfg.MODEL.MASK_FORMER.TRANSFORMER_DECODER_NAME == "MultiScaleMaskedTransformerDecoder"
         )
         if use_object_decoder:
-            weight_dict["loss_object_decoder"] = 1.0
+            if cfg.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT <= 0:
+                weight_dict["loss_object_decoder"] = 1.0
             if cfg.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT > 0:
                 weight_dict["loss_object_rl"] = cfg.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT
 
@@ -195,6 +196,10 @@ class MaskFormer(nn.Module):
             object_rl_objective=cfg.MODEL.MASK_FORMER.OBJECT_RL_OBJECTIVE,
             object_rl_train_eof=cfg.MODEL.MASK_FORMER.OBJECT_RL_TRAIN_EOF,
         )
+        criterion.object_rl_detach_inputs = cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY
+        for module in sem_seg_head.modules():
+            if hasattr(module, "detach_predicted_masks"):
+                module.detach_predicted_masks = not (cfg.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT > 0 and not cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY)
         criterion.object_rl_paint_order = cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_PAINT_ORDER
 
         return {

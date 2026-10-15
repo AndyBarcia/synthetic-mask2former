@@ -1,6 +1,6 @@
 # Supervised and object-decoder RL training
 
-`train_net.py` supports three modes. Existing commands use `supervised` by default.
+`train_net.py` supports five modes. Existing commands use `supervised` by default.
 
 ```bash
 # Normal supervised training (existing SOLVER settings).
@@ -104,3 +104,11 @@ are logged as RQ; absolute batch PQ and RQ are both logged for comparison.
 Fused mask supervision uses only query slots left after all original targets.
 If unions would exceed the query count, retain unions in thing-class order up
 to that budget; preserve every original target.
+
+`TRAINING.MODE hybrid` starts from `MODEL.WEIGHTS` and combines RL with supervised
+segmentation and query-bias losses, including auxiliary losses. Object-decoder
+teacher forcing is excluded; the object decoder learns only from RL. The backbone,
+pixel decoder, mask decoder, and query-bias head remain trainable. Policy inputs
+retain their gradients; sampling, hard mask thresholds, and rewards do not.
+`supervised_then_hybrid` hands off supervised weights to a fresh hybrid optimizer
+and scheduler in `hybrid/`, using the `TRAINING.RL` schedule and loss weight.

@@ -9,6 +9,7 @@ class GTQueryBias(nn.Module):
 
     def __init__(self, feature_dim, hidden_dim, num_queries):
         super().__init__()
+        self.detach_predicted_masks = True
         self.gt_encoder = nn.Sequential(
             nn.Linear(feature_dim + 1, hidden_dim),
             nn.ReLU(),
@@ -44,6 +45,6 @@ class GTQueryBias(nn.Module):
     def predicted_query_logits(self, features, mask_logits):
         # A predicted mask stands in for GT at inference. Score its own query.
         return torch.stack([
-            self(image_features, masks.detach().sigmoid()).diagonal()
+            self(image_features, (masks.detach() if self.detach_predicted_masks else masks).sigmoid()).diagonal()
             for image_features, masks in zip(features, mask_logits)
         ])

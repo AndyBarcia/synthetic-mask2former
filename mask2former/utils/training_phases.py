@@ -2,7 +2,7 @@
 import os
 
 
-MODES = ("supervised", "supervised_then_rl", "rl")
+MODES = ("supervised", "supervised_then_rl", "rl", "hybrid", "supervised_then_hybrid")
 
 
 def validate_training_mode(cfg):
@@ -17,8 +17,8 @@ def validate_training_mode(cfg):
             raise ValueError("RL weight and iteration budget must be positive")
         if cfg.MODEL.MASK_FORMER.TRANSFORMER_DECODER_NAME != "MultiScaleMaskedTransformerDecoder":
             raise ValueError("RL training requires the object decoder")
-        if mode == "rl" and not cfg.MODEL.WEIGHTS:
-            raise ValueError("TRAINING.MODE rl requires MODEL.WEIGHTS")
+        if mode in ("rl", "hybrid") and not cfg.MODEL.WEIGHTS:
+            raise ValueError("TRAINING.MODE rl/hybrid requires MODEL.WEIGHTS")
     return mode
 
 
@@ -26,10 +26,10 @@ def phase_config(cfg, phase, weights=None):
     """Clone config; each phase owns an independent solver and output directory."""
     result = cfg.clone()
     result.defrost()
-    rl = phase == "rl"
-    result.MODEL.MASK_FORMER.OBJECT_RL_ONLY = rl
+    rl = phase in ("rl", "hybrid")
+    result.MODEL.MASK_FORMER.OBJECT_RL_ONLY = phase == "rl"
     result.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT = cfg.TRAINING.RL.WEIGHT if rl else 0.0
-    if cfg.TRAINING.MODE == "supervised_then_rl":
+    if cfg.TRAINING.MODE in ("supervised_then_rl", "supervised_then_hybrid"):
         result.OUTPUT_DIR = os.path.join(cfg.OUTPUT_DIR, phase)
     if weights is not None:
         result.MODEL.WEIGHTS = weights
