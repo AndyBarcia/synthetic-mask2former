@@ -213,6 +213,9 @@ class SetCriterion(nn.Module):
         self.object_rl_objective = object_rl_objective
         if object_rl_objective in ("best_of_n_ft", "best_of_n_set") and not object_rl_train_eof:
             raise ValueError("Best-of-N fine-tuning requires EOF training")
+        if (object_rl_weight > 0 and not object_rl_train_eof
+                and getattr(object_decoder, "collapse_masks", False)):
+            raise ValueError("Fixed-set RL requires OBJECT_DEC_COLLAPSE_MASKS=False")
         self.object_rl_train_eof = object_rl_train_eof
         if object_rl_weight > 0 and object_rl_train_eof:
             if object_decoder is None:
@@ -390,6 +393,14 @@ class SetCriterion(nn.Module):
                 [feature.repeat(repeats, 1, 1) for feature in features],
                 masks.repeat(repeats, 1, 1, 1), image_sizes)
 
+    def _policy_class_kwargs(self, outputs, repeats=1, selected=None):
+        if not getattr(self.object_decoder, "collapse_masks", False):
+            return {}
+        classes = outputs["pred_logits"][..., :-1].detach().argmax(-1)
+        if selected is not None:
+            classes = classes[selected]
+        return {"query_classes": classes.repeat(repeats, 1)}
+
     def _object_rollout_rewards(self, sampled, greedy, outputs, targets):
         """Reuse rendering inputs for all samples and the greedy baseline."""
         batch_size = outputs["pred_masks"].shape[0]
@@ -496,6 +507,7 @@ class SetCriterion(nn.Module):
                     *sampled_inputs, sample=True, max_steps=self.object_rl_max_steps,
                     return_actions=True,
                     query_bias_logits=query_bias.repeat(repeats, 1) if query_bias is not None else None,
+                    **self._policy_class_kwargs(outputs, repeats=repeats),
                 )
                 sampled_orders.extend(orders)
                 trajectories.extend(actions)
@@ -503,6 +515,7 @@ class SetCriterion(nn.Module):
                 *policy_inputs, sample=False, max_steps=self.object_rl_max_steps,
                 return_actions=True,
                 query_bias_logits=query_bias,
+                **self._policy_class_kwargs(outputs),
             )
             sampled_reward, greedy_reward = self._object_rollout_rewards(
                 sampled_orders, greedy_orders, outputs, targets
@@ -528,6 +541,7 @@ class SetCriterion(nn.Module):
                     [feature[winners] for feature in policy_inputs[1]],
                     policy_inputs[2][winners], policy_inputs[3], winning_trajectories,
                     query_bias_logits=query_bias[winners] if query_bias is not None else None,
+                    **self._policy_class_kwargs(outputs, selected=winners),
                 )
                 token_count = sum(map(len, winning_trajectories))
                 loss = -log_probability.sum() / token_count
@@ -567,6 +581,7 @@ class SetCriterion(nn.Module):
                     *sampled_inputs, sample=True, max_steps=self.object_rl_max_steps,
                     return_actions=True,
                     query_bias_logits=query_bias.repeat(repeats, 1) if query_bias is not None else None,
+                    **self._policy_class_kwargs(outputs, repeats=repeats),
                 )
                 sampled.extend(orders)
                 trajectories.extend(actions)
@@ -574,6 +589,7 @@ class SetCriterion(nn.Module):
                 *policy_inputs, sample=False, max_steps=self.object_rl_max_steps,
                 return_actions=True,
                 query_bias_logits=query_bias,
+                **self._policy_class_kwargs(outputs),
             )
             sampled_reward, greedy_reward = self._object_rollout_rewards(
                 sampled, greedy, outputs, targets
@@ -586,6 +602,7 @@ class SetCriterion(nn.Module):
                 *scored_inputs,
                 trajectories[start * batch_size:(start + repeats) * batch_size],
                 query_bias_logits=query_bias.repeat(repeats, 1) if query_bias is not None else None,
+                **self._policy_class_kwargs(outputs, repeats=repeats),
             )
             log_probabilities.append(scores.reshape(repeats, batch_size))
         log_probability = torch.cat(log_probabilities)

@@ -72,6 +72,8 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_MAP_ENCODER = True
     # Greedy inference and RL reference only; sampled EOF stays stochastic.
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_EOF_THRESHOLD = 0.5
+    cfg.MODEL.MASK_FORMER.OBJECT_DEC_COLLAPSE_MASKS = True
+    cfg.MODEL.MASK_FORMER.OBJECT_DEC_COLLAPSE_IOU_THRESHOLD = 0.8
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_LAYERS = 5
     # NoPE by default; learned absolute positions and RoPE remain opt-in.
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_POSITION_ENCODING = False
