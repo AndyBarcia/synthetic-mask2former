@@ -68,6 +68,8 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_PREFIX_TREE_BRANCHES = 4
     cfg.MODEL.MASK_FORMER.OBJECT_PRETRAIN_PQ_TEMPERATURE = 0.0
     cfg.MODEL.MASK_FORMER.OBJECT_PRETRAIN_PQ_REWARD = "terminal"
+    # Best tested architecture: two-stage, 256d map encoder + pointer decoder.
+    cfg.MODEL.MASK_FORMER.OBJECT_DEC_MAP_ENCODER = True
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_LAYERS = 5
     # NoPE by default; learned absolute positions and RoPE remain opt-in.
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_POSITION_ENCODING = False
