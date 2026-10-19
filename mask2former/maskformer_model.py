@@ -184,6 +184,7 @@ class MaskFormer(nn.Module):
                 cfg.MODEL.MASK_FORMER.OBJECT_DEC_MASK_IOU_THRESHOLD,
                 cfg.MODEL.MASK_FORMER.OBJECT_DEC_PREFIX_TREE_BRANCHES,
                 map_decoder=cfg.MODEL.MASK_FORMER.OBJECT_DEC_MAP_ENCODER,
+                eof_threshold=cfg.MODEL.MASK_FORMER.OBJECT_DEC_EOF_THRESHOLD,
                 position_encoding=cfg.MODEL.MASK_FORMER.OBJECT_DEC_POSITION_ENCODING,
                 rope=cfg.MODEL.MASK_FORMER.OBJECT_DEC_ROPE,
             ) if use_object_decoder else None,
