@@ -47,7 +47,7 @@ class RotaryDecoderLayer(nn.TransformerDecoderLayer):
 class ObjectDecoder(nn.Module):
     def __init__(self, mask_dim, hidden_dim, num_queries, num_layers, num_heads,
                  dim_feedforward, mask_iou_threshold=0.8, prefix_tree_branches=4,
-                 position_encoding=False, rope=False):
+                 position_encoding=False, rope=False, eof_threshold=.5):
         super().__init__()
         if not 0 <= mask_iou_threshold <= 1:
             raise ValueError("mask_iou_threshold must be between 0 and 1")
@@ -56,6 +56,9 @@ class ObjectDecoder(nn.Module):
         self.prefix_tree_branches = prefix_tree_branches
         self.num_queries = num_queries
         self.num_heads = num_heads
+        if not 0 <= eof_threshold < 1:
+            raise ValueError("EOF threshold must be in [0, 1); zero restores argmax")
+        self.eof_threshold = eof_threshold
         self.mask_iou_threshold = mask_iou_threshold
         self.input_mask_projection = nn.Linear(mask_dim, hidden_dim)
         self.output_mask_projection = nn.Linear(mask_dim, hidden_dim)
@@ -356,6 +359,17 @@ class ObjectDecoder(nn.Module):
                                               exclusions, max_steps)
         return None
 
+    def _greedy_action(self, logits, threshold=None):
+        """Strict majority EOF for greedy decoding; sampling stays categorical."""
+        threshold = self.eof_threshold if threshold is None else threshold
+        if not 0 <= threshold < 1:
+            raise ValueError("EOF threshold must be in [0, 1)")
+        if threshold == 0:
+            return logits.argmax(-1)
+        stop = logits.float().softmax(-1)[..., -1] > threshold
+        mask = logits[..., :-1].argmax(-1)
+        return torch.where(stop, torch.full_like(mask, self.num_queries), mask)
+
     @torch.no_grad()
     def generate(self, mask_embeddings, image_features, mask_logits, image_sizes, *, use_cache=True, image_regions=None):
         """Return ordered queries, mask-versus-EOF logits, and probabilities."""
@@ -375,7 +389,7 @@ class ObjectDecoder(nn.Module):
             logits = (self._decode_step(tokens[:, -1], cache) if cache is not None else
                       self(mask_embeddings, image_features, image_regions, tokens, exclusions)[:, -1])
             logits[:, :num_queries].masked_fill_(unavailable, -torch.inf)
-            next_token = logits.argmax(-1)
+            next_token = self._greedy_action(logits)
             active = ~finished & (next_token != num_queries)
             active_batch = torch.arange(batch_size, device=unavailable.device)[active]
             unavailable[active_batch] |= exclusions[active_batch, next_token[active]]
@@ -398,7 +412,7 @@ class ObjectDecoder(nn.Module):
 
     def rollout(self, mask_embeddings, image_features, mask_logits, image_sizes,
                 sample=True, max_steps=32, return_diagnostics=False,
-                return_actions=False, query_bias_logits=None, *, use_cache=True):
+                return_actions=False, query_bias_logits=None, *, use_cache=True, greedy_eof_threshold=None):
         """Generate query orders and sequence log probabilities for policy gradients.
 
         A capped rollout is treated as an implicit EOF after the last selected query.
@@ -422,7 +436,7 @@ class ObjectDecoder(nn.Module):
                       self(mask_embeddings, image_features, regions, previous, exclusions)[:, -1]).clone()
             logits[:, :num_queries].masked_fill_(unavailable.clone(), -torch.inf)
             distribution = torch.distributions.Categorical(logits=logits)
-            token = distribution.sample() if sample else logits.argmax(-1)
+            token = distribution.sample() if sample else self._greedy_action(logits, greedy_eof_threshold)
             active = ~finished
             if diagnostics is not None:
                 with torch.no_grad():

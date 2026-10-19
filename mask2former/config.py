@@ -68,6 +68,8 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_PREFIX_TREE_BRANCHES = 4
     cfg.MODEL.MASK_FORMER.OBJECT_PRETRAIN_PQ_TEMPERATURE = 0.0
     cfg.MODEL.MASK_FORMER.OBJECT_PRETRAIN_PQ_REWARD = "terminal"
+    # Greedy inference and RL reference only; sampled EOF stays stochastic.
+    cfg.MODEL.MASK_FORMER.OBJECT_DEC_EOF_THRESHOLD = 0.5
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_LAYERS = 5
     # NoPE by default; learned absolute positions and RoPE remain opt-in.
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_POSITION_ENCODING = False
