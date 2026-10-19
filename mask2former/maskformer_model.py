@@ -185,6 +185,8 @@ class MaskFormer(nn.Module):
                 cfg.MODEL.MASK_FORMER.OBJECT_DEC_MASK_IOU_THRESHOLD,
                 cfg.MODEL.MASK_FORMER.OBJECT_DEC_PREFIX_TREE_BRANCHES,
                 eof_threshold=cfg.MODEL.MASK_FORMER.OBJECT_DEC_EOF_THRESHOLD,
+                collapse_masks=cfg.MODEL.MASK_FORMER.OBJECT_DEC_COLLAPSE_MASKS,
+                collapse_iou_threshold=cfg.MODEL.MASK_FORMER.OBJECT_DEC_COLLAPSE_IOU_THRESHOLD,
                 position_encoding=cfg.MODEL.MASK_FORMER.OBJECT_DEC_POSITION_ENCODING,
                 rope=cfg.MODEL.MASK_FORMER.OBJECT_DEC_ROPE,
             ) if use_object_decoder else None,
@@ -324,6 +326,7 @@ class MaskFormer(nn.Module):
                 self.criterion.object_decoder.generate(
                     outputs["mask_embeddings"], outputs["object_decoder_image_features"],
                     outputs["pred_masks"], outputs["object_decoder_image_sizes"],
+                    query_classes=outputs["pred_logits"][..., :-1].argmax(-1),
                     **({"image_regions": outputs["object_decoder_image_regions"]} if deferred else {}),
                 )
                 if self.criterion.object_decoder is not None

@@ -3,6 +3,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+from .mask_groups import mask_compatibility, group_logits
 
 
 def apply_rotary_positions(x, positions):
@@ -47,7 +48,8 @@ class RotaryDecoderLayer(nn.TransformerDecoderLayer):
 class ObjectDecoder(nn.Module):
     def __init__(self, mask_dim, hidden_dim, num_queries, num_layers, num_heads,
                  dim_feedforward, mask_iou_threshold=0.8, prefix_tree_branches=4,
-                 position_encoding=False, rope=False, eof_threshold=.5):
+                 position_encoding=False, rope=False, eof_threshold=.5,
+                 collapse_masks=False, collapse_iou_threshold=.8):
         super().__init__()
         if not 0 <= mask_iou_threshold <= 1:
             raise ValueError("mask_iou_threshold must be between 0 and 1")
@@ -58,6 +60,10 @@ class ObjectDecoder(nn.Module):
         self.num_heads = num_heads
         if not 0 <= eof_threshold < 1:
             raise ValueError("EOF threshold must be in [0, 1); zero restores argmax")
+        if not 0 < collapse_iou_threshold < 1:
+            raise ValueError("Collapse IoU threshold must be in (0, 1)")
+        self.collapse_masks = collapse_masks
+        self.collapse_iou_threshold = collapse_iou_threshold
         self.eof_threshold = eof_threshold
         self.mask_iou_threshold = mask_iou_threshold
         self.input_mask_projection = nn.Linear(mask_dim, hidden_dim)
@@ -371,12 +377,14 @@ class ObjectDecoder(nn.Module):
         return torch.where(stop, torch.full_like(mask, self.num_queries), mask)
 
     @torch.no_grad()
-    def generate(self, mask_embeddings, image_features, mask_logits, image_sizes, *, use_cache=True, image_regions=None):
+    def generate(self, mask_embeddings, image_features, mask_logits, image_sizes, *, use_cache=True, image_regions=None, query_classes=None):
         """Return ordered queries, mask-versus-EOF logits, and probabilities."""
         batch_size, num_queries, _ = mask_embeddings.shape
         if image_regions is None:
             image_regions = self.prepare_regions(mask_logits, image_sizes)
         exclusions = self.prepare_vocabulary_exclusions(mask_logits)
+        compatibility = (mask_compatibility(mask_logits, query_classes, self.collapse_iou_threshold)
+                         if self.collapse_masks else None)
         unavailable = torch.zeros(batch_size, num_queries, dtype=torch.bool, device=mask_embeddings.device)
         order = torch.full((batch_size, num_queries), -1, dtype=torch.long, device=mask_embeddings.device)
         log_odds = torch.zeros(batch_size, num_queries, dtype=mask_embeddings.dtype, device=mask_embeddings.device)
@@ -389,14 +397,15 @@ class ObjectDecoder(nn.Module):
             logits = (self._decode_step(tokens[:, -1], cache) if cache is not None else
                       self(mask_embeddings, image_features, image_regions, tokens, exclusions)[:, -1])
             logits[:, :num_queries].masked_fill_(unavailable, -torch.inf)
-            next_token = self._greedy_action(logits)
+            selection_logits = group_logits(logits.float(), compatibility) if compatibility is not None else logits
+            next_token = self._greedy_action(selection_logits)
             active = ~finished & (next_token != num_queries)
             active_batch = torch.arange(batch_size, device=unavailable.device)[active]
             unavailable[active_batch] |= exclusions[active_batch, next_token[active]]
             order[active_batch, lengths[active]] = next_token[active]
-            relative_logits = logits[active_batch, next_token[active]] - logits[active_batch, num_queries]
-            log_odds[active_batch, lengths[active]] = relative_logits
-            probabilities[active_batch, lengths[active]] = relative_logits.sigmoid()
+            relative_logits = selection_logits[active_batch, next_token[active]] - selection_logits[active_batch, num_queries]
+            log_odds[active_batch, lengths[active]] = relative_logits.to(log_odds.dtype)
+            probabilities[active_batch, lengths[active]] = relative_logits.sigmoid().to(probabilities.dtype)
             lengths += active.long()
             finished |= next_token == num_queries
             if finished.all():
@@ -412,7 +421,8 @@ class ObjectDecoder(nn.Module):
 
     def rollout(self, mask_embeddings, image_features, mask_logits, image_sizes,
                 sample=True, max_steps=32, return_diagnostics=False,
-                return_actions=False, query_bias_logits=None, *, use_cache=True, greedy_eof_threshold=None):
+                return_actions=False, query_bias_logits=None, *, use_cache=True, greedy_eof_threshold=None,
+                query_classes=None):
         """Generate query orders and sequence log probabilities for policy gradients.
 
         A capped rollout is treated as an implicit EOF after the last selected query.
@@ -421,6 +431,8 @@ class ObjectDecoder(nn.Module):
         max_steps = min(max_steps, num_queries + 1)
         regions = self.prepare_regions(mask_logits, image_sizes)
         exclusions = self.prepare_vocabulary_exclusions(mask_logits)
+        compatibility = (mask_compatibility(mask_logits, query_classes, self.collapse_iou_threshold)
+                         if self.collapse_masks else None)
         unavailable = torch.zeros(batch_size, num_queries, dtype=torch.bool, device=mask_embeddings.device)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=mask_embeddings.device)
         previous = torch.full((batch_size, 1), -1, dtype=torch.long, device=mask_embeddings.device)
@@ -435,6 +447,8 @@ class ObjectDecoder(nn.Module):
             logits = (self._decode_step(previous[:, -1], cache) if cache is not None else
                       self(mask_embeddings, image_features, regions, previous, exclusions)[:, -1]).clone()
             logits[:, :num_queries].masked_fill_(unavailable.clone(), -torch.inf)
+            if compatibility is not None:
+                logits = group_logits(logits.float(), compatibility)
             distribution = torch.distributions.Categorical(logits=logits)
             token = distribution.sample() if sample else self._greedy_action(logits, greedy_eof_threshold)
             active = ~finished
@@ -475,7 +489,7 @@ class ObjectDecoder(nn.Module):
 
     def autoregressive_log_probability(self, mask_embeddings, image_features,
                                        mask_logits, image_sizes, trajectories,
-                                       query_bias_logits=None):
+                                       query_bias_logits=None, *, query_classes=None):
         """Score sampled mask and EOF actions in one causal decoder pass."""
         batch_size, num_queries = mask_embeddings.shape[:2]
         steps = max(map(len, trajectories))
@@ -509,6 +523,9 @@ class ObjectDecoder(nn.Module):
         regions = self.prepare_regions(mask_logits, image_sizes)
         logits = self(mask_embeddings, image_features, regions, previous, exclusions)
         logits = logits.float().masked_fill(~torch.stack(allowed, dim=1), -torch.inf)
+        if self.collapse_masks:
+            logits = group_logits(logits, mask_compatibility(
+                mask_logits, query_classes, self.collapse_iou_threshold))
         log_probabilities = F.log_softmax(logits, dim=-1).gather(
             -1, actions.unsqueeze(-1)
         ).squeeze(-1)
