@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from .map_encoder import MapEncoder
+from .state_cache import StateCache, pack_by_image
 from .mask_groups import mask_compatibility, group_logits
 
 
@@ -150,55 +151,162 @@ class ObjectDecoder(nn.Module):
 
     def forward(self, mask_embeddings, image_features, image_regions, previous_tokens,
                 vocabulary_exclusions, *, positions=None, ancestors=None, return_hidden=False,
-                map_last_only=False):
+                map_last_only=False, state_cache=None, image_ids=None, merge_states=True):
         # Sampling and gradient scoring can share an outer AMP context.
         # Avoid reusing parameter casts cached by the preceding no-grad pass.
         with torch.autocast(device_type=mask_embeddings.device.type,
                 enabled=torch.is_autocast_enabled(mask_embeddings.device.type), cache_enabled=False):
             return self._forward_impl(mask_embeddings, image_features, image_regions,
                 previous_tokens, vocabulary_exclusions, positions=positions,
-                ancestors=ancestors, return_hidden=return_hidden, map_last_only=map_last_only)
+                ancestors=ancestors, return_hidden=return_hidden, map_last_only=map_last_only,
+                state_cache=state_cache, image_ids=image_ids, merge_states=merge_states)
 
     def _forward_impl(self, mask_embeddings, image_features, image_regions, previous_tokens,
                       vocabulary_exclusions, *, positions=None, ancestors=None,
-                      return_hidden=False, map_last_only=False):
-        """Return next-token logits from independent map summaries."""
-        if len(image_features) != 3 or len(image_regions) != 3:
-            raise ValueError("Object decoder requires three image feature levels")
-        mask_tokens = self.input_mask_projection(mask_embeddings)
-        vocabulary = torch.cat((mask_tokens, self.eof.expand(mask_tokens.shape[0], 1, -1)), dim=1)
-        previous = self.map_encoder(mask_tokens, image_features[0], image_regions[0],
-            previous_tokens, ancestors, positions, last_only=map_last_only)
-        steps = previous.shape[1]
-        state_mask = ~torch.eye(steps, device=previous.device, dtype=torch.bool)
-        vocabulary_mask = self._vocabulary_mask(vocabulary_exclusions, previous_tokens, ancestors)
-        vocabulary_mask = vocabulary_mask[:, None].expand(-1, self.num_heads, -1, -1).reshape(
-            mask_tokens.shape[0] * self.num_heads, steps, self.num_queries + 1
-        )
-        decoded = previous
-        for layer_index, layer in enumerate(self.layers.layers):
-            level_index = layer_index % len(image_features)
-            image_memory = torch.cat((
-                image_features[level_index],
-                self.null_image_token[level_index].expand(mask_tokens.shape[0], 1, -1),
-            ), dim=1)
-            decoded = layer(
-                decoded, image_memory,
-                tgt_mask=state_mask,
-                memory_mask=self._memory_mask(image_regions[level_index], previous_tokens, ancestors),
-            )
-            attended = self.vocabulary_attention[layer_index](
-                decoded, vocabulary, vocabulary, attn_mask=vocabulary_mask,
-                need_weights=False,
-            )[0]
-            decoded = self.vocabulary_norm[layer_index](decoded + attended)
-        decoded = self.norm(decoded)
-        output_mask_tokens = self.output_mask_projection(mask_embeddings)
-        output_vocabulary = torch.cat((
-            output_mask_tokens, self.eof.expand(output_mask_tokens.shape[0], 1, -1),
-        ), dim=1)
-        logits = torch.matmul(decoded, output_vocabulary.transpose(1, 2)) * self.scale
-        return (logits, decoded) if return_hidden else logits
+                      return_hidden=False, map_last_only=False, state_cache=None,
+                      image_ids=None, merge_states=True):
+        cache = self._prepare_decode_cache(mask_embeddings, image_features, image_regions,
+            vocabulary_exclusions, previous_tokens.shape[1], state_cache=state_cache,
+            image_ids=image_ids, merge_states=merge_states)
+        owner = self.map_encoder.render_maps(image_regions[0], previous_tokens,
+            ancestors, positions, map_last_only)
+        valid = (previous_tokens >= 0) & (previous_tokens < self.num_queries)
+        prior = F.one_hot(previous_tokens.clamp(0, self.num_queries - 1), self.num_queries).bool()
+        selected = self._accumulate_prior(prior, valid, ancestors)
+        blocked = self._vocabulary_mask(vocabulary_exclusions, previous_tokens, ancestors)
+        if map_last_only:
+            selected, blocked = selected[:, -1:], blocked[:, -1:]
+        self._prove_unique_path(previous_tokens, selected, image_regions[0], cache,
+                                ancestors, positions)
+        covered = [F.pad(torch.bmm(selected.float(), region.float()) > 0, (0, 1))
+                   for region in image_regions]
+        logits, hidden = self._evaluate_states(owner, selected, covered, blocked, cache)
+        if map_last_only:
+            logits = F.pad(logits, (0, 0, previous_tokens.shape[1] - 1, 0))
+            hidden = F.pad(hidden, (0, 0, previous_tokens.shape[1] - 1, 0))
+        return (logits, hidden) if return_hidden else logits
+
+    @staticmethod
+    def _prove_unique_path(previous, selected, regions, cache, ancestors, positions):
+        """Exact cold-cache shortcut for distinct linear prefixes.
+
+        A newly selected nonempty query paints a label absent from every prior
+        map. Selected sets themselves remain distinct even for empty masks.
+        Independent source images cannot collide with each other.
+        """
+        scope = cache["state_cache"]
+        if (not cache["merge_states"] or ancestors is not None or positions is not None
+                or len(cache["memory_rows"]) != len(previous)
+                or scope["maps"].keys is not None or scope["decoder"].keys is not None):
+            return
+        if selected.shape[1] == 1:
+            cache["unique_maps"] = cache["unique_decoder_states"] = True
+            return
+        introduced = selected[:, 1:] & ~selected[:, :-1]
+        fresh = introduced.any(-1).all()
+        nonempty = (introduced & regions.any(-1)[:, None]).any(-1).all()
+        # One small transfer replaces two full-key sorts and compaction passes.
+        cache["unique_decoder_states"], cache["unique_maps"] = torch.stack((fresh, nonempty)).tolist()
+
+    def _evaluate_states(self, owner, selected, covered, blocked, cache):
+        with torch.autocast(device_type=owner.device.type,
+                enabled=torch.is_autocast_enabled(owner.device.type), cache_enabled=False):
+            return self._evaluate_states_impl(owner, selected, covered, blocked, cache)
+
+    def _evaluate_states_impl(self, owner, selected, covered, blocked, cache):
+        batch, steps, _ = owner.shape
+        scope = cache["state_cache"]
+        summaries = self.map_encoder.encode_maps(cache["vocabulary"][:, :-1],
+            cache["features"][0], cache["regions"][0], owner, cache["pool_cache"],
+            state_cache=scope["maps"], image_ids=cache["image_ids"],
+            merge_states=cache["merge_states"], unique_states=cache["unique_maps"])
+        memo = scope["decoder"] if cache["merge_states"] else None
+        if memo is not None:
+            # Selected queries determine the image exclusions at *every* scale.
+            # Blocked vocabulary is explicit so equal visible maps cannot erase
+            # action eligibility differences (e.g. fully overwritten queries).
+            keys = torch.cat((cache["image_ids"][:, None, None].expand(-1, steps, 1),
+                owner, selected, blocked), dim=-1).flatten(0, 1)
+            if cache["unique_decoder_states"]:
+                missing = torch.arange(batch * steps, device=owner.device)
+            else:
+                lookup = memo.lookup(keys)
+                missing = lookup.missing
+        else:
+            missing = torch.arange(batch * steps, device=owner.device)
+        if len(missing):
+            memory_batch = len(cache["memory_rows"])
+            dense = (memo is None or cache["unique_decoder_states"]) and memory_batch == batch
+            if dense:
+                # Proven-unique queries already have their dense [image, state]
+                # layout. No sorting, packing, scatter, or result gather needed.
+                if cache["identity_images"]:
+                    decoded, memory_masks, vocabulary_mask = summaries, covered, blocked
+                else:
+                    rows = cache["memory_rows"]
+                    decoded = summaries[rows]
+                    memory_masks = [mask[rows] for mask in covered]
+                    vocabulary_mask = blocked[rows]
+            else:
+                images, nodes = missing // steps, missing % steps
+                memory_images = cache["memory_inverse"][images]
+                slots, capacity = pack_by_image(memory_images, memory_batch)
+                decoded = summaries.new_zeros(memory_batch, capacity, summaries.shape[-1])
+                decoded[memory_images, slots] = summaries[images, nodes].to(decoded.dtype)
+                memory_masks = []
+                for mask in covered:
+                    packed = mask.new_zeros(memory_batch, capacity, mask.shape[-1])
+                    packed[memory_images, slots] = mask[images, nodes]
+                    memory_masks.append(packed)
+                vocabulary_mask = blocked.new_zeros(memory_batch, capacity, blocked.shape[-1])
+                vocabulary_mask[memory_images, slots] = blocked[images, nodes]
+            for index, layer in enumerate(self.layers.layers):
+                # Each map has exactly one self-attention key. Its softmax is
+                # identically one: only the value and output projections remain.
+                width = layer.self_attn.embed_dim
+                attended = F.linear(decoded, layer.self_attn.in_proj_weight[2 * width:],
+                                    layer.self_attn.in_proj_bias[2 * width:])
+                attended = layer.self_attn.out_proj(attended)
+                decoded = layer.norm1(decoded + layer.dropout1(attended))
+                attended = self._cached_cross_attention(layer.multihead_attn, decoded,
+                    cache["image_kv"][index], memory_masks[index % 3])
+                decoded = layer.norm2(decoded + layer.dropout2(attended))
+                decoded = layer.norm3(decoded + layer._ff_block(decoded))
+                attended = self._cached_cross_attention(self.vocabulary_attention[index], decoded,
+                    cache["vocabulary_kv"][index], vocabulary_mask)
+                decoded = self.vocabulary_norm[index](decoded + attended)
+            hidden = self.norm(decoded)
+            logits = (hidden @ cache["output_vocabulary"].transpose(1, 2)) * self.scale
+            if dense:
+                values = torch.cat((logits, hidden), -1)
+                if not cache["identity_images"]:
+                    values = values[cache["memory_inverse"]]
+                values = values.flatten(0, 1)
+            else:
+                values = torch.cat((logits[memory_images, slots], hidden[memory_images, slots]), -1)
+        else:
+            values = None
+        if memo is not None:
+            values = (memo.store_unique(keys, values) if cache["unique_decoder_states"]
+                      else memo.store(lookup, values))
+        values = values.reshape(batch, steps, -1)
+        logits_dtype = (torch.get_autocast_dtype(owner.device.type)
+                        if torch.is_autocast_enabled(owner.device.type)
+                        else cache["output_vocabulary"].dtype)
+        return values[..., :self.num_queries + 1].to(logits_dtype), values[..., self.num_queries + 1:]
+
+    def _state_scope(self, state_cache):
+        scope = {} if state_cache is None else state_cache
+        precision = (torch.get_autocast_dtype(self.eof.device.type)
+                     if torch.is_autocast_enabled(self.eof.device.type) else None)
+        signature = (id(self), torch.is_grad_enabled(), self.training, self.eof.device,
+                     self.eof.dtype, precision, tuple(p._version for p in self.parameters()))
+        if "signature" in scope and scope["signature"] != signature:
+            raise ValueError("State caches must not cross models, updates, grad modes, or precision contexts")
+        scope["signature"] = signature
+        if "maps" not in scope:
+            scope["maps"], scope["decoder"] = StateCache(), StateCache()
+        return scope
 
     @staticmethod
     def _attention_heads(tensor, num_heads):
@@ -226,32 +334,78 @@ class ObjectDecoder(nn.Module):
         attended = attended.transpose(1, 2).reshape(query.shape[0], query.shape[2], width)
         return attention.out_proj(attended)
 
+    def _fixed_memories(self, mask_embeddings, image_features, rows, image_ids, scope):
+        """Source-image K/V projections shared across rollout/scoring batches."""
+        if "memory_ids" in scope and torch.equal(scope["memory_ids"], image_ids):
+            return scope["memories"]
+        batch = len(rows)
+        vocabulary = torch.cat((self.input_mask_projection(mask_embeddings[rows]),
+                                self.eof.expand(batch, 1, -1)), 1)
+        output = torch.cat((self.output_mask_projection(mask_embeddings[rows]),
+                            self.eof.expand(batch, 1, -1)), 1)
+        images = [torch.cat((feature[rows], self.null_image_token[level].expand(batch, 1, -1)), 1)
+                  for level, feature in enumerate(image_features)]
+        memories = {
+            "vocabulary": vocabulary,
+            "output_vocabulary": output,
+            "image_kv": [self._project_attention_kv(layer.multihead_attn, images[index % 3])
+                         for index, layer in enumerate(self.layers.layers)],
+            "vocabulary_kv": [self._project_attention_kv(attention, vocabulary)
+                              for attention in self.vocabulary_attention],
+        }
+        scope["memory_ids"], scope["memories"] = image_ids.clone(), memories
+        return memories
+
     def _prepare_decode_cache(self, mask_embeddings, image_features, regions,
-                              exclusions, max_steps):
+                              exclusions, max_steps, *, state_cache=None, image_ids=None,
+                              merge_states=True):
         """Cache fixed projections and allocate incremental, rollout-local state.
 
         Projected tensors retain their gradients during differentiable rollouts.
-        No cache survives a rollout or optimizer update.
+        State memos can span rollout batches in one explicitly shared scope.
+        The scope must not be reused after backward or an optimizer update.
         """
         if len(image_features) != 3 or len(regions) != 3:
             raise ValueError("Object decoder requires three image feature levels")
         batch_size = mask_embeddings.shape[0]
-        vocabulary = torch.cat((self.input_mask_projection(mask_embeddings),
-                                self.eof.expand(batch_size, 1, -1)), dim=1)
-        output_vocabulary = torch.cat((self.output_mask_projection(mask_embeddings),
-                                       self.eof.expand(batch_size, 1, -1)), dim=1)
-        image_memory = [torch.cat((feature, self.null_image_token[level].expand(batch_size, 1, -1)), 1)
-                        for level, feature in enumerate(image_features)]
+        private_scope = state_cache is None
+        state_cache = self._state_scope(state_cache)
+        identity_images = image_ids is None
+        if image_ids is None:
+            image_ids = torch.arange(batch_size, device=mask_embeddings.device)
+            memory_ids = memory_rows = memory_inverse = image_ids
+        else:
+            image_ids = image_ids.to(device=mask_embeddings.device, dtype=torch.long)
+            if image_ids.shape != (batch_size,):
+                raise ValueError("image_ids must contain one stable source ID per batch row")
+            memory_ids, memory_inverse = torch.unique(image_ids, sorted=True, return_inverse=True)
+            memory_rows = torch.full_like(memory_ids, batch_size)
+            memory_rows.scatter_reduce_(0, memory_inverse,
+                torch.arange(batch_size, device=image_ids.device), reduce="amin")
+        with torch.autocast(device_type=mask_embeddings.device.type,
+                enabled=torch.is_autocast_enabled(mask_embeddings.device.type), cache_enabled=False):
+            memories = self._fixed_memories(mask_embeddings, image_features, memory_rows,
+                                            memory_ids, state_cache)
+        vocabulary = memories["vocabulary"][memory_inverse]
         return {
             "vocabulary": vocabulary,
-            "output_vocabulary": output_vocabulary,
-            "image_kv": [self._project_attention_kv(layer.multihead_attn, image_memory[index % 3])
-                         for index, layer in enumerate(self.layers.layers)],
-            "vocabulary_kv": [self._project_attention_kv(attention, vocabulary)
-                              for attention in self.vocabulary_attention],
+            "output_vocabulary": memories["output_vocabulary"],
+            "image_kv": memories["image_kv"],
+            "vocabulary_kv": memories["vocabulary_kv"],
+            "memory_rows": memory_rows,
+            "memory_inverse": memory_inverse,
             "features": image_features,
             "pool_cache": {},
-            "history": [],
+            "state_cache": state_cache,
+            "image_ids": image_ids,
+            "merge_states": merge_states,
+            "unique_maps": False,
+            "unique_decoder_states": False,
+            "identity_images": identity_images,
+            "private_scope": private_scope,
+            "owner": torch.full((batch_size, regions[0].shape[-1]), self.num_queries,
+                                dtype=torch.long, device=mask_embeddings.device),
+            "selected": exclusions.new_zeros(batch_size, self.num_queries),
             "regions": regions,
             "exclusions": exclusions,
             "covered": [region.new_zeros(batch_size, region.shape[-1] + 1) for region in regions],
@@ -266,37 +420,38 @@ class ObjectDecoder(nn.Module):
         if step >= cache["max_steps"]:
             raise ValueError("Decode cache capacity exceeded")
         vocabulary = cache["vocabulary"]
-        batch_size, _, width = vocabulary.shape
+        batch_size = vocabulary.shape[0]
         rows = torch.arange(batch_size, device=previous_token.device)
         valid = (previous_token >= 0) & (previous_token < self.num_queries)
         query_index = previous_token.clamp(0, self.num_queries - 1)
         cache["blocked"][:, :-1] |= cache["exclusions"][rows, query_index] & valid[:, None]
         for covered, regions in zip(cache["covered"], cache["regions"]):
             covered[:, :-1] |= regions[rows, query_index] & valid[:, None]
-        cache["history"].append(previous_token)
-        previous = torch.stack(cache["history"], 1)
-        decoded = self.map_encoder(vocabulary[:, :-1], cache["features"][0], cache["regions"][0],
-            previous, None, None, last_only=True, pool_cache=cache["pool_cache"])[:, -1:]
-        for index, layer in enumerate(self.layers.layers):
-            attended = layer.self_attn(decoded, decoded, decoded, need_weights=False)[0]
-            decoded = layer.norm1(decoded + layer.dropout1(attended))
-            attended = self._cached_cross_attention(layer.multihead_attn, decoded,
-                                                     cache["image_kv"][index], cache["covered"][index % 3][:, None])
-            decoded = layer.norm2(decoded + layer.dropout2(attended))
-            decoded = layer.norm3(decoded + layer._ff_block(decoded))
-            attended = self._cached_cross_attention(self.vocabulary_attention[index], decoded,
-                                                     cache["vocabulary_kv"][index], cache["blocked"][:, None])
-            decoded = self.vocabulary_norm[index](decoded + attended)
+        paint = cache["regions"][0][rows, query_index] & valid[:, None]
+        cache["unique_maps"] = cache["unique_decoder_states"] = False
+        if (cache["merge_states"] and cache["private_scope"]
+                and len(cache["memory_rows"]) == batch_size):
+            scope = cache["state_cache"]
+            if scope["maps"].keys is None and scope["decoder"].keys is None:
+                cache["unique_maps"] = cache["unique_decoder_states"] = True
+            else:
+                fresh = valid & ~cache["selected"][rows, query_index]
+                flags = torch.stack((fresh.all(), (fresh & paint.any(-1)).all())).tolist()
+                cache["unique_decoder_states"], cache["unique_maps"] = flags
+        cache["owner"] = torch.where(paint, query_index[:, None], cache["owner"])
+        cache["selected"] = cache["selected"] | (F.one_hot(query_index, self.num_queries).bool() & valid[:, None])
+        logits, _ = self._evaluate_states(cache["owner"][:, None], cache["selected"][:, None],
+            [mask[:, None].clone() for mask in cache["covered"]], cache["blocked"][:, None].clone(), cache)
         cache["step"] += 1
-        return (self.norm(decoded) @ cache["output_vocabulary"].transpose(1, 2))[:, 0] * self.scale
+        return logits[:, 0].clone()
 
     def _rollout_cache(self, use_cache, mask_embeddings, image_features, regions,
-                       exclusions, max_steps):
+                       exclusions, max_steps, *, state_cache=None, image_ids=None):
         # Respect custom forward implementations.
         if (use_cache
                 and getattr(self.forward, "__func__", None) is ObjectDecoder.forward):
             return self._prepare_decode_cache(mask_embeddings, image_features, regions,
-                                              exclusions, max_steps)
+                                              exclusions, max_steps, state_cache=state_cache, image_ids=image_ids)
         return None
 
     def _greedy_action(self, logits, threshold=None):
@@ -357,7 +512,7 @@ class ObjectDecoder(nn.Module):
     def rollout(self, mask_embeddings, image_features, mask_logits, image_sizes,
                 sample=True, max_steps=32, return_diagnostics=False,
                 return_actions=False, query_bias_logits=None, *, use_cache=True, greedy_eof_threshold=None,
-                query_classes=None):
+                query_classes=None, state_cache=None, image_ids=None):
         """Generate query orders and sequence log probabilities for policy gradients.
 
         A capped rollout is treated as an implicit EOF after the last selected query.
@@ -377,11 +532,12 @@ class ObjectDecoder(nn.Module):
             key: torch.zeros(batch_size, device=mask_embeddings.device)
             for key in ("actions", "entropy", "top1_probability", "eof_probability", "available_masks")
         } if return_diagnostics else None
-        cache = self._rollout_cache(use_cache, mask_embeddings, image_features, regions, exclusions, max_steps)
+        cache = self._rollout_cache(use_cache, mask_embeddings, image_features, regions, exclusions, max_steps,
+                                    state_cache=state_cache, image_ids=image_ids)
         for _ in range(max_steps):
             logits = (self._decode_step(previous[:, -1], cache) if cache is not None else
                       self(mask_embeddings, image_features, regions, previous, exclusions,
-                           map_last_only=True)[:, -1]).clone()
+                           map_last_only=True, state_cache=state_cache, image_ids=image_ids)[:, -1]).clone()
             logits[:, :num_queries].masked_fill_(unavailable.clone(), -torch.inf)
             if compatibility is not None:
                 logits = group_logits(logits.float(), compatibility)
@@ -425,7 +581,8 @@ class ObjectDecoder(nn.Module):
 
     def trajectory_log_probability(self, mask_embeddings, image_features,
                                        mask_logits, image_sizes, trajectories,
-                                       query_bias_logits=None, *, query_classes=None):
+                                       query_bias_logits=None, *, query_classes=None,
+                                       state_cache=None, image_ids=None):
         """Score sampled mask and EOF actions from their prefix maps."""
         batch_size, num_queries = mask_embeddings.shape[:2]
         steps = max(map(len, trajectories))
@@ -457,7 +614,8 @@ class ObjectDecoder(nn.Module):
             chosen_batch = chosen.nonzero(as_tuple=True)[0]
             unavailable[chosen_batch] |= exclusions[chosen_batch, actions[chosen_batch, step]]
         regions = self.prepare_regions(mask_logits, image_sizes)
-        logits = self(mask_embeddings, image_features, regions, previous, exclusions)
+        logits = self(mask_embeddings, image_features, regions, previous, exclusions,
+                      state_cache=state_cache, image_ids=image_ids)
         logits = logits.float().masked_fill(~torch.stack(allowed, dim=1), -torch.inf)
         if self.collapse_masks:
             logits = group_logits(logits, mask_compatibility(
@@ -561,7 +719,8 @@ class ObjectDecoder(nn.Module):
         return loss, mask_loss_sum.detach(), eof_loss_sum.detach(), token_count, mask_count
 
     def rollout_permutation(self, mask_embeddings, image_features, mask_logits,
-                            image_sizes, proposal_mask, sample=True, *, use_cache=True):
+                            image_sizes, proposal_mask, sample=True, *, use_cache=True,
+                            state_cache=None, image_ids=None):
         """Select every allowed proposal once; EOF is forced after the last mask."""
         batch_size, num_queries = mask_embeddings.shape[:2]
         if proposal_mask.shape != (batch_size, num_queries):
@@ -577,11 +736,13 @@ class ObjectDecoder(nn.Module):
         action_steps = []
         log_probability = mask_embeddings.new_zeros(batch_size)
         max_steps = int(counts.max().item())
-        cache = self._rollout_cache(use_cache, mask_embeddings, image_features, regions, exclusions, max_steps)
+        cache = self._rollout_cache(use_cache, mask_embeddings, image_features, regions, exclusions, max_steps,
+                                    state_cache=state_cache, image_ids=image_ids)
         for step in range(max_steps):
             active = counts > step
             logits = (self._decode_step(previous[:, -1], cache) if cache is not None else
-                      self(mask_embeddings, image_features, regions, previous, exclusions)[:, -1]).clone()
+                      self(mask_embeddings, image_features, regions, previous, exclusions,
+                           state_cache=state_cache, image_ids=image_ids)[:, -1]).clone()
             remaining = proposal_mask & ~selected
             eligible = remaining & ~excluded_neighbors
             # IoU exclusions defer overlapping proposals. Once every remaining
@@ -607,7 +768,7 @@ class ObjectDecoder(nn.Module):
         return orders, log_probability
 
     def permutation_log_probability(self, mask_embeddings, image_features, mask_logits,
-                                    image_sizes, proposal_mask, orders):
+                                    image_sizes, proposal_mask, orders, *, state_cache=None, image_ids=None):
         """Score fixed permutations from their prefix maps."""
         batch_size, num_queries = proposal_mask.shape
         counts = proposal_mask.sum(-1)
@@ -639,7 +800,8 @@ class ObjectDecoder(nn.Module):
             selected[chosen, actions[chosen, step]] = True
             excluded_neighbors[chosen] |= exclusions[chosen, actions[chosen, step]]
         regions = self.prepare_regions(mask_logits, image_sizes)
-        logits = self(mask_embeddings, image_features, regions, previous, exclusions)
+        logits = self(mask_embeddings, image_features, regions, previous, exclusions,
+                      state_cache=state_cache, image_ids=image_ids)
         logits = logits.float().masked_fill(~torch.stack(allowed, dim=1), -torch.inf)
         log_probabilities = F.log_softmax(logits, dim=-1).gather(
             -1, actions.unsqueeze(-1)

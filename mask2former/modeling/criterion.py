@@ -393,6 +393,13 @@ class SetCriterion(nn.Module):
                 [feature.repeat(repeats, 1, 1) for feature in features],
                 masks.repeat(repeats, 1, 1, 1), image_sizes)
 
+    @staticmethod
+    def _policy_state_kwargs(policy_inputs, state_cache, repeats=1):
+        """Rollout copies of one source image share the same discrete-state DAG."""
+        return {"state_cache": state_cache,
+                "image_ids": torch.arange(policy_inputs[0].shape[0],
+                    device=policy_inputs[0].device).repeat(repeats)}
+
     def _policy_class_kwargs(self, outputs, repeats=1, selected=None):
         if not getattr(self.object_decoder, "collapse_masks", False):
             return {}
@@ -445,22 +452,27 @@ class SetCriterion(nn.Module):
         k = self.object_rl_num_samples
         rollout_batch = 4
         sampled = []
+        sampling_states = {}
         with torch.no_grad():
             for start in range(0, k, rollout_batch):
                 repeats = min(rollout_batch, k - start)
                 sampled_inputs = self._repeat_policy_inputs(policy_inputs, repeats)
                 orders, _ = self.object_decoder.rollout_permutation(
-                    *sampled_inputs, proposal_mask.repeat(repeats, 1), sample=True
+                    *sampled_inputs, proposal_mask.repeat(repeats, 1), sample=True,
+                    **self._policy_state_kwargs(policy_inputs, sampling_states, repeats),
                 )
                 sampled.extend(orders)
             greedy, _ = self.object_decoder.rollout_permutation(
-                *policy_inputs, proposal_mask, sample=False
+                *policy_inputs, proposal_mask, sample=False,
+                **self._policy_state_kwargs(policy_inputs, sampling_states),
             )
             sampled_reward, greedy_reward = self._object_rollout_rewards(
                 sampled, greedy, outputs, targets
             )
         # Sampling needs no graph. A full causal pass scores each fixed order,
         # avoiding a growing-prefix autograd graph for every sampled action.
+        del sampling_states
+        scoring_states = {}
         log_probabilities = []
         for start in range(0, k, rollout_batch):
             repeats = min(rollout_batch, k - start)
@@ -468,6 +480,7 @@ class SetCriterion(nn.Module):
             scores = self.object_decoder.permutation_log_probability(
                 *scored_inputs, proposal_mask.repeat(repeats, 1),
                 sampled[start * batch_size:(start + repeats) * batch_size],
+                **self._policy_state_kwargs(policy_inputs, scoring_states, repeats),
             )
             log_probabilities.append(scores.reshape(repeats, batch_size))
         log_probability = torch.cat(log_probabilities)
@@ -499,6 +512,7 @@ class SetCriterion(nn.Module):
         rollout_batch = 4
         sampled_orders = []
         trajectories = []
+        sampling_states = {}
         with torch.no_grad():
             for start in range(0, k, rollout_batch):
                 repeats = min(rollout_batch, k - start)
@@ -507,6 +521,7 @@ class SetCriterion(nn.Module):
                     *sampled_inputs, sample=True, max_steps=self.object_rl_max_steps,
                     return_actions=True,
                     query_bias_logits=query_bias.repeat(repeats, 1) if query_bias is not None else None,
+                    **self._policy_state_kwargs(policy_inputs, sampling_states, repeats),
                     **self._policy_class_kwargs(outputs, repeats=repeats),
                 )
                 sampled_orders.extend(orders)
@@ -515,6 +530,7 @@ class SetCriterion(nn.Module):
                 *policy_inputs, sample=False, max_steps=self.object_rl_max_steps,
                 return_actions=True,
                 query_bias_logits=query_bias,
+                **self._policy_state_kwargs(policy_inputs, sampling_states),
                 **self._policy_class_kwargs(outputs),
             )
             sampled_reward, greedy_reward = self._object_rollout_rewards(
@@ -523,6 +539,7 @@ class SetCriterion(nn.Module):
             best_trajectories, best_reward, winners = select_best_of_n(
                 sampled_reward, greedy_reward, trajectories
             )
+        del sampling_states
         if self.object_rl_objective == "best_of_n_set":
             loss, mask_nll, eof_nll, token_count, mask_count = (
                 self.object_decoder.set_imitation_loss(
@@ -573,6 +590,7 @@ class SetCriterion(nn.Module):
         rollout_batch = 4
         sampled = []
         trajectories = []
+        sampling_states = {}
         with torch.no_grad():
             for start in range(0, k, rollout_batch):
                 repeats = min(rollout_batch, k - start)
@@ -581,6 +599,7 @@ class SetCriterion(nn.Module):
                     *sampled_inputs, sample=True, max_steps=self.object_rl_max_steps,
                     return_actions=True,
                     query_bias_logits=query_bias.repeat(repeats, 1) if query_bias is not None else None,
+                    **self._policy_state_kwargs(policy_inputs, sampling_states, repeats),
                     **self._policy_class_kwargs(outputs, repeats=repeats),
                 )
                 sampled.extend(orders)
@@ -589,11 +608,14 @@ class SetCriterion(nn.Module):
                 *policy_inputs, sample=False, max_steps=self.object_rl_max_steps,
                 return_actions=True,
                 query_bias_logits=query_bias,
+                **self._policy_state_kwargs(policy_inputs, sampling_states),
                 **self._policy_class_kwargs(outputs),
             )
             sampled_reward, greedy_reward = self._object_rollout_rewards(
                 sampled, greedy, outputs, targets
             )
+        del sampling_states
+        scoring_states = {}
         log_probabilities = []
         for start in range(0, k, rollout_batch):
             repeats = min(rollout_batch, k - start)
@@ -602,6 +624,7 @@ class SetCriterion(nn.Module):
                 *scored_inputs,
                 trajectories[start * batch_size:(start + repeats) * batch_size],
                 query_bias_logits=query_bias.repeat(repeats, 1) if query_bias is not None else None,
+                **self._policy_state_kwargs(policy_inputs, scoring_states, repeats),
                 **self._policy_class_kwargs(outputs, repeats=repeats),
             )
             log_probabilities.append(scores.reshape(repeats, batch_size))
