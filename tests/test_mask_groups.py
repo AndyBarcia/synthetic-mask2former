@@ -48,6 +48,8 @@ def test_sampling_scoring(device='cpu',amp=False):
     with torch.autocast(device_type=device,enabled=amp):
         with torch.no_grad():
             orders,online,actions=m.rollout(*args,sample=True,max_steps=4,return_actions=True,query_classes=cls)
+        # Sampling under no_grad must not leave detached weights in the AMP cache.
+        torch.clear_autocast_cache()
         scored=m.autoregressive_log_probability(*args,actions,query_classes=cls)
     torch.testing.assert_close(online,scored,atol=.02 if amp else 5e-6,rtol=.005 if amp else 5e-6)
     assert all(not(0 in order and 1 in order) for order in orders)
@@ -77,6 +79,49 @@ def test_criterion_class_routing():
         assert c.object_decoder.eof.grad is not None
     print('real criterion RLOO and best-of-N route predicted classes through sampling and rescoring PASS',flush=True)
 
+def test_representative_flip(device='cpu', amp=False):
+    """Replay sampled topology when numerical rounding reverses tied queries."""
+    m = ObjectDecoder(8,8,3,2,2,16,collapse_masks=True).to(device)
+    m.test_logits = torch.nn.Parameter(torch.tensor([8.,8.,-8.,0.],device=device))
+    def fixed(self,emb,features,regions,previous,exclusions,**kwargs):
+        # Emulate the opposite rounding of incremental versus batched decoding.
+        perturbation = self.test_logits.new_tensor(
+            [1e-4,0.,0.,0.] if not torch.is_grad_enabled() else [0.,1e-4,0.,0.])
+        return (self.test_logits + perturbation).expand(len(emb),previous.shape[1],-1)
+    m.forward = types.MethodType(fixed,m)
+    emb=torch.randn(1,3,8,device=device)
+    features=[torch.randn(1,4,8,device=device) for _ in range(3)]
+    masks=torch.tensor([[[[1.,-1.],[1.,-1.]],[[1.,-1.],[1.,-1.]],
+                         [[-1.,1.],[-1.,1.]]]],device=device)
+    cls=torch.tensor([[0,0,1]],device=device)
+    args=(emb,features,masks,[(2,2)]*3)
+    with torch.autocast(device_type=device,enabled=amp):
+        with torch.no_grad():
+            _, online, actions=m.rollout(*args,return_actions=True,use_cache=False,
+                                        max_steps=4,query_classes=cls)
+        assert actions[0][0] == 0
+        broken=m.autoregressive_log_probability(*args,[list(path) for path in actions],query_classes=cls)
+        assert torch.isneginf(broken).all()  # Original failure, without saved groups.
+        # Sampling under no_grad must not leave detached weights in the AMP cache.
+        torch.clear_autocast_cache()
+        scored=m.autoregressive_log_probability(*args,actions,query_classes=cls)
+        torch.testing.assert_close(scored,online,atol=1e-5,rtol=1e-5)
+        (-scored.mean()).backward()
+    assert torch.isfinite(m.test_logits.grad).all()
+    assert m.test_logits.grad[0] != 0 and m.test_logits.grad[1] != 0
+    # Non-transitive compatibility can change the entire partition, not only
+    # the representative. Preserve all memberships from the sampling pass.
+    chain=np.array([[[1,1,0],[1,1,1],[0,1,1]]],dtype=bool)
+    raw=torch.tensor([[3.,3.-1e-4,2.,0.]],device=device)
+    _, topology=group_logits(raw,chain,return_indices=True)
+    flipped=raw.clone();flipped[0,1]+=2e-4;flipped.requires_grad_()
+    replay=group_logits(flipped,chain,group_indices=topology)
+    assert torch.isfinite(replay).tolist()==[[True,False,True,True]]
+    (-replay.log_softmax(-1)[0,0]).backward()
+    assert torch.isfinite(flipped.grad).all()
+    print('near-tied representatives and complete-link topology replay PASS',device,amp,flush=True)
+
 if __name__=='__main__':
-    torch.set_num_threads(4);test_group_math();test_scripted_selection();test_sampling_scoring();test_criterion_class_routing()
-    if torch.cuda.is_available():test_sampling_scoring('cuda',True)
+    torch.set_num_threads(4);test_group_math();test_scripted_selection();test_sampling_scoring();test_criterion_class_routing();test_representative_flip()
+    if torch.cuda.is_available():
+        test_sampling_scoring('cuda',True);test_representative_flip('cuda',True)

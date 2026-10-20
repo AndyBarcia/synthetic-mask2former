@@ -41,9 +41,7 @@ through both rollout generation and likelihood scoring.
 
 ## Verification
 
-Focused checks: `tests/test_map_state_decoder.py`, `tests/test_eof_defaults.py`,
-and `tests/test_mask_groups.py`. Invoke each with `runpy.run_path` from the
-repository root inside the training container. Checks cover tree/linear parity,
-causal isolation, group probability and EOF conservation, complete-link grouping,
+Focused checks: `tests/test_eof_defaults.py` and `tests/test_mask_groups.py`. Invoke each with `runpy.run_path` from the
+repository root inside the training container. Checks cover group probability and EOF conservation, complete-link grouping,
 shared gradients, sampled online/rescored likelihood agreement, actual criterion
 class routing for RLOO and best-of-N, and CUDA AMP generation/backpropagation.
