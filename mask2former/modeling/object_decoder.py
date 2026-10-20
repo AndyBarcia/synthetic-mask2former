@@ -1,54 +1,16 @@
-"""Autoregressive pointer decoder over the mask query embeddings."""
+"""Map-conditioned pointer decoder over mask query embeddings."""
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+from .map_encoder import MapEncoder
 from .mask_groups import mask_compatibility, group_logits
-
-
-def apply_rotary_positions(x, positions):
-    """Rotate adjacent head-dimension pairs; x has shape [B, H, T, D]."""
-    frequency = 10000.0 ** (-torch.arange(0, x.shape[-1], 2, device=x.device).float() / x.shape[-1])
-    angles = positions.float()[..., None] * frequency
-    cosine = angles.cos()[:, None].to(x.dtype)
-    sine = angles.sin()[:, None].to(x.dtype)
-    even, odd = x[..., 0::2], x[..., 1::2]
-    return torch.stack((even * cosine - odd * sine, even * sine + odd * cosine), dim=-1).flatten(-2)
-
-
-class RotaryDecoderLayer(nn.TransformerDecoderLayer):
-    """Post-norm decoder layer with RoPE on projected self-attention Q/K."""
-
-    def forward(self, tgt, memory, tgt_mask=None, memory_mask=None, *, positions):
-        batch, steps, width = tgt.shape
-        heads = self.self_attn.num_heads
-        query, key, value = F.linear(
-            tgt, self.self_attn.in_proj_weight, self.self_attn.in_proj_bias
-        ).chunk(3, dim=-1)
-        query, key, value = [
-            tensor.reshape(batch, steps, heads, width // heads).transpose(1, 2)
-            for tensor in (query, key, value)
-        ]
-        query = apply_rotary_positions(query, positions)
-        key = apply_rotary_positions(key, positions)
-        # MultiheadAttention bool masks mark blocked entries; SDPA marks allowed.
-        allowed = None
-        if tgt_mask is not None:
-            allowed = ~tgt_mask
-            if allowed.ndim == 3:
-                allowed = allowed.reshape(batch, heads, steps, steps)
-        attended = F.scaled_dot_product_attention(query, key, value, attn_mask=allowed)
-        attended = attended.transpose(1, 2).reshape(batch, steps, width)
-        attended = self.self_attn.out_proj(attended)
-        decoded = self.norm1(tgt + self.dropout1(attended))
-        decoded = self.norm2(decoded + self._mha_block(decoded, memory, memory_mask, None))
-        return self.norm3(decoded + self._ff_block(decoded))
 
 
 class ObjectDecoder(nn.Module):
     def __init__(self, mask_dim, hidden_dim, num_queries, num_layers, num_heads,
                  dim_feedforward, mask_iou_threshold=0.8, prefix_tree_branches=4,
-                 position_encoding=False, rope=False, map_decoder=False, eof_threshold=.5,
+                 eof_threshold=.5,
                  collapse_masks=False, collapse_iou_threshold=.8):
         super().__init__()
         if not 0 <= mask_iou_threshold <= 1:
@@ -68,30 +30,12 @@ class ObjectDecoder(nn.Module):
         self.mask_iou_threshold = mask_iou_threshold
         self.input_mask_projection = nn.Linear(mask_dim, hidden_dim)
         self.output_mask_projection = nn.Linear(mask_dim, hidden_dim)
-        self.bos = nn.Parameter(torch.zeros(hidden_dim), requires_grad=not map_decoder)
         self.eof = nn.Parameter(torch.zeros(hidden_dim))
         # This key remains available if previous masks cover an entire feature map.
         self.null_image_token = nn.Parameter(torch.zeros(3, hidden_dim))
         nn.init.normal_(self.null_image_token, std=0.02)
-        self.position = nn.Embedding(num_queries + 1, hidden_dim)
-        self.position_encoding = position_encoding
-        self.rope = rope
-        self.map_decoder = map_decoder
-        if map_decoder and (position_encoding or rope):
-            raise ValueError("Map decoding uses map geometry instead of sequence positions")
-        if map_decoder:
-            self.position = nn.Embedding(num_queries + 3, hidden_dim)
-            self.inspection_cls = nn.Parameter(torch.randn(hidden_dim) * .02)
-            self.inspection_void = nn.Parameter(torch.randn(hidden_dim) * .02)
-            self.inspection_geometry = nn.Linear(3, hidden_dim)
-            self.inspection_encoder = nn.TransformerEncoder(
-                nn.TransformerEncoderLayer(hidden_dim, num_heads, dim_feedforward,
-                    dropout=0., batch_first=True), num_layers=2, enable_nested_tensor=False)
-        if rope and (hidden_dim // num_heads) % 2:
-            raise ValueError("RoPE requires an even attention head dimension")
-        self.position.requires_grad_(position_encoding and not rope)
-        layer_type = RotaryDecoderLayer if rope else nn.TransformerDecoderLayer
-        layer = layer_type(
+        self.map_encoder = MapEncoder(hidden_dim, num_heads, dim_feedforward, num_queries)
+        layer = nn.TransformerDecoderLayer(
             d_model=hidden_dim, nhead=num_heads, dim_feedforward=dim_feedforward,
             dropout=0.0, batch_first=True,
         )
@@ -150,86 +94,6 @@ class ObjectDecoder(nn.Module):
                     weights[batch, node, token] = count
         return previous, positions, ancestors, weights
 
-    def inspection_summaries(self, mask_tokens, image_features, regions,
-                             previous_tokens, ancestors=None, positions=None, node_indices=None):
-        """Encode visible query regions and uncovered image at each summary node.
-
-        Painting uses last-mask-wins ownership on the coarsest image grid.
-        Only ancestors of the summary participate; later masks and sibling
-        branches cannot leak into its map. Mask boundaries are discrete, while
-        pooled image features and query embeddings remain differentiable.
-        """
-        rows, nodes = node_indices
-        if not len(rows):
-            return rows, nodes, mask_tokens.new_empty((0, mask_tokens.shape[-1]))
-        steps = previous_tokens.shape[1]
-        indices = torch.arange(steps, device=previous_tokens.device)
-        context = (indices[None] <= nodes[:, None] if ancestors is None
-                   else ancestors[rows, nodes])
-        tokens = previous_tokens[rows]
-        valid = context & (tokens >= 0) & (tokens < self.num_queries)
-        # Tree storage indices are not sequence positions on branched paths.
-        ranks_source = (positions[rows] + 1 if positions is not None else
-                        ancestors[rows].sum(-1) if ancestors is not None else indices[None] + 1)
-        ranks = torch.zeros(len(rows), self.num_queries, device=tokens.device, dtype=torch.long)
-        ranks.scatter_reduce_(1, tokens.clamp(0, self.num_queries - 1),
-                              ranks_source * valid, reduce='amax')
-        painted_rank, owner = (regions[rows].long() * ranks[:, :, None]).max(1)
-        visible = (owner[:, None] == torch.arange(self.num_queries, device=tokens.device)[None, :, None])
-        visible &= painted_rank[:, None] > 0
-        visible = torch.cat((visible, (painted_rank == 0)[:, None]), dim=1)
-        area = visible.float().mean(-1)
-        weights = visible.to(image_features.dtype)
-        pooled = torch.bmm(weights, image_features[rows]) / weights.sum(-1, keepdim=True).clamp_min(1)
-        raw_area = torch.cat((regions[rows].float().mean(-1), area[:, -1:]), dim=1)
-        order = F.pad(ranks.float() / (ranks.amax(-1, keepdim=True).clamp_min(1)), (0, 1))
-        geometry = torch.stack((area, raw_area, order), dim=-1).to(mask_tokens.dtype)
-        query_tokens = torch.cat((mask_tokens[rows], self.inspection_void.expand(len(rows), 1, -1)), dim=1)
-        region_tokens = query_tokens + pooled + self.inspection_geometry(geometry)
-        if self.map_decoder:
-            # Pack only visible segments (including uncovered image). This keeps
-            # the expensive per-state encoder proportional to the painted map.
-            visible_valid = area > 0
-            count = visible_valid.sum(-1)
-            slots = visible_valid.long().argsort(dim=-1, descending=True, stable=True)
-            slots = slots[:, :int(count.max())]
-            region_tokens = region_tokens.gather(1, slots[..., None].expand(-1, -1, region_tokens.shape[-1]))
-            area = area.gather(1, slots)
-        tokens = torch.cat((self.inspection_cls.expand(len(rows), 1, -1), region_tokens), dim=1)
-        padding = F.pad(area == 0, (1, 0), value=False)
-        encoded = self.inspection_encoder(tokens, src_key_padding_mask=padding)
-        return rows, nodes, encoded[:, 0]
-
-    def map_states(self, mask_tokens, features, regions, previous, ancestors, positions, last_only=False):
-        """Encode every prefix independently, including the initial empty map."""
-        from torch.utils.checkpoint import checkpoint
-        batch, steps = previous.shape
-        rows = torch.arange(batch, device=previous.device).repeat_interleave(steps)
-        nodes = torch.arange(steps, device=previous.device).repeat(batch)
-        if last_only:
-            rows = torch.arange(batch, device=previous.device)
-            nodes = torch.full_like(rows, steps - 1)
-        result = []
-        for offset in range(0, len(rows), 16):
-            indices = (rows[offset:offset+16], nodes[offset:offset+16])
-            def encode(masks, pixels, indices=indices):
-                # Sampling and scoring share an outer autocast context in RL.
-                # Disable its weight cache here so checkpoint forward/recompute
-                # see the same casts, independent of earlier no-grad rollouts.
-                with torch.autocast(device_type=masks.device.type,
-                                    enabled=torch.is_autocast_enabled(masks.device.type),
-                                    cache_enabled=False):
-                    return self.inspection_summaries(masks, pixels, regions, previous,
-                        ancestors, positions, node_indices=indices)[2]
-            result.append(checkpoint(encode, mask_tokens, features, use_reentrant=False)
-                          if self.training and torch.is_grad_enabled() else encode(mask_tokens, features))
-        encoded = torch.cat(result)
-        if last_only:
-            states = encoded.new_zeros(batch, steps, encoded.shape[-1])
-            states[:, -1] = encoded
-            return states
-        return encoded.reshape(batch, steps, -1)
-
     @staticmethod
     def _accumulate_prior(prior, valid, ancestors=None):
         prior = prior & valid.unsqueeze(-1)
@@ -270,7 +134,7 @@ class ObjectDecoder(nn.Module):
         return F.pad(blocked, (0, 1), value=False)
 
     def _memory_mask(self, regions, previous_tokens, ancestors=None):
-        """Block the union of masks emitted up to each autoregressive position."""
+        """Block the union of masks emitted up to each map prefix."""
         batch_size, num_queries, spatial_tokens = regions.shape
         indices = previous_tokens.clamp(0, num_queries - 1)
         prior_regions = regions.gather(
@@ -298,30 +162,15 @@ class ObjectDecoder(nn.Module):
     def _forward_impl(self, mask_embeddings, image_features, image_regions, previous_tokens,
                       vocabulary_exclusions, *, positions=None, ancestors=None,
                       return_hidden=False, map_last_only=False):
-        """Return next-token logits with causal image and vocabulary attention."""
+        """Return next-token logits from independent map summaries."""
         if len(image_features) != 3 or len(image_regions) != 3:
             raise ValueError("Object decoder requires three image feature levels")
         mask_tokens = self.input_mask_projection(mask_embeddings)
         vocabulary = torch.cat((mask_tokens, self.eof.expand(mask_tokens.shape[0], 1, -1)), dim=1)
-        previous = vocabulary.gather(
-            1, previous_tokens.clamp_min(0).unsqueeze(-1).expand(-1, -1, vocabulary.shape[-1])
-        )
-        previous = torch.where(
-            (previous_tokens < 0).unsqueeze(-1), self.bos, previous
-        )
-        if self.map_decoder:
-            previous = self.map_states(mask_tokens, image_features[0], image_regions[0],
-                previous_tokens, ancestors, positions, last_only=map_last_only)
+        previous = self.map_encoder(mask_tokens, image_features[0], image_regions[0],
+            previous_tokens, ancestors, positions, last_only=map_last_only)
         steps = previous.shape[1]
-        if self.position_encoding and not self.rope:
-            previous = previous + (self.position.weight[:steps] if positions is None else self.position(positions))
-        causal_mask = torch.ones(steps, steps, dtype=torch.bool, device=previous.device).triu(1)
-        if ancestors is not None:
-            causal_mask = (~ancestors)[:, None].expand(-1, self.num_heads, -1, -1).reshape(
-                mask_tokens.shape[0] * self.num_heads, steps, steps
-            )
-        if self.map_decoder:
-            causal_mask = ~torch.eye(steps, device=previous.device, dtype=torch.bool)
+        state_mask = ~torch.eye(steps, device=previous.device, dtype=torch.bool)
         vocabulary_mask = self._vocabulary_mask(vocabulary_exclusions, previous_tokens, ancestors)
         vocabulary_mask = vocabulary_mask[:, None].expand(-1, self.num_heads, -1, -1).reshape(
             mask_tokens.shape[0] * self.num_heads, steps, self.num_queries + 1
@@ -335,11 +184,8 @@ class ObjectDecoder(nn.Module):
             ), dim=1)
             decoded = layer(
                 decoded, image_memory,
-                tgt_mask=causal_mask,
+                tgt_mask=state_mask,
                 memory_mask=self._memory_mask(image_regions[level_index], previous_tokens, ancestors),
-                **({"positions": positions if positions is not None else
-                    torch.arange(steps, device=decoded.device)[None].expand(decoded.shape[0], -1)}
-                   if self.rope else {}),
             )
             attended = self.vocabulary_attention[layer_index](
                 decoded, vocabulary, vocabulary, attn_mask=vocabulary_mask,
@@ -375,20 +221,18 @@ class ObjectDecoder(nn.Module):
         query = self._attention_heads(query, attention.num_heads)
         # SDPA uses True for allowed keys, unlike MultiheadAttention.
         attended = F.scaled_dot_product_attention(
-            query, *kv, attn_mask=(~blocked)[:, None, None, :],
+            query, *kv, attn_mask=(~blocked)[:, None, :, :],
         )
-        attended = attended.transpose(1, 2).reshape(query.shape[0], 1, width)
+        attended = attended.transpose(1, 2).reshape(query.shape[0], query.shape[2], width)
         return attention.out_proj(attended)
 
     def _prepare_decode_cache(self, mask_embeddings, image_features, regions,
                               exclusions, max_steps):
         """Cache fixed projections and allocate incremental, rollout-local state.
 
-        Only use under no_grad: sampled trajectories are scored separately in a
-        full causal pass with gradients. No cache survives a rollout or update.
+        Projected tensors retain their gradients during differentiable rollouts.
+        No cache survives a rollout or optimizer update.
         """
-        if torch.is_grad_enabled():
-            raise RuntimeError("Incremental decoding caches require no_grad")
         if len(image_features) != 3 or len(regions) != 3:
             raise ValueError("Object decoder requires three image feature levels")
         batch_size = mask_embeddings.shape[0]
@@ -405,7 +249,9 @@ class ObjectDecoder(nn.Module):
                          for index, layer in enumerate(self.layers.layers)],
             "vocabulary_kv": [self._project_attention_kv(attention, vocabulary)
                               for attention in self.vocabulary_attention],
-            "self_kv": [None for _ in self.layers.layers],
+            "features": image_features,
+            "pool_cache": {},
+            "history": [],
             "regions": regions,
             "exclusions": exclusions,
             "covered": [region.new_zeros(batch_size, region.shape[-1] + 1) for region in regions],
@@ -416,8 +262,6 @@ class ObjectDecoder(nn.Module):
 
     def _decode_step(self, previous_token, cache):
         """Consume one token (BOS=-1), returning logits for the next action."""
-        if torch.is_grad_enabled():
-            raise RuntimeError("Incremental decoding caches require no_grad")
         step = cache["step"]
         if step >= cache["max_steps"]:
             raise ValueError("Decode cache capacity exceeded")
@@ -429,46 +273,27 @@ class ObjectDecoder(nn.Module):
         cache["blocked"][:, :-1] |= cache["exclusions"][rows, query_index] & valid[:, None]
         for covered, regions in zip(cache["covered"], cache["regions"]):
             covered[:, :-1] |= regions[rows, query_index] & valid[:, None]
-        decoded = vocabulary[rows, previous_token.clamp_min(0)][:, None]
-        decoded = torch.where((previous_token < 0)[:, None, None], self.bos, decoded)
-        if self.position_encoding and not self.rope:
-            decoded = decoded + self.position.weight[step]
-        positions = torch.full((batch_size, 1), step, device=decoded.device, dtype=torch.long)
+        cache["history"].append(previous_token)
+        previous = torch.stack(cache["history"], 1)
+        decoded = self.map_encoder(vocabulary[:, :-1], cache["features"][0], cache["regions"][0],
+            previous, None, None, last_only=True, pool_cache=cache["pool_cache"])[:, -1:]
         for index, layer in enumerate(self.layers.layers):
-            query, key, value = F.linear(
-                decoded, layer.self_attn.in_proj_weight, layer.self_attn.in_proj_bias,
-            ).chunk(3, dim=-1)
-            query, key, value = [self._attention_heads(tensor, self.num_heads)
-                                 for tensor in (query, key, value)]
-            if self.rope:
-                query = apply_rotary_positions(query, positions)
-                key = apply_rotary_positions(key, positions)
-            if cache["self_kv"][index] is None:
-                shape = (batch_size, self.num_heads, cache["max_steps"], width // self.num_heads)
-                cache["self_kv"][index] = (key.new_empty(shape), value.new_empty(shape))
-            keys, values = cache["self_kv"][index]
-            keys[:, :, step:step + 1] = key
-            values[:, :, step:step + 1] = value
-            # The current query may attend to every cached token, including itself.
-            # is_causal=True would incorrectly align a length-one query to BOS.
-            attended = F.scaled_dot_product_attention(query, keys[:, :, :step + 1],
-                                                      values[:, :, :step + 1])
-            attended = attended.transpose(1, 2).reshape(batch_size, 1, width)
-            decoded = layer.norm1(decoded + layer.dropout1(layer.self_attn.out_proj(attended)))
+            attended = layer.self_attn(decoded, decoded, decoded, need_weights=False)[0]
+            decoded = layer.norm1(decoded + layer.dropout1(attended))
             attended = self._cached_cross_attention(layer.multihead_attn, decoded,
-                                                     cache["image_kv"][index], cache["covered"][index % 3])
+                                                     cache["image_kv"][index], cache["covered"][index % 3][:, None])
             decoded = layer.norm2(decoded + layer.dropout2(attended))
             decoded = layer.norm3(decoded + layer._ff_block(decoded))
             attended = self._cached_cross_attention(self.vocabulary_attention[index], decoded,
-                                                     cache["vocabulary_kv"][index], cache["blocked"])
+                                                     cache["vocabulary_kv"][index], cache["blocked"][:, None])
             decoded = self.vocabulary_norm[index](decoded + attended)
         cache["step"] += 1
         return (self.norm(decoded) @ cache["output_vocabulary"].transpose(1, 2))[:, 0] * self.scale
 
     def _rollout_cache(self, use_cache, mask_embeddings, image_features, regions,
                        exclusions, max_steps):
-        # Preserve differentiable rollouts and custom forward implementations.
-        if (use_cache and not self.map_decoder and not torch.is_grad_enabled()
+        # Respect custom forward implementations.
+        if (use_cache
                 and getattr(self.forward, "__func__", None) is ObjectDecoder.forward):
             return self._prepare_decode_cache(mask_embeddings, image_features, regions,
                                               exclusions, max_steps)
@@ -505,7 +330,7 @@ class ObjectDecoder(nn.Module):
         for _ in range(num_queries):
             logits = (self._decode_step(tokens[:, -1], cache) if cache is not None else
                       self(mask_embeddings, image_features, image_regions, tokens, exclusions,
-                           **({"map_last_only": True} if self.map_decoder else {}))[:, -1])
+                           map_last_only=True)[:, -1])
             logits[:, :num_queries].masked_fill_(unavailable, -torch.inf)
             selection_logits = group_logits(logits.float(), compatibility) if compatibility is not None else logits
             next_token = self._greedy_action(selection_logits)
@@ -556,7 +381,7 @@ class ObjectDecoder(nn.Module):
         for _ in range(max_steps):
             logits = (self._decode_step(previous[:, -1], cache) if cache is not None else
                       self(mask_embeddings, image_features, regions, previous, exclusions,
-                           **({"map_last_only": True} if self.map_decoder else {}))[:, -1]).clone()
+                           map_last_only=True)[:, -1]).clone()
             logits[:, :num_queries].masked_fill_(unavailable.clone(), -torch.inf)
             if compatibility is not None:
                 logits = group_logits(logits.float(), compatibility)
@@ -598,10 +423,10 @@ class ObjectDecoder(nn.Module):
             return orders, log_probability, actions
         return orders, log_probability
 
-    def autoregressive_log_probability(self, mask_embeddings, image_features,
+    def trajectory_log_probability(self, mask_embeddings, image_features,
                                        mask_logits, image_sizes, trajectories,
                                        query_bias_logits=None, *, query_classes=None):
-        """Score sampled mask and EOF actions in one causal decoder pass."""
+        """Score sampled mask and EOF actions from their prefix maps."""
         batch_size, num_queries = mask_embeddings.shape[:2]
         steps = max(map(len, trajectories))
         actions = torch.full(
@@ -783,12 +608,12 @@ class ObjectDecoder(nn.Module):
 
     def permutation_log_probability(self, mask_embeddings, image_features, mask_logits,
                                     image_sizes, proposal_mask, orders):
-        """Score fixed permutations in one causal decoder pass per batch."""
+        """Score fixed permutations from their prefix maps."""
         batch_size, num_queries = proposal_mask.shape
         counts = proposal_mask.sum(-1)
         steps = int(counts.max().item())
         if not steps:
-            return self.bos.sum().expand(batch_size) * 0.0
+            return self.eof.sum().expand(batch_size) * 0.0
         actions = torch.full(
             (batch_size, steps), num_queries, dtype=torch.long, device=proposal_mask.device
         )

@@ -475,7 +475,7 @@ class SetCriterion(nn.Module):
             sampled_reward, greedy_reward, log_probability
         )
         # An all-empty batch still needs a graph-connected zero for RL-only runs.
-        rl_loss = rl_loss + self.object_decoder.bos.sum() * 0.0
+        rl_loss = rl_loss + self.object_decoder.eof.sum() * 0.0
         record_rl_diagnostics(sampled_reward, greedy_reward, advantage,
                               log_probability, rl_loss, reward_mode=self.object_rl_reward)
         return {"loss_object_rl": rl_loss}
@@ -536,7 +536,7 @@ class SetCriterion(nn.Module):
                     trajectory for trajectory, wins in zip(best_trajectories, winners.tolist())
                     if wins
                 ]
-                log_probability = self.object_decoder.autoregressive_log_probability(
+                log_probability = self.object_decoder.trajectory_log_probability(
                     policy_inputs[0][winners],
                     [feature[winners] for feature in policy_inputs[1]],
                     policy_inputs[2][winners], policy_inputs[3], winning_trajectories,
@@ -598,7 +598,7 @@ class SetCriterion(nn.Module):
         for start in range(0, k, rollout_batch):
             repeats = min(rollout_batch, k - start)
             scored_inputs = self._repeat_policy_inputs(policy_inputs, repeats)
-            scores = self.object_decoder.autoregressive_log_probability(
+            scores = self.object_decoder.trajectory_log_probability(
                 *scored_inputs,
                 trajectories[start * batch_size:(start + repeats) * batch_size],
                 query_bias_logits=query_bias.repeat(repeats, 1) if query_bias is not None else None,
@@ -609,7 +609,7 @@ class SetCriterion(nn.Module):
         rl_loss, advantage = self._rl_policy_loss(
             sampled_reward, greedy_reward, log_probability
         )
-        rl_loss = rl_loss + self.object_decoder.bos.sum() * 0.0
+        rl_loss = rl_loss + self.object_decoder.eof.sum() * 0.0
         sampled_lengths = sampled_reward.new_tensor(
             [len(order) for order in sampled]
         ).reshape(k, batch_size)
