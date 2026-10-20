@@ -520,24 +520,68 @@ class ObjectDecoder(nn.Module):
             for batch_index in range(batch_size)
         ]
 
+    @torch.no_grad()
+    def rollout_samples_and_greedy(self, mask_embeddings, image_features, mask_logits,
+                                   image_sizes, num_samples, *, max_steps=32,
+                                   query_classes=None, query_bias_logits=None,
+                                   state_cache=None):
+        """Decode all samples and the greedy baseline in a shared state batch.
+
+        Copies are sample-major, with the greedy batch last. Fixed proposal
+        regions, IoU exclusions, and complete-link compatibility are prepared
+        once per source image. Sampling and differentiable rescoring must use
+        separate state scopes.
+        """
+        if num_samples < 1:
+            raise ValueError("num_samples must be positive")
+        batch = mask_embeddings.shape[0]
+        repeats = num_samples + 1
+        regions = [x.repeat(repeats, 1, 1) for x in self.prepare_regions(mask_logits, image_sizes)]
+        exclusions = self.prepare_vocabulary_exclusions(mask_logits).repeat(repeats, 1, 1)
+        compatibility = (mask_compatibility(mask_logits, query_classes, self.collapse_iou_threshold)
+                         if self.collapse_masks else None)
+        if compatibility is not None:
+            compatibility = compatibility[None].repeat(repeats, axis=0).reshape(
+                repeats * batch, self.num_queries, self.num_queries)
+        orders, scores, actions = self.rollout(
+            mask_embeddings.repeat(repeats, 1, 1),
+            [x.repeat(repeats, 1, 1) for x in image_features],
+            None, image_sizes,  # All mask-derived data is supplied in _prepared.
+            max_steps=max_steps, return_actions=True, sample_rows=num_samples * batch,
+            query_bias_logits=(query_bias_logits.repeat(repeats, 1)
+                               if query_bias_logits is not None else None),
+            image_ids=torch.arange(batch, device=mask_embeddings.device).repeat(repeats),
+            state_cache={} if state_cache is None else state_cache,
+            _prepared=(regions, exclusions, compatibility))
+        return orders[:-batch], orders[-batch:], actions[:-batch], actions[-batch:]
+
     def rollout(self, mask_embeddings, image_features, mask_logits, image_sizes,
                 sample=True, max_steps=32, return_diagnostics=False,
                 return_actions=False, query_bias_logits=None, *, use_cache=True, greedy_eof_threshold=None,
-                query_classes=None, state_cache=None, image_ids=None):
+                query_classes=None, state_cache=None, image_ids=None,
+                sample_rows=None, _prepared=None):
         """Generate query orders and sequence log probabilities for policy gradients.
 
         A capped rollout is treated as an implicit EOF after the last selected query.
         """
         batch_size, num_queries = mask_embeddings.shape[:2]
         max_steps = min(max_steps, num_queries + 1)
-        regions = self.prepare_regions(mask_logits, image_sizes)
-        exclusions = self.prepare_vocabulary_exclusions(mask_logits)
-        compatibility = (mask_compatibility(mask_logits, query_classes, self.collapse_iou_threshold)
-                         if self.collapse_masks else None)
+        if _prepared is None:
+            regions = self.prepare_regions(mask_logits, image_sizes)
+            exclusions = self.prepare_vocabulary_exclusions(mask_logits)
+            compatibility = (mask_compatibility(mask_logits, query_classes, self.collapse_iou_threshold)
+                             if self.collapse_masks else None)
+        else:
+            regions, exclusions, compatibility = _prepared
+        sampled_count = (batch_size if sample else 0) if sample_rows is None else sample_rows
+        if not 0 <= sampled_count <= batch_size:
+            raise ValueError("sample_rows must be within the rollout batch")
+        sampled_rows = torch.arange(batch_size, device=mask_embeddings.device) < sampled_count
         unavailable = torch.zeros(batch_size, num_queries, dtype=torch.bool, device=mask_embeddings.device)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=mask_embeddings.device)
         previous = torch.full((batch_size, 1), -1, dtype=torch.long, device=mask_embeddings.device)
-        action_steps = []
+        action_buffer = torch.full((batch_size, max_steps), -1, dtype=torch.long, device=mask_embeddings.device)
+        rows = torch.arange(batch_size, device=mask_embeddings.device)
         log_probability = mask_embeddings.new_zeros(batch_size)
         diagnostics = {
             key: torch.zeros(batch_size, device=mask_embeddings.device)
@@ -545,15 +589,27 @@ class ObjectDecoder(nn.Module):
         } if return_diagnostics else None
         cache = self._rollout_cache(use_cache, mask_embeddings, image_features, regions, exclusions, max_steps,
                                     state_cache=state_cache, image_ids=image_ids)
-        for _ in range(max_steps):
+        for step in range(max_steps):
+            if cache is not None and not torch.is_grad_enabled():
+                cache["inference_capacity"] = min(step + 1, num_queries + 1)
             logits = (self._decode_step(previous[:, -1], cache) if cache is not None else
                       self(mask_embeddings, image_features, regions, previous, exclusions,
                            map_last_only=True, state_cache=state_cache, image_ids=image_ids)[:, -1]).clone()
-            logits[:, :num_queries].masked_fill_(unavailable.clone(), -torch.inf)
+            logits[:, :num_queries].masked_fill_(unavailable | finished[:, None], -torch.inf)
+            # Finished paths have no policy contribution. A degenerate EOF
+            # distribution avoids regrouping their unused vocabulary forever.
+            logits[:, -1].masked_fill_(finished, 0)
             if compatibility is not None:
                 logits = group_logits(logits.float(), compatibility)
             distribution = torch.distributions.Categorical(logits=logits)
-            token = distribution.sample() if sample else self._greedy_action(logits, greedy_eof_threshold)
+            if sampled_count == batch_size:
+                token = distribution.sample()
+            elif sampled_count == 0:
+                token = self._greedy_action(logits, greedy_eof_threshold)
+            else:
+                # Greedy rows consume no random draws and retain the strict EOF gate.
+                token = torch.cat((torch.distributions.Categorical(logits=logits[:sampled_count]).sample(),
+                    self._greedy_action(logits[sampled_count:], greedy_eof_threshold)))
             active = ~finished
             if diagnostics is not None:
                 with torch.no_grad():
@@ -563,21 +619,20 @@ class ObjectDecoder(nn.Module):
                     diagnostics["top1_probability"] += torch.where(active, probabilities.max(-1).values, 0)
                     diagnostics["eof_probability"] += torch.where(active, probabilities[:, -1], 0)
                     diagnostics["available_masks"] += torch.where(active, (~unavailable).sum(-1), 0)
-            if sample:
+            if sampled_count:
                 log_probability = log_probability + torch.where(
-                    active, distribution.log_prob(token), 0.0
+                    active & sampled_rows, distribution.log_prob(token), 0.0
                 )
-            action_steps.append(torch.where(active, token, -1).detach())
+            action_buffer[:, step] = torch.where(active, token, -1).detach()
             chosen = active & (token != num_queries)
-            chosen_batch = torch.arange(batch_size, device=unavailable.device)[chosen]
-            unavailable[chosen_batch] |= exclusions[chosen_batch, token[chosen]]
+            unavailable = unavailable | (exclusions[rows, token.clamp_max(num_queries - 1)] & chosen[:, None])
             finished = finished | (token == num_queries)
             if finished.all():
                 break
             next_input = torch.where(finished, num_queries, token)[:, None]
             previous = next_input if cache is not None else torch.cat((previous, next_input), dim=1)
         # Transfer the complete ragged trajectories once, rather than each token.
-        rows = torch.stack(action_steps, 1).tolist() if action_steps else [[] for _ in range(batch_size)]
+        rows = action_buffer.tolist()
         actions = [[token for token in row if token >= 0] for row in rows]
         orders = [[token for token in row if token != num_queries] for row in actions]
         if diagnostics is not None:

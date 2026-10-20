@@ -38,14 +38,20 @@ def group_logits(logits, compatibility):
     labels = np.broadcast_to(np.arange(queries + 1), raw.shape).copy()
     for image in range(batch):
         for state, row in enumerate(raw[image]):
-            remaining = sorted(np.flatnonzero(np.isfinite(row[:-1])), key=lambda q: (-row[q], q))
-            while remaining:
-                anchor = remaining.pop(0)
-                group, rest = [anchor], []
-                for query in remaining:
-                    (group if compatibility[image, query, group].all() else rest).append(query)
-                remaining = rest
-                labels[image, state, group] = anchor
+            remaining = np.asarray(sorted(np.flatnonzero(np.isfinite(row[:-1])),
+                                          key=lambda q: (-row[q], q)), dtype=np.int64)
+            while remaining.size:
+                anchor, rest = remaining[0], remaining[1:]
+                # Only candidates compatible with the anchor can join. Update
+                # their eligibility in bulk as each complete-link member joins.
+                allowed = compatibility[image, rest, anchor].copy()
+                selected = np.zeros(rest.size, dtype=bool)
+                for index in np.flatnonzero(allowed):
+                    if allowed[index]:
+                        selected[index] = True
+                        allowed &= compatibility[image, rest, rest[index]]
+                labels[image, state, rest[selected]] = anchor
+                remaining = rest[~selected]
     indices = torch.as_tensor(labels, device=logits.device)
     # One batched segmented logsumexp replaces up to Q tiny GPU reductions.
     maxima = torch.full_like(per_image, -torch.inf).scatter_reduce(

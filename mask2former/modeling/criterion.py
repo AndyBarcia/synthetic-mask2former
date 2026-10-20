@@ -507,31 +507,15 @@ class SetCriterion(nn.Module):
             outputs["pred_masks"].detach(),
             outputs["object_decoder_image_sizes"],
         )
-        batch_size = policy_inputs[0].shape[0]
         k = self.object_rl_num_samples
-        rollout_batch = 4
-        sampled_orders = []
-        trajectories = []
         sampling_states = {}
         with torch.no_grad():
-            for start in range(0, k, rollout_batch):
-                repeats = min(rollout_batch, k - start)
-                sampled_inputs = self._repeat_policy_inputs(policy_inputs, repeats)
-                orders, _, actions = self.object_decoder.rollout(
-                    *sampled_inputs, sample=True, max_steps=self.object_rl_max_steps,
-                    return_actions=True,
-                    query_bias_logits=query_bias.repeat(repeats, 1) if query_bias is not None else None,
-                    **self._policy_state_kwargs(policy_inputs, sampling_states, repeats),
-                    **self._policy_class_kwargs(outputs, repeats=repeats),
+            sampled_orders, greedy_orders, trajectories, greedy_actions = (
+                self.object_decoder.rollout_samples_and_greedy(
+                    *policy_inputs, num_samples=k, max_steps=self.object_rl_max_steps,
+                    query_bias_logits=query_bias, state_cache=sampling_states,
+                    **self._policy_class_kwargs(outputs),
                 )
-                sampled_orders.extend(orders)
-                trajectories.extend(actions)
-            greedy_orders, _, _ = self.object_decoder.rollout(
-                *policy_inputs, sample=False, max_steps=self.object_rl_max_steps,
-                return_actions=True,
-                query_bias_logits=query_bias,
-                **self._policy_state_kwargs(policy_inputs, sampling_states),
-                **self._policy_class_kwargs(outputs),
             )
             sampled_reward, greedy_reward = self._object_rollout_rewards(
                 sampled_orders, greedy_orders, outputs, targets
@@ -592,24 +576,12 @@ class SetCriterion(nn.Module):
         trajectories = []
         sampling_states = {}
         with torch.no_grad():
-            for start in range(0, k, rollout_batch):
-                repeats = min(rollout_batch, k - start)
-                sampled_inputs = self._repeat_policy_inputs(policy_inputs, repeats)
-                orders, _, actions = self.object_decoder.rollout(
-                    *sampled_inputs, sample=True, max_steps=self.object_rl_max_steps,
-                    return_actions=True,
-                    query_bias_logits=query_bias.repeat(repeats, 1) if query_bias is not None else None,
-                    **self._policy_state_kwargs(policy_inputs, sampling_states, repeats),
-                    **self._policy_class_kwargs(outputs, repeats=repeats),
+            sampled, greedy, trajectories, greedy_actions = (
+                self.object_decoder.rollout_samples_and_greedy(
+                    *policy_inputs, num_samples=k, max_steps=self.object_rl_max_steps,
+                    query_bias_logits=query_bias, state_cache=sampling_states,
+                    **self._policy_class_kwargs(outputs),
                 )
-                sampled.extend(orders)
-                trajectories.extend(actions)
-            greedy, _, greedy_actions = self.object_decoder.rollout(
-                *policy_inputs, sample=False, max_steps=self.object_rl_max_steps,
-                return_actions=True,
-                query_bias_logits=query_bias,
-                **self._policy_state_kwargs(policy_inputs, sampling_states),
-                **self._policy_class_kwargs(outputs),
             )
             sampled_reward, greedy_reward = self._object_rollout_rewards(
                 sampled, greedy, outputs, targets
