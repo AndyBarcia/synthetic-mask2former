@@ -219,7 +219,8 @@ class ObjectDecoder(nn.Module):
         summaries = self.map_encoder.encode_maps(cache["vocabulary"][:, :-1],
             cache["features"][0], cache["regions"][0], owner, cache["pool_cache"],
             state_cache=scope["maps"], image_ids=cache["image_ids"],
-            merge_states=cache["merge_states"], unique_states=cache["unique_maps"])
+            merge_states=cache["merge_states"], unique_states=cache["unique_maps"],
+            inference_capacity=cache.get("inference_capacity"))
         memo = scope["decoder"] if cache["merge_states"] else None
         if memo is not None:
             # Selected queries determine the image exclusions at *every* scale.
@@ -475,14 +476,21 @@ class ObjectDecoder(nn.Module):
         compatibility = (mask_compatibility(mask_logits, query_classes, self.collapse_iou_threshold)
                          if self.collapse_masks else None)
         unavailable = torch.zeros(batch_size, num_queries, dtype=torch.bool, device=mask_embeddings.device)
-        order = torch.full((batch_size, num_queries), -1, dtype=torch.long, device=mask_embeddings.device)
-        log_odds = torch.zeros(batch_size, num_queries, dtype=mask_embeddings.dtype, device=mask_embeddings.device)
-        probabilities = torch.zeros(batch_size, num_queries, dtype=mask_embeddings.dtype, device=mask_embeddings.device)
+        order = torch.full((batch_size, num_queries + 1), -1, dtype=torch.long, device=mask_embeddings.device)
+        log_odds = torch.zeros(batch_size, num_queries + 1, dtype=mask_embeddings.dtype, device=mask_embeddings.device)
+        probabilities = torch.zeros(batch_size, num_queries + 1, dtype=mask_embeddings.dtype, device=mask_embeddings.device)
         lengths = torch.zeros(batch_size, dtype=torch.long, device=mask_embeddings.device)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=mask_embeddings.device)
         tokens = torch.full((batch_size, 1), -1, dtype=torch.long, device=mask_embeddings.device)
+        rows = torch.arange(batch_size, device=mask_embeddings.device)
         cache = self._rollout_cache(use_cache, mask_embeddings, image_features, image_regions, exclusions, num_queries)
-        for _ in range(num_queries):
+        if cache is not None:
+            # A private greedy path has no cross-rollout states to reuse. Keep
+            # fixed K/V and pooled segments, without accumulating state history.
+            cache["merge_states"] = False
+        for step in range(num_queries):
+            if cache is not None:
+                cache["inference_capacity"] = min(step + 1, num_queries + 1)
             logits = (self._decode_step(tokens[:, -1], cache) if cache is not None else
                       self(mask_embeddings, image_features, image_regions, tokens, exclusions,
                            map_last_only=True)[:, -1])
@@ -490,12 +498,15 @@ class ObjectDecoder(nn.Module):
             selection_logits = group_logits(logits.float(), compatibility) if compatibility is not None else logits
             next_token = self._greedy_action(selection_logits)
             active = ~finished & (next_token != num_queries)
-            active_batch = torch.arange(batch_size, device=unavailable.device)[active]
-            unavailable[active_batch] |= exclusions[active_batch, next_token[active]]
-            order[active_batch, lengths[active]] = next_token[active]
-            relative_logits = selection_logits[active_batch, next_token[active]] - selection_logits[active_batch, num_queries]
-            log_odds[active_batch, lengths[active]] = relative_logits.to(log_odds.dtype)
-            probabilities[active_batch, lengths[active]] = relative_logits.sigmoid().to(probabilities.dtype)
+            query = next_token.clamp_max(num_queries - 1)
+            unavailable |= exclusions[rows, query] & active[:, None]
+            # Finished rows write a sentinel column instead of packing a
+            # variable-length active batch (which synchronizes CUDA).
+            destination = torch.where(active, lengths, num_queries)
+            order[rows, destination] = next_token
+            relative_logits = selection_logits[rows, query] - selection_logits[rows, num_queries]
+            log_odds[rows, destination] = relative_logits.to(log_odds.dtype)
+            probabilities[rows, destination] = relative_logits.sigmoid().to(probabilities.dtype)
             lengths += active.long()
             finished |= next_token == num_queries
             if finished.all():

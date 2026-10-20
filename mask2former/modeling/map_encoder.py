@@ -54,6 +54,34 @@ class MapEncoder(nn.Module):
         cache["pooled"] = pooled[:, -1]
         return pooled
 
+    @staticmethod
+    def _pool_inference_segments(visible, features, cache, capacity):
+        """One greedy state, with a host-known bound on occupied slots.
+
+        Pack changed slots into fixed-capacity buffers without nonzero or a
+        device-to-host count. Padding rows contribute nothing to cached slots.
+        """
+        visible = visible[:, 0]
+        batch, slots, pixels = visible.shape
+        prior = cache.get("visible")
+        if prior is None:
+            prior = torch.zeros_like(visible)
+            cache["pooled"] = features.new_zeros(batch, slots, features.shape[-1])
+        changed = (visible != prior).any(-1)
+        # Disappearing slots have zero area; only changed nonempty slots need
+        # GEMM rows. There are at most step+1 visible segments, including void.
+        compute = changed & visible.any(-1)
+        indices = compute.long().argsort(dim=-1, descending=True, stable=True)[:, :capacity]
+        weights = visible.gather(1, indices[..., None].expand(-1, -1, pixels)).to(features.dtype)
+        values = torch.bmm(weights, features) / weights.sum(-1, keepdim=True).clamp_min(1)
+        pooled = cache["pooled"].clone()
+        old = pooled.gather(1, indices[..., None].expand(-1, -1, features.shape[-1]))
+        values = torch.where(compute.gather(1, indices)[..., None], values, old)
+        pooled.scatter_(1, indices[..., None].expand_as(values), values.to(pooled.dtype))
+        pooled.masked_fill_(~visible.any(-1)[..., None], 0)
+        cache["visible"], cache["pooled"] = visible.clone(), pooled
+        return pooled[:, None]
+
     def render_maps(self, regions, previous, ancestors=None, positions=None, last_only=False):
         """Canonical query ownership. Paint order matters only where masks overlap."""
         batch, steps = previous.shape
@@ -96,7 +124,8 @@ class MapEncoder(nn.Module):
             return F.pad(encoded, (0, 0, previous.shape[1] - 1, 0)) if last_only else encoded
 
     def encode_maps(self, mask_tokens, features, regions, owner, pool_cache=None, *,
-                    state_cache=None, image_ids=None, merge_states=True, unique_states=False):
+                    state_cache=None, image_ids=None, merge_states=True, unique_states=False,
+                    inference_capacity=None):
         batch, states, _ = owner.shape
         device = owner.device
         if image_ids is None:
@@ -127,7 +156,9 @@ class MapEncoder(nn.Module):
         pool_cache = {} if pool_cache is None else pool_cache
         visible = active_owner[:, :, None] == torch.arange(self.num_queries + 1, device=device)[None, None, :, None]
         area = visible.float().mean(-1)
-        pooled = self._pool_visible_segments(visible, features, pool_cache)
+        pooled = (self._pool_inference_segments(visible, features, pool_cache, inference_capacity)
+                  if inference_capacity is not None else
+                  self._pool_visible_segments(visible, features, pool_cache))
         if "raw_area" not in pool_cache:
             pool_cache["raw_area"] = regions.float().mean(-1)
         raw_area = torch.cat((pool_cache["raw_area"][:, None].expand(-1, active_owner.shape[1], -1),
@@ -138,7 +169,8 @@ class MapEncoder(nn.Module):
         region_tokens = region_tokens[images, active_slots]
         area = area[images, active_slots]
         valid = area > 0
-        capacity = int(valid.sum(-1).max())
+        capacity = (inference_capacity if inference_capacity is not None
+                    else int(valid.sum(-1).max()))
         slots = valid.long().argsort(dim=-1, descending=True, stable=True)[..., :capacity]
         region_tokens = region_tokens.gather(1, slots[..., None].expand(-1, -1, region_tokens.shape[-1]))
         area = area.gather(1, slots)

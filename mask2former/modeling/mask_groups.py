@@ -26,23 +26,33 @@ def group_logits(logits, compatibility):
     batch, queries = compatibility.shape[:2]
     if logits.shape[0] != batch or logits.shape[-1] != queries + 1:
         raise ValueError("Grouped logits and mask compatibility shapes differ")
+    # Most images have no collapsible pair. Their logits already are grouped.
+    off_diagonal = compatibility.copy()
+    diagonal = np.arange(queries)
+    off_diagonal[:, diagonal, diagonal] = False
+    if not off_diagonal.any():
+        return logits
     per_image = logits.reshape(batch, -1, queries + 1)
-    result = []
-    for image, states in enumerate(per_image):
-        for row in states:
-            raw = row.detach().float().cpu().numpy()
-            remaining = sorted(np.flatnonzero(np.isfinite(raw[:-1])), key=lambda q: (-raw[q], q))
-            representatives, masses = [], []
+    # Transfer topology once, rather than once per state and once per group.
+    raw = per_image.detach().float().cpu().numpy()
+    labels = np.broadcast_to(np.arange(queries + 1), raw.shape).copy()
+    for image in range(batch):
+        for state, row in enumerate(raw[image]):
+            remaining = sorted(np.flatnonzero(np.isfinite(row[:-1])), key=lambda q: (-row[q], q))
             while remaining:
                 anchor = remaining.pop(0)
                 group, rest = [anchor], []
                 for query in remaining:
                     (group if compatibility[image, query, group].all() else rest).append(query)
                 remaining = rest
-                representatives.append(int(anchor))
-                masses.append(torch.logsumexp(row[group], dim=0))
-            representatives.append(queries)
-            masses.append(row[-1])
-            indices = torch.tensor(representatives, device=row.device)
-            result.append(torch.full_like(row, -torch.inf).scatter(0, indices, torch.stack(masses)))
-    return torch.stack(result).reshape_as(logits)
+                labels[image, state, group] = anchor
+    indices = torch.as_tensor(labels, device=logits.device)
+    # One batched segmented logsumexp replaces up to Q tiny GPU reductions.
+    maxima = torch.full_like(per_image, -torch.inf).scatter_reduce(
+        -1, indices, per_image.detach(), reduce="amax", include_self=True)
+    shifted = per_image - maxima.gather(-1, indices).masked_fill(~torch.isfinite(per_image), 0)
+    masses = torch.zeros_like(per_image).scatter_add(-1, indices, shifted.exp())
+    grouped = maxima + masses.clamp_min(torch.finfo(masses.dtype).tiny).log()
+    # Singleton groups keep exactly the original value, including -inf and EOF.
+    counts = torch.zeros_like(per_image).scatter_add(-1, indices, torch.ones_like(per_image))
+    return torch.where(counts == 1, per_image, grouped).reshape_as(logits)
