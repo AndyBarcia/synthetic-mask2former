@@ -15,13 +15,25 @@ def mask_compatibility(mask_logits, query_classes, threshold):
     return ((iou > threshold) & same_class).cpu().numpy()
 
 
-def group_logits(logits, compatibility):
+class SampledTrajectory(list):
+    """Actions together with the exact detached grouping used to sample them."""
+
+    def __init__(self, actions, group_indices):
+        super().__init__(actions)
+        self.group_indices = group_indices
+
+
+def group_logits(logits, compatibility, *, group_indices=None, return_indices=False):
     """Log-sum-exp each group at its highest-logit representative's index.
 
     Groups are built greedily in descending individual-logit order, with query
     index breaking ties. Every pair in a group must be compatible (no chains).
     EOF is its own action. Group topology is detached; probability sums remain
     differentiable. Supports [B,Q+1] and [B,T,Q+1] logits.
+
+    return_indices records the sampled partition and its representatives.
+    Passing group_indices replays that partition with current differentiable
+    logits, avoiding representative or membership changes during rescoring.
     """
     batch, queries = compatibility.shape[:2]
     if logits.shape[0] != batch or logits.shape[-1] != queries + 1:
@@ -30,13 +42,17 @@ def group_logits(logits, compatibility):
     off_diagonal = compatibility.copy()
     diagonal = np.arange(queries)
     off_diagonal[:, diagonal, diagonal] = False
-    if not off_diagonal.any():
+    if group_indices is None and not off_diagonal.any():
+        if return_indices:
+            indices = np.broadcast_to(np.arange(queries + 1), logits.shape).copy()
+            return logits, indices
         return logits
     per_image = logits.reshape(batch, -1, queries + 1)
     # Transfer topology once, rather than once per state and once per group.
-    raw = per_image.detach().float().cpu().numpy()
-    labels = np.broadcast_to(np.arange(queries + 1), raw.shape).copy()
-    for image in range(batch):
+    raw = per_image.detach().float().cpu().numpy() if group_indices is None else None
+    labels = (np.broadcast_to(np.arange(queries + 1), raw.shape).copy()
+              if group_indices is None else np.asarray(group_indices).reshape(per_image.shape))
+    for image in range(batch) if group_indices is None else ():
         for state, row in enumerate(raw[image]):
             remaining = np.asarray(sorted(np.flatnonzero(np.isfinite(row[:-1])),
                                           key=lambda q: (-row[q], q)), dtype=np.int64)
@@ -61,4 +77,5 @@ def group_logits(logits, compatibility):
     grouped = maxima + masses.clamp_min(torch.finfo(masses.dtype).tiny).log()
     # Singleton groups keep exactly the original value, including -inf and EOF.
     counts = torch.zeros_like(per_image).scatter_add(-1, indices, torch.ones_like(per_image))
-    return torch.where(counts == 1, per_image, grouped).reshape_as(logits)
+    result = torch.where(counts == 1, per_image, grouped).reshape_as(logits)
+    return (result, labels.reshape(logits.shape)) if return_indices else result

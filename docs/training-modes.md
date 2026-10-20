@@ -68,6 +68,11 @@ it through `MODEL.MASK_FORMER.OBJECT_RL_*`:
 
 Rewards use per-image mean class PQ and the configured panoptic paint order.
 RL diagnostics appear in the standard metrics files and console logs.
+When duplicate masks are collapsed, sampled trajectories retain the exact
+complete-link group memberships and representative indices. Gradient rescoring
+reuses that detached topology while recomputing differentiable group probability
+masses. This preserves sampled action support even when nearly tied logits round
+differently during incremental sampling and batched rescoring.
 
 For evaluation, point `MODEL.WEIGHTS` to the desired phase checkpoint and use
 `--eval-only`. In sequential mode, use the phase's output directory if you also

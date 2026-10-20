@@ -1,11 +1,12 @@
 """Map-conditioned pointer decoder over mask query embeddings."""
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
 from .map_encoder import MapEncoder
 from .state_cache import StateCache, pack_by_image
-from .mask_groups import mask_compatibility, group_logits
+from .mask_groups import mask_compatibility, group_logits, SampledTrajectory
 
 
 class ObjectDecoder(nn.Module):
@@ -581,6 +582,7 @@ class ObjectDecoder(nn.Module):
         finished = torch.zeros(batch_size, dtype=torch.bool, device=mask_embeddings.device)
         previous = torch.full((batch_size, 1), -1, dtype=torch.long, device=mask_embeddings.device)
         action_buffer = torch.full((batch_size, max_steps), -1, dtype=torch.long, device=mask_embeddings.device)
+        sampled_groups = []
         rows = torch.arange(batch_size, device=mask_embeddings.device)
         log_probability = mask_embeddings.new_zeros(batch_size)
         diagnostics = {
@@ -600,7 +602,11 @@ class ObjectDecoder(nn.Module):
             # distribution avoids regrouping their unused vocabulary forever.
             logits[:, -1].masked_fill_(finished, 0)
             if compatibility is not None:
-                logits = group_logits(logits.float(), compatibility)
+                if return_actions:
+                    logits, groups = group_logits(logits.float(), compatibility, return_indices=True)
+                    sampled_groups.append(groups)
+                else:
+                    logits = group_logits(logits.float(), compatibility)
             distribution = torch.distributions.Categorical(logits=logits)
             if sampled_count == batch_size:
                 token = distribution.sample()
@@ -634,6 +640,10 @@ class ObjectDecoder(nn.Module):
         # Transfer the complete ragged trajectories once, rather than each token.
         rows = action_buffer.tolist()
         actions = [[token for token in row if token >= 0] for row in rows]
+        if sampled_groups:
+            groups = np.stack(sampled_groups, axis=1)
+            actions = [SampledTrajectory(row, groups[index, :len(row)].copy())
+                       for index, row in enumerate(actions)]
         orders = [[token for token in row if token != num_queries] for row in actions]
         if diagnostics is not None:
             diagnostics["length"] = torch.tensor([len(order) for order in orders], device=finished.device).float()
@@ -684,8 +694,21 @@ class ObjectDecoder(nn.Module):
                       state_cache=state_cache, image_ids=image_ids)
         logits = logits.float().masked_fill(~torch.stack(allowed, dim=1), -torch.inf)
         if self.collapse_masks:
+            # Cached incremental decoding and batched rescoring can round nearly
+            # tied logits differently. Replay the sampled complete-link topology,
+            # including its representative, so the sampled event retains support.
+            saved_groups = [getattr(path, "group_indices", None) for path in trajectories]
+            group_indices = None
+            if any(group is not None for group in saved_groups):
+                if not all(group is not None for group in saved_groups):
+                    raise ValueError("Cannot mix grouped sampled and plain trajectories")
+                group_indices = np.broadcast_to(
+                    np.arange(num_queries + 1), (batch_size, steps, num_queries + 1)).copy()
+                for index, group in enumerate(saved_groups):
+                    group_indices[index, :len(group)] = group
             logits = group_logits(logits, mask_compatibility(
-                mask_logits, query_classes, self.collapse_iou_threshold))
+                mask_logits, query_classes, self.collapse_iou_threshold),
+                group_indices=group_indices)
         log_probabilities = F.log_softmax(logits, dim=-1).gather(
             -1, actions.unsqueeze(-1)
         ).squeeze(-1)
