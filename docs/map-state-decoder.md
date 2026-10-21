@@ -20,6 +20,16 @@ Checkpointed chunks bound memory; generation encodes only its current map.
 The 256d two-stage map checkpoints from the experiments retain compatible
 parameter names. Legacy history checkpoints require MAP_ENCODER=False.
 
+## Single-token supervised pretraining
+
+Supervised pretraining shuffles the matched teacher queries and samples one
+prediction position uniformly per image, including the initial object and EOF.
+Only the preceding teacher queries are painted; BOS and padding are no-op paints.
+`map_last_only=True` renders and encodes exactly one panoptic state per image,
+and mean cross-entropy supervises its next query or EOF. There is no prefix-tree
+expansion or supervision of every sequence position. Empty scenes supervise EOF
+from the empty state. Each image contributes one target, independent of length.
+
 ## Greedy EOF stopping
 
 `MODEL.MASK_FORMER.OBJECT_DEC_EOF_THRESHOLD=0.5` applies strict EOF probability

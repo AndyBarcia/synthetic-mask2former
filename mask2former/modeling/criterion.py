@@ -276,38 +276,45 @@ class SetCriterion(nn.Module):
         weights = torch.where(target.bool(), 1.0, self.eos_coef)
         return {"loss_query_bias": (loss * weights).sum() / weights.sum().clamp_min(1.0)}
 
+    @staticmethod
+    def _sample_teacher_state(indices, num_queries, device):
+        """One uniform next-token prediction point on a shuffled GT query path.
+
+        Position zero predicts the first object from an empty map; position N
+        predicts EOF from the complete teacher map. BOS/padding are no-op paints.
+        Only the matched-index packing is ragged; permutation and position
+        sampling run as one batch on the device.
+        """
+        lengths = [len(source) for source, _ in indices]
+        counts = torch.tensor(lengths, device=device)
+        matched = torch.zeros(len(indices), num_queries, device=device, dtype=torch.bool)
+        images = torch.arange(len(indices), device=device).repeat_interleave(
+            counts, output_size=sum(lengths))
+        sources = torch.cat([source.to(device) for source, _ in indices])
+        matched[images, sources] = True
+        priority = torch.rand(matched.shape, device=device).masked_fill(~matched, torch.inf)
+        sequence = F.pad(priority.argsort(dim=-1, stable=True), (0, 1), value=num_queries)
+        positions = torch.arange(num_queries + 1, device=device)[None]
+        sequence = sequence.masked_fill(positions >= counts[:, None], num_queries)
+        prediction = torch.multinomial((positions <= counts[:, None]).float(), 1)
+        target = sequence.gather(1, prediction).squeeze(1)
+        prefix = torch.where(positions[:, :-1] < prediction, sequence[:, :-1], -1)
+        previous = F.pad(prefix, (1, 0), value=-1)
+        return previous, target
+
     def loss_object_decoder(self, outputs, indices):
-        """Teacher-force shared prefixes and permuted suffixes in one tree pass."""
+        """Encode one sampled teacher panoptic state and predict its next token."""
         embeddings = outputs["mask_embeddings"]
-        num_queries = embeddings.shape[1]
-        paths_per_image = []
-        for src_indices, _ in indices:
-            src_indices = src_indices.to(embeddings.device)
-            ordered = src_indices[torch.randperm(len(src_indices), device=embeddings.device)]
-            # Keep at least two suffix objects when possible, so branching can
-            # change the order. Empty and singleton scenes remain valid paths.
-            split = int(torch.randint(max(len(ordered) - 1, 1), (), device=embeddings.device))
-            prefix, suffix = ordered[:split], ordered[split:]
-            paths = [ordered.tolist()]
-            for _ in range(self.object_decoder.prefix_tree_branches - 1):
-                permutation = torch.randperm(len(suffix), device=embeddings.device)
-                paths.append(torch.cat((prefix, suffix[permutation])).tolist())
-            paths_per_image.append(paths)
-        previous, positions, ancestors, weights = self.object_decoder.pack_prefix_trees(
-            paths_per_image, num_queries, embeddings.device
-        )
+        previous, target = self._sample_teacher_state(
+            indices, embeddings.shape[1], embeddings.device)
         image_regions = self.object_decoder.prepare_regions(
-            outputs["pred_masks"], outputs["object_decoder_image_sizes"]
-        )
+            outputs["pred_masks"], outputs["object_decoder_image_sizes"])
         vocabulary_exclusions = self.object_decoder.prepare_vocabulary_exclusions(
-            outputs["pred_masks"]
-        )
+            outputs["pred_masks"])
         logits = self.object_decoder(
-            embeddings, outputs["object_decoder_image_features"], image_regions, previous,
-            vocabulary_exclusions, positions=positions, ancestors=ancestors,
-        )
-        loss = -(F.log_softmax(logits.float(), dim=-1) * weights).sum() / weights.sum()
-        return {"loss_object_decoder": loss}
+            embeddings, outputs["object_decoder_image_features"], image_regions,
+            previous, vocabulary_exclusions, map_last_only=True)[:, -1]
+        return {"loss_object_decoder": F.cross_entropy(logits.float(), target)}
 
     @torch.no_grad()
     def object_reward(self, orders, outputs, targets, *, return_stats=False):

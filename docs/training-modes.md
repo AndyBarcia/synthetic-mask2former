@@ -40,8 +40,10 @@ supervised checkpoint. Without `--resume`, the command starts a new run. Keep
 `MODEL.WEIGHTS` set when resuming RL-only mode.
 
 RL freezes the backbone and segmentation head, runs them in evaluation mode,
-and updates only the object decoder. Supervised training retains prefix-tree
-teacher forcing and the current matcher and inference behavior.
+and updates only the object decoder. Supervised training samples one teacher prediction position per image, builds
+only that panoptic state, and predicts its next query or EOF. It does not
+expand prefix trees or supervise every position. Matching and inference
+behavior are unchanged.
 
 RL phase solver overrides are `TRAINING.RL.MAX_ITER`, `BASE_LR`, `WARMUP_ITERS`,
 `STEPS`, and `LR_SCHEDULER_NAME`. Other solver settings, including batch size,
