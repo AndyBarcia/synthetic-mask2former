@@ -144,8 +144,14 @@ class COCOPanopticNewBaselineDatasetMapper:
             for segment_info in segments_info:
                 class_id = segment_info["category_id"]
                 if not segment_info["iscrowd"]:
+                    visible = pan_seg_gt == segment_info["id"]
+                    # Cropping/resizing can remove an annotated segment. Empty
+                    # masks are not object targets and must not consume queries
+                    # or contribute spurious per-class fused-mask targets.
+                    if not visible.any():
+                        continue
                     classes.append(class_id)
-                    masks.append(pan_seg_gt == segment_info["id"])
+                    masks.append(visible)
 
             classes = np.array(classes)
             instances.gt_classes = torch.tensor(classes, dtype=torch.int64)

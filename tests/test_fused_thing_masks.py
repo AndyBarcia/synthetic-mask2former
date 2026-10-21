@@ -66,9 +66,46 @@ def test_disabled_and_insufficient_queries():
     criterion.fused_thing_masks = False
     assert criterion._mask_targets(targets) is targets
     criterion.fused_thing_masks = True
+    capped = criterion._mask_targets(targets, num_queries=2)[0]
+    assert capped["labels"].tolist() == [1, 1]
+    torch.testing.assert_close(capped["masks"], targets[0]["masks"])
+    assert criterion._mask_targets(targets, num_queries=3)[0]["labels"].tolist() == [1, 1, 1]
     try:
-        criterion({"pred_masks": torch.zeros(1, 2, 1, 2)}, targets)
+        criterion({"pred_masks": torch.zeros(1, 1, 1, 2)}, targets)
     except ValueError as error:
         assert "NUM_OBJECT_QUERIES" in str(error)
     else:
-        raise AssertionError("Insufficient queries must not silently drop targets")
+        raise AssertionError("Insufficient queries must not silently drop original targets")
+
+
+def test_crowded_image_preserves_originals_and_caps_fusion():
+    criterion = make_criterion()
+    criterion.thing_class_ids = tuple(range(10))
+    labels = torch.cat((torch.arange(10).repeat_interleave(9), torch.arange(10,15)))
+    masks = torch.eye(95).reshape(95,1,95)
+    targets = [{"labels":labels,"masks":masks}]
+    unlimited = criterion._mask_targets(targets)[0]
+    assert len(unlimited["labels"]) == 105
+    limited = criterion._mask_targets(targets,num_queries=100)[0]
+    assert len(limited["labels"]) == len(limited["masks"]) == 100
+    torch.testing.assert_close(limited["labels"][:95],labels)
+    torch.testing.assert_close(limited["masks"][:95],masks)
+    torch.testing.assert_close(limited["labels"][95:],unlimited["labels"][95:100])
+    torch.testing.assert_close(limited["masks"][95:],unlimited["masks"][95:100])
+    assert len(targets[0]["labels"]) == 95
+
+
+def test_forward_caps_fusion_to_query_slots():
+    criterion = make_criterion()
+    targets = [{"labels": torch.tensor([1, 1]),
+                "masks": torch.tensor([[[1., 0.]], [[0., 1.]]])}]
+    outputs = {
+        "pred_masks": torch.tensor([[[[8., -8.]], [[-8., 8.]]]], requires_grad=True),
+        "pred_logits": torch.zeros(1, 2, 4, requires_grad=True),
+        "gt_query_bias_logits": [torch.zeros(2, 2, requires_grad=True)],
+    }
+    losses = criterion(outputs, targets)
+    assert all(torch.isfinite(value) for value in losses.values())
+    sum(losses.values()).backward()
+    assert outputs["pred_masks"].grad is not None
+    assert outputs["pred_logits"].grad is not None
