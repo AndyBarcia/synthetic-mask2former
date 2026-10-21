@@ -13,7 +13,7 @@ class ObjectDecoder(nn.Module):
     def __init__(self, mask_dim, hidden_dim, num_queries, num_layers, num_heads,
                  dim_feedforward, mask_iou_threshold=0.8, prefix_tree_branches=4,
                  eof_threshold=.5,
-                 collapse_masks=False, collapse_iou_threshold=.8):
+                 collapse_masks=False, collapse_iou_threshold=.8, map_feature_dim=None):
         super().__init__()
         if not 0 <= mask_iou_threshold <= 1:
             raise ValueError("mask_iou_threshold must be between 0 and 1")
@@ -36,7 +36,7 @@ class ObjectDecoder(nn.Module):
         # This key remains available if previous masks cover an entire feature map.
         self.null_image_token = nn.Parameter(torch.zeros(3, hidden_dim))
         nn.init.normal_(self.null_image_token, std=0.02)
-        self.map_encoder = MapEncoder(hidden_dim, num_heads, dim_feedforward, num_queries)
+        self.map_encoder = MapEncoder(hidden_dim, num_heads, dim_feedforward, num_queries, map_feature_dim)
         layer = nn.TransformerDecoderLayer(
             d_model=hidden_dim, nhead=num_heads, dim_feedforward=dim_feedforward,
             dropout=0.0, batch_first=True,
@@ -169,7 +169,7 @@ class ObjectDecoder(nn.Module):
         cache = self._prepare_decode_cache(mask_embeddings, image_features, image_regions,
             vocabulary_exclusions, previous_tokens.shape[1], state_cache=state_cache,
             image_ids=image_ids, merge_states=merge_states)
-        owner = self.map_encoder.render_maps(image_regions[0], previous_tokens,
+        owner = self.map_encoder.render_maps(cache["map_regions"], previous_tokens,
             ancestors, positions, map_last_only)
         valid = (previous_tokens >= 0) & (previous_tokens < self.num_queries)
         prior = F.one_hot(previous_tokens.clamp(0, self.num_queries - 1), self.num_queries).bool()
@@ -177,10 +177,10 @@ class ObjectDecoder(nn.Module):
         blocked = self._vocabulary_mask(vocabulary_exclusions, previous_tokens, ancestors)
         if map_last_only:
             selected, blocked = selected[:, -1:], blocked[:, -1:]
-        self._prove_unique_path(previous_tokens, selected, image_regions[0], cache,
+        self._prove_unique_path(previous_tokens, selected, cache["map_regions"], cache,
                                 ancestors, positions)
         covered = [F.pad(torch.bmm(selected.float(), region.float()) > 0, (0, 1))
-                   for region in image_regions]
+                   for region in image_regions[:3]]
         logits, hidden = self._evaluate_states(owner, selected, covered, blocked, cache)
         if map_last_only:
             logits = F.pad(logits, (0, 0, previous_tokens.shape[1] - 1, 0))
@@ -218,7 +218,7 @@ class ObjectDecoder(nn.Module):
         batch, steps, _ = owner.shape
         scope = cache["state_cache"]
         summaries = self.map_encoder.encode_maps(cache["vocabulary"][:, :-1],
-            cache["features"][0], cache["regions"][0], owner, cache["pool_cache"],
+            cache["map_features"], cache["map_regions"], owner, cache["pool_cache"],
             state_cache=scope["maps"], image_ids=cache["image_ids"],
             merge_states=cache["merge_states"], unique_states=cache["unique_maps"],
             inference_capacity=cache.get("inference_capacity"))
@@ -346,7 +346,7 @@ class ObjectDecoder(nn.Module):
         output = torch.cat((self.output_mask_projection(mask_embeddings[rows]),
                             self.eof.expand(batch, 1, -1)), 1)
         images = [torch.cat((feature[rows], self.null_image_token[level].expand(batch, 1, -1)), 1)
-                  for level, feature in enumerate(image_features)]
+                  for level, feature in enumerate(image_features[:3])]
         memories = {
             "vocabulary": vocabulary,
             "output_vocabulary": output,
@@ -367,8 +367,9 @@ class ObjectDecoder(nn.Module):
         State memos can span rollout batches in one explicitly shared scope.
         The scope must not be reused after backward or an optimizer update.
         """
-        if len(image_features) != 3 or len(regions) != 3:
-            raise ValueError("Object decoder requires three image feature levels")
+        if len(image_features) not in (3, 4) or len(regions) != len(image_features):
+            raise ValueError("Expected three attention levels and an optional full-resolution map level")
+        map_level = 3 if len(image_features) == 4 else 0
         batch_size = mask_embeddings.shape[0]
         private_scope = state_cache is None
         state_cache = self._state_scope(state_cache)
@@ -388,6 +389,7 @@ class ObjectDecoder(nn.Module):
                 enabled=torch.is_autocast_enabled(mask_embeddings.device.type), cache_enabled=False):
             memories = self._fixed_memories(mask_embeddings, image_features, memory_rows,
                                             memory_ids, state_cache)
+            map_features = self.map_encoder.feature_projection(image_features[map_level])
         vocabulary = memories["vocabulary"][memory_inverse]
         return {
             "vocabulary": vocabulary,
@@ -397,7 +399,9 @@ class ObjectDecoder(nn.Module):
             "memory_rows": memory_rows,
             "memory_inverse": memory_inverse,
             "features": image_features,
-            "pool_cache": {},
+            "map_features": map_features,
+            "map_regions": regions[map_level],
+            "pool_cache": {"float32_accumulation": map_level == 3},
             "state_cache": state_cache,
             "image_ids": image_ids,
             "merge_states": merge_states,
@@ -405,12 +409,12 @@ class ObjectDecoder(nn.Module):
             "unique_decoder_states": False,
             "identity_images": identity_images,
             "private_scope": private_scope,
-            "owner": torch.full((batch_size, regions[0].shape[-1]), self.num_queries,
+            "owner": torch.full((batch_size, regions[map_level].shape[-1]), self.num_queries,
                                 dtype=torch.long, device=mask_embeddings.device),
             "selected": exclusions.new_zeros(batch_size, self.num_queries),
             "regions": regions,
             "exclusions": exclusions,
-            "covered": [region.new_zeros(batch_size, region.shape[-1] + 1) for region in regions],
+            "covered": [region.new_zeros(batch_size, region.shape[-1] + 1) for region in regions[:3]],
             "blocked": exclusions.new_zeros(batch_size, self.num_queries + 1),
             "max_steps": max_steps,
             "step": 0,
@@ -429,7 +433,7 @@ class ObjectDecoder(nn.Module):
         cache["blocked"][:, :-1] |= cache["exclusions"][rows, query_index] & valid[:, None]
         for covered, regions in zip(cache["covered"], cache["regions"]):
             covered[:, :-1] |= regions[rows, query_index] & valid[:, None]
-        paint = cache["regions"][0][rows, query_index] & valid[:, None]
+        paint = cache["map_regions"][rows, query_index] & valid[:, None]
         cache["unique_maps"] = cache["unique_decoder_states"] = False
         if (cache["merge_states"] and cache["private_scope"]
                 and len(cache["memory_rows"]) == batch_size):

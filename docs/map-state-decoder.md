@@ -67,3 +67,27 @@ repository root inside the training container. Checks cover tree/linear parity,
 causal isolation, group probability and EOF conservation, complete-link grouping,
 shared gradients, sampled online/rescored likelihood agreement, actual criterion
 class routing for RLOO and best-of-N, and CUDA AMP generation/backpropagation.
+
+## Native mask-prediction features
+
+Map encoding pools native pixel-decoder mask features by default
+(`MODEL.MASK_FORMER.MAP_ENCODER_FULL_RESOLUTION=True`). Set it to `False` to
+use the coarsest image-attention scale instead. At 1024x1024 input resolution the native stride-4 map is 256x256, versus
+32x32 for the coarsest attention level: 64 times as many spatial positions.
+
+The proposal head appends the exact mask-prediction feature tensor and its size
+as a fourth map-only level. The pointer decoder's image attention and K/V caches
+continue to use the first three levels. Ownership rendering and pooled segment
+embeddings use the fourth level in training, inference, and RL. Deferred mask
+prediction computes native ownership masks directly from the mask embeddings
+and native features. If mask-feature channels differ from policy width, the map
+encoder supplies a learned feature projection.
+
+Native-resolution pooling accumulates sums and pixel counts in FP32 before
+casting normalized embeddings back to the feature dtype. An all-visible 256x256
+region has 65,536 pixels, exceeding FP16's maximum finite count. Segment reuse
+and exact whole-state sharing continue to apply at the chosen resolution.
+
+`tests/test_full_resolution_map.py` checks native feature routing, gradients,
+cached/full decode parity, deferred inference, combined rollouts, differing
+feature widths, and 65,536-pixel FP16 overflow prevention on CPU/CUDA/AMP.

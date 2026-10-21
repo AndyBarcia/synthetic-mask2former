@@ -7,15 +7,30 @@ from .state_cache import StateCache, pack_by_image
 
 
 class MapEncoder(nn.Module):
-    def __init__(self, hidden_dim, num_heads, dim_feedforward, num_queries):
+    def __init__(self, hidden_dim, num_heads, dim_feedforward, num_queries, feature_dim=None):
         super().__init__()
         self.num_queries = num_queries
+        feature_dim = hidden_dim if feature_dim is None else feature_dim
+        self.feature_projection = (nn.Identity() if feature_dim == hidden_dim
+                                   else nn.Linear(feature_dim, hidden_dim))
         self.inspection_cls = nn.Parameter(torch.randn(hidden_dim) * .02)
         self.inspection_void = nn.Parameter(torch.randn(hidden_dim) * .02)
         self.inspection_geometry = nn.Linear(2, hidden_dim)
         self.inspection_encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(hidden_dim, num_heads, dim_feedforward,
                 dropout=0., batch_first=True), num_layers=2, enable_nested_tensor=False)
+
+    @staticmethod
+    def _pool_mean(weights, features, full_precision):
+        # Native 256x256 maps can exceed FP16's finite range even for a
+        # constant-one region. Accumulate sums and counts before casting the
+        # normalized embedding back to the feature dtype.
+        if full_precision:
+            with torch.autocast(device_type=features.device.type, enabled=False):
+                summed = torch.bmm(weights.float(), features.float())
+                count = weights.sum(-1, keepdim=True, dtype=torch.float32).clamp_min(1)
+                return (summed / count).to(features.dtype)
+        return torch.bmm(weights, features) / weights.sum(-1, keepdim=True).clamp_min(1)
 
     @staticmethod
     def _pool_visible_segments(visible, features, cache):
@@ -41,7 +56,7 @@ class MapEncoder(nn.Module):
         destinations = packed_index[images, steps, segments]
         weights = features.new_zeros(batch, capacity, pixels)
         weights[images, destinations] = visible[images, steps, segments].to(weights.dtype)
-        values = torch.bmm(weights, features) / weights.sum(-1, keepdim=True).clamp_min(1)
+        values = MapEncoder._pool_mean(weights, features, cache.get("float32_accumulation", False))
         # Prefix maxima propagate the latest changed version in each slot.
         # Cached slot IDs precede every packed version, making zero-change
         # states (including empty masks) reference their cached value directly.
@@ -73,7 +88,7 @@ class MapEncoder(nn.Module):
         compute = changed & visible.any(-1)
         indices = compute.long().argsort(dim=-1, descending=True, stable=True)[:, :capacity]
         weights = visible.gather(1, indices[..., None].expand(-1, -1, pixels)).to(features.dtype)
-        values = torch.bmm(weights, features) / weights.sum(-1, keepdim=True).clamp_min(1)
+        values = MapEncoder._pool_mean(weights, features, cache.get("float32_accumulation", False))
         pooled = cache["pooled"].clone()
         old = pooled.gather(1, indices[..., None].expand(-1, -1, features.shape[-1]))
         values = torch.where(compute.gather(1, indices)[..., None], values, old)
@@ -119,6 +134,7 @@ class MapEncoder(nn.Module):
         with torch.autocast(device_type=mask_tokens.device.type,
                 enabled=torch.is_autocast_enabled(mask_tokens.device.type), cache_enabled=False):
             owner = self.render_maps(regions, previous, ancestors, positions, last_only)
+            features = self.feature_projection(features)
             encoded = self.encode_maps(mask_tokens, features, regions, owner, pool_cache,
                 state_cache=state_cache, image_ids=image_ids, merge_states=merge_states)
             return F.pad(encoded, (0, 0, previous.shape[1] - 1, 0)) if last_only else encoded

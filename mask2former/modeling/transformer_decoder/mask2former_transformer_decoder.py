@@ -249,6 +249,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         mask_dim: int,
         enforce_input_project: bool,
         inference_mask_optimization: bool = True,
+        map_encoder_full_resolution: bool = True,
     ):
         """
         NOTE: this interface is experimental.
@@ -272,6 +273,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         assert mask_classification, "Only support mask classification model"
         self.mask_classification = mask_classification
         self.inference_mask_optimization = inference_mask_optimization
+        self.map_encoder_full_resolution = map_encoder_full_resolution
 
         # positional encoding
         N_steps = hidden_dim // 2
@@ -362,6 +364,7 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
 
         ret["mask_dim"] = cfg.MODEL.SEM_SEG_HEAD.MASK_DIM
         ret["inference_mask_optimization"] = cfg.MODEL.MASK_FORMER.INFERENCE_MASK_OPTIMIZATION
+        ret["map_encoder_full_resolution"] = cfg.MODEL.MASK_FORMER.MAP_ENCODER_FULL_RESOLUTION
 
         return ret
 
@@ -476,6 +479,14 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
                 query_bias_logits
             )
         }
+        if self.map_encoder_full_resolution:
+            # Exact mask-prediction features, without downsampling or positional
+            # additions. The fourth level is exclusively for map encoding.
+            out['object_decoder_image_features'].append(mask_features.flatten(2).transpose(1, 2))
+            out['object_decoder_image_sizes'] = [*size_list, tuple(mask_features.shape[-2:])]
+            if image_regions is not None:
+                full_masks = torch.einsum("bqc,bchw->bqhw", mask_embeddings, mask_features)
+                image_regions.append(full_masks.flatten(2) > 0)
         if efficient and defer_mask_predictions:
             out['mask_features'] = mask_features
             out['object_decoder_image_regions'] = image_regions

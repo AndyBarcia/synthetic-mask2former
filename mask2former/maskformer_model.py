@@ -186,6 +186,8 @@ class MaskFormer(nn.Module):
                 eof_threshold=cfg.MODEL.MASK_FORMER.OBJECT_DEC_EOF_THRESHOLD,
                 collapse_masks=cfg.MODEL.MASK_FORMER.OBJECT_DEC_COLLAPSE_MASKS,
                 collapse_iou_threshold=cfg.MODEL.MASK_FORMER.OBJECT_DEC_COLLAPSE_IOU_THRESHOLD,
+                map_feature_dim=(cfg.MODEL.SEM_SEG_HEAD.MASK_DIM
+                                 if cfg.MODEL.MASK_FORMER.MAP_ENCODER_FULL_RESOLUTION else None),
             ) if use_object_decoder else None,
             object_rl_weight=cfg.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT,
             object_rl_max_steps=cfg.MODEL.MASK_FORMER.OBJECT_RL_MAX_STEPS,
