@@ -27,17 +27,27 @@ class ImageMemories(nn.Module):
 
 
 class ProposalTokenAdapter(nn.Sequential):
-    def __init__(self, num_classes, mask_dim):
-        super().__init__(nn.LayerNorm(175 + num_classes), nn.Linear(175 + num_classes, mask_dim))
-        nn.init.zeros_(self[-1].weight)
-        nn.init.zeros_(self[-1].bias)
+    def __init__(self, num_classes, mask_dim, fusion='residual'):
+        if fusion not in ('residual', 'concat'):
+            raise ValueError('Unknown proposal token fusion')
+        context_dim = 175 + num_classes
+        layers = ([nn.LayerNorm(context_dim), nn.Linear(context_dim, mask_dim)]
+                  if fusion == 'residual' else [])
+        super().__init__(*layers)
+        if fusion == 'residual':
+            nn.init.zeros_(self[-1].weight)
+            nn.init.zeros_(self[-1].bias)
         self.num_classes = num_classes
+        self.fusion = fusion
+        self.output_dim = mask_dim + context_dim if fusion == 'concat' else mask_dim
 
     def forward(self, proposal, padded_size):
         scale = proposal['centers'].new_tensor((padded_size[1], padded_size[0]))
         context = torch.cat((proposal['dynamic_parameters'], proposal['centers'] / scale,
                              proposal['strides'] / scale, proposal['bias'], proposal['scores'][:, None],
                              F.one_hot(proposal['labels'], self.num_classes).float()), -1)
+        if self.fusion == 'concat':
+            return torch.cat((proposal['embeddings'], context), dim=-1)
         return proposal['embeddings'] + super().forward(context)
 
 
@@ -74,7 +84,7 @@ class YOLOXHead(nn.Module):
                                         box_free=y.BOX_FREE, soft_labels=y.SOFT_LABELS, full_mask_loss=y.FULL_MASK_LOSS,
                                         large_kernel=y.LARGE_KERNEL),
             memory=ImageMemories(channels, m.HIDDEN_DIM, m.ENFORCE_INPUT_PROJ),
-            token_adapter=ProposalTokenAdapter(classes, channels), num_classes=classes, num_queries=y.TOPK)
+            token_adapter=ProposalTokenAdapter(classes, channels, fusion=y.TOKEN_FUSION), num_classes=classes, num_queries=y.TOPK)
 
     def forward(self, features, mask=None, *, padded_size):
         return self.layers(features, mask, padded_size=padded_size)

@@ -13,6 +13,7 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.YOLOX.TOPK = 300
     cfg.MODEL.YOLOX.MAX_STEPS = 64
     cfg.MODEL.YOLOX.DYNAMIC_MASKS = True
+    cfg.MODEL.YOLOX.TOKEN_FUSION = "residual"
     cfg.MODEL.YOLOX.BOX_FREE = False
     cfg.MODEL.YOLOX.SOFT_LABELS = False
     cfg.MODEL.YOLOX.FULL_MASK_LOSS = False

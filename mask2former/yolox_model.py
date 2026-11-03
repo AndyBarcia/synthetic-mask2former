@@ -74,7 +74,7 @@ class YOLOXObjectDecoder(MaskFormer):
             weight_dict['loss_object_rl'] = m.OBJECT_RL_WEIGHT
         criterion = YOLOXCriterion(
             sem_seg_head.num_classes, matcher, weight_dict,
-            ProposalObjectDecoder(cfg.MODEL.SEM_SEG_HEAD.MASK_DIM, m.HIDDEN_DIM, y.TOPK,
+            ProposalObjectDecoder(sem_seg_head.token_adapter.output_dim, m.HIDDEN_DIM, y.TOPK,
                                   m.OBJECT_DEC_LAYERS, m.NHEADS, m.DIM_FEEDFORWARD,
                                   mask_iou_threshold=1., prefix_tree_branches=m.OBJECT_DEC_PREFIX_TREE_BRANCHES,
                                   position_encoding=m.OBJECT_DEC_POSITION_ENCODING, rope=m.OBJECT_DEC_ROPE,
