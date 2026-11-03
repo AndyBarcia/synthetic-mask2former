@@ -399,7 +399,7 @@ MODEL:
     TOPK: 337
     MAX_STEPS: 25
     RL_SAMPLES: 4
-OUTPUT_DIR: output/small_synthetic_yolox_all_masks_fullres_rl
+OUTPUT_DIR: output/yolox
 SEED: -1
 SOLVER:
   AMP:
