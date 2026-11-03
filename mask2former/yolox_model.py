@@ -11,7 +11,7 @@ from .maskformer_model import MaskFormer
 from .modeling.yolox.criterion import YOLOXCriterion
 from .modeling.yolox.matcher import YOLOXMatcher
 from .modeling.yolox.object_decoder import ProposalObjectDecoder
-from .modeling.panoptic_paint import paint_panoptic_masks, score_panoptic_masks
+from .modeling.panoptic_paint import paint_panoptic_masks
 
 
 @META_ARCH_REGISTRY.register()
@@ -20,7 +20,7 @@ class YOLOXObjectDecoder(MaskFormer):
 
     @configurable
     def __init__(self, *, backbone, sem_seg_head, criterion, metadata, pixel_mean, pixel_std,
-                 num_queries, max_steps, rendering, freeze_backbone=False, freeze_pixel_decoder=False,
+                 num_queries, max_steps, freeze_backbone=False, freeze_pixel_decoder=False,
                  freeze_memory=False, freeze_proposals=False, semantic_on=False, instance_on=False,
                  size_divisibility=32, test_topk_per_image=100):
         super().__init__(
@@ -31,7 +31,6 @@ class YOLOXObjectDecoder(MaskFormer):
             instance_on=instance_on, test_topk_per_image=test_topk_per_image,
             object_rl_only=criterion.object_rl_only)
         self.max_steps = max_steps
-        self.rendering = rendering
         self.freeze_backbone = freeze_backbone or self.object_rl_only
         self.freeze_pixel_decoder = freeze_pixel_decoder or self.object_rl_only
         self.freeze_memory = freeze_memory or self.object_rl_only
@@ -46,21 +45,14 @@ class YOLOXObjectDecoder(MaskFormer):
         y, m = cfg.MODEL.YOLOX, cfg.MODEL.MASK_FORMER
         if y.TOPK <= 0 or y.MAX_STEPS <= 0 or y.WIDTH <= 0 or y.WIDTH % 8:
             raise ValueError('YOLOX budgets must be positive and WIDTH divisible by eight')
-        if not 0 <= y.MATCH_IOU_THRESHOLD <= 1 or y.RENDERING not in ('forward', 'pixel-score'):
-            raise ValueError('Invalid object matching IoU or renderer')
         if y.RL_SAMPLES < 2:
             raise ValueError('RLOO requires at least two samples')
-        if y.OBJECT_DEC_SUPERVISION not in ("hungarian", "dynamic_k_grouped"):
-            raise ValueError("Invalid YOLOX object decoder supervision")
         backbone = build_backbone(cfg)
         sem_seg_head = build_sem_seg_head(cfg, backbone.output_shape())
         metadata = MetadataCatalog.get(cfg.DATASETS.TRAIN[0])
         things = metadata.thing_dataset_id_to_contiguous_id.values()
         matcher = YOLOXMatcher(sem_seg_head.num_classes, things, box_free=y.BOX_FREE,
-                               soft_labels=y.SOFT_LABELS, object_iou_threshold=y.MATCH_IOU_THRESHOLD,
-                               cost_class=m.CLASS_WEIGHT, cost_mask=m.MASK_WEIGHT,
-                               cost_dice=m.DICE_WEIGHT, num_points=m.TRAIN_NUM_POINTS,
-                               ensure_gt_coverage=y.OBJECT_DEC_SUPERVISION == "dynamic_k_grouped")
+                               soft_labels=y.SOFT_LABELS)
         weight_dict = {
             'loss_objectness': y.OBJECTNESS_WEIGHT, 'loss_ce': m.CLASS_WEIGHT,
             'loss_mask': m.MASK_WEIGHT, 'loss_dice': m.DICE_WEIGHT,
@@ -74,19 +66,18 @@ class YOLOXObjectDecoder(MaskFormer):
             weight_dict['loss_object_rl'] = m.OBJECT_RL_WEIGHT
         criterion = YOLOXCriterion(
             sem_seg_head.num_classes, matcher, weight_dict,
-            ProposalObjectDecoder(sem_seg_head.token_adapter.output_dim, m.HIDDEN_DIM, y.TOPK,
+            ProposalObjectDecoder(cfg.MODEL.SEM_SEG_HEAD.MASK_DIM, m.HIDDEN_DIM, y.TOPK,
                                   m.OBJECT_DEC_LAYERS, m.NHEADS, m.DIM_FEEDFORWARD,
                                   mask_iou_threshold=1., prefix_tree_branches=m.OBJECT_DEC_PREFIX_TREE_BRANCHES,
                                   position_encoding=m.OBJECT_DEC_POSITION_ENCODING, rope=m.OBJECT_DEC_ROPE,
                                   eof_threshold=m.OBJECT_DEC_EOF_THRESHOLD, collapse_masks=False),
-            things, full_mask_loss=y.FULL_MASK_LOSS, object_rl_weight=m.OBJECT_RL_WEIGHT,
-            object_dec_supervision=y.OBJECT_DEC_SUPERVISION,
+            things, object_rl_weight=m.OBJECT_RL_WEIGHT,
             object_rl_only=m.OBJECT_RL_ONLY, object_rl_num_samples=y.RL_SAMPLES,
-            object_rl_max_steps=y.MAX_STEPS, rendering=y.RENDERING)
+            object_rl_max_steps=y.MAX_STEPS)
         return dict(
             backbone=backbone, sem_seg_head=sem_seg_head, criterion=criterion, metadata=metadata,
             pixel_mean=cfg.MODEL.PIXEL_MEAN, pixel_std=cfg.MODEL.PIXEL_STD,
-            num_queries=y.TOPK, max_steps=y.MAX_STEPS, rendering=y.RENDERING,
+            num_queries=y.TOPK, max_steps=y.MAX_STEPS,
             freeze_backbone=y.FREEZE_BACKBONE, freeze_pixel_decoder=y.FREEZE_PIXEL_DECODER,
             freeze_memory=y.FREEZE_MEMORY, freeze_proposals=y.FREEZE_PROPOSALS,
             semantic_on=m.TEST.SEMANTIC_ON, instance_on=m.TEST.INSTANCE_ON,
@@ -137,10 +128,7 @@ class YOLOXObjectDecoder(MaskFormer):
             masks = masks.new_empty((0, height, width))
         labels, scores = proposal['labels'][ids], proposal['scores'][ids]
         valid = torch.ones((1, len(ids)), device=self.device, dtype=torch.bool)
-        if self.rendering == 'forward':
-            canvas, table = paint_panoptic_masks(masks[None], labels[None], valid, self.criterion.isthing)
-        else:
-            canvas, table = score_panoptic_masks(masks[None], labels[None], valid, self.criterion.isthing, scores[None], overlap_threshold=0.)
+        canvas, table = paint_panoptic_masks(masks[None], labels[None], valid, self.criterion.isthing)
         info = [dict(id=i, category_id=int(c), isthing=bool(self.criterion.isthing[c]))
                 for i, c in enumerate(table[0].tolist()) if i and c >= 0]
         result = dict(panoptic_seg=(canvas[0], info))

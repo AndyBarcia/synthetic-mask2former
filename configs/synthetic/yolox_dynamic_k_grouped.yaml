@@ -1,5 +1,0 @@
-_BASE_: "yolox_fullres.yaml"
-MODEL:
-  YOLOX:
-    OBJECT_DEC_SUPERVISION: "dynamic_k_grouped"
-OUTPUT_DIR: "output/small_synthetic_yolox_all_masks_fullres_dynamic_k_rl"

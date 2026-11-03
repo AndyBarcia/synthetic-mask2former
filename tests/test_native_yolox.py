@@ -41,9 +41,9 @@ class Pixel(nn.Module):
 
 def model(box_free=False, frozen_pixel=False, rl=False):
     head = YOLOXHead(pixel_decoder=Pixel(), predictor=YOLOXMaskProposals(
-        256, 4, {0, 2}, 16, dynamic_masks=True, box_free=box_free),
-        memory=ImageMemories(256, 32), token_adapter=ProposalTokenAdapter(4, 256), num_classes=4, num_queries=20)
-    decoder = ProposalObjectDecoder(256, 32, 20, 1, 4, 64, prefix_tree_branches=2)
+        256, 4, {0, 2}, 16, box_free=box_free),
+        memory=ImageMemories(256, 32), token_adapter=ProposalTokenAdapter(4, 256), num_classes=4, num_queries=86)
+    decoder = ProposalObjectDecoder(256, 32, 86, 1, 4, 64, prefix_tree_branches=2)
     weights = {name: 1. for name in ['loss_objectness', 'loss_ce', 'loss_box', 'loss_mask', 'loss_dice',
                                    'loss_stuff_presence', 'loss_stuff_mask', 'loss_stuff_dice',
                                    'loss_object_decoder', 'loss_object_rl']}
@@ -55,7 +55,7 @@ def model(box_free=False, frozen_pixel=False, rl=False):
         metadata=SimpleNamespace(thing_dataset_id_to_contiguous_id={1: 0, 2: 2}),
         pixel_mean=[0, 0, 0], pixel_std=[1, 1, 1], freeze_backbone=True,
         freeze_pixel_decoder=frozen_pixel, freeze_memory=True, freeze_proposals=False,
-        num_queries=20, max_steps=8, rendering='forward', semantic_on=True, instance_on=True)
+        num_queries=86, max_steps=8, semantic_on=True, instance_on=True)
 
 
 def batch(empty=False):
@@ -86,7 +86,7 @@ class NativeYOLOXTest(unittest.TestCase):
         expected = F.interpolate(captured['proposals'][0]['masks'][None].float(),
                                  (64, 64), mode='bilinear', align_corners=False)[0, :, :59, :61]
         expected = F.interpolate(expected[None], (71, 79), mode='bilinear', align_corners=False)[0]
-        self.assertEqual(tuple(result['panoptic_proposals'].shape), (20, 71, 79))
+        self.assertEqual(tuple(result['panoptic_proposals'].shape), (86, 71, 79))
         torch.testing.assert_close(result['panoptic_proposals'], expected)
 
     def test_named_criterion_losses_and_gradients_for_both_heads(self):

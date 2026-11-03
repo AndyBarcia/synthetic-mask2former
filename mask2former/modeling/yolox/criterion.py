@@ -25,22 +25,17 @@ class YOLOXCriterion(nn.Module, DynamicMaskRenderer):
     """
 
     def __init__(self, num_classes, matcher, weight_dict, object_decoder, thing_ids,
-                 *, full_mask_loss=False, object_rl_weight=0., object_rl_only=False,
-                 object_rl_num_samples=4, object_rl_max_steps=64, rendering='forward',
-                 object_dec_supervision='hungarian'):
+                 *, object_rl_weight=0., object_rl_only=False,
+                 object_rl_num_samples=4, object_rl_max_steps=25):
         super().__init__()
         self.num_classes = num_classes
         self.matcher = matcher
         self.weight_dict = weight_dict
         self.object_decoder = object_decoder
-        self.full_mask_loss = full_mask_loss
-        self.dynamic_masks = True
         self.object_rl_weight = object_rl_weight
         self.object_rl_only = object_rl_only
         self.object_rl_num_samples = object_rl_num_samples
         self.object_rl_max_steps = object_rl_max_steps
-        self.rendering = rendering
-        self.object_dec_supervision = object_dec_supervision
         thing_ids = sorted(thing_ids)
         self.register_buffer('thing_ids', torch.tensor(thing_ids, dtype=torch.long))
         self.register_buffer('stuff_ids', torch.tensor(sorted(set(range(num_classes)) - set(thing_ids)), dtype=torch.long))
@@ -66,13 +61,13 @@ class YOLOXCriterion(nn.Module, DynamicMaskRenderer):
             'loss_ce': loss_cls,
         }
 
-    def loss_masks(self, raw, dense, target, index, ids, matched, points):
+    def loss_masks(self, raw, dense, target, index, ids, matched):
         things = self.matcher.thing_lookup[target['labels']] >= 0
         logits = self.render_candidates_at_resolution(raw, dense, index, ids, target['masks'].shape[-2:])
         bce, dice = mask_losses(logits, target['masks'][things][matched].flatten(1))
         return {'loss_mask': bce, 'loss_dice': dice}
 
-    def loss_stuff(self, raw, dense, target, index, points):
+    def loss_stuff(self, raw, dense, target, index):
         masks = dense.new_zeros((len(self.stuff_ids), *target['masks'].shape[-2:]))
         for k, category in enumerate(self.stuff_ids):
             rows = target['masks'][target['labels'] == category]
@@ -119,9 +114,8 @@ class YOLOXCriterion(nn.Module, DynamicMaskRenderer):
                 quality = intersection / union.clamp_min(1e-8)
                 image_losses['loss_box'] = (1 - quality.square()).mean() if len(ids) else raw['boxes'][index].sum() * 0
             image_losses.update(self.loss_labels(raw, target, index, ids, matched, quality))
-            points = None  # Dense loss on the original full-resolution targets.
-            image_losses.update(self.loss_masks(raw, dense, target, index, ids, matched, points))
-            image_losses.update(self.loss_stuff(raw, dense, target, index, points))
+            image_losses.update(self.loss_masks(raw, dense, target, index, ids, matched))
+            image_losses.update(self.loss_stuff(raw, dense, target, index))
             for name, loss in image_losses.items():
                 losses[name] = losses.get(name, 0.) + loss / len(targets)
         return (losses, prepared, indices) if return_assignment else losses
@@ -169,22 +163,18 @@ class YOLOXCriterion(nn.Module, DynamicMaskRenderer):
     def loss_object_decoder(self, outputs, targets, prepared=None, indices=None):
         decoder = self.object_decoder
         embeddings, masks = outputs['mask_embeddings'], outputs['pred_masks']
-        groups = None
-        if self.object_dec_supervision == 'dynamic_k_grouped':
-            if prepared is None or indices is None:
-                _, prepared, indices = self.loss_proposals(outputs, targets, return_assignment=True)
-            matches, groups = self.dynamic_teacher_groups(outputs, prepared, indices)
-            try:
-                sizes = [len(members) for mapping in groups for members in mapping.values()]
-                get_event_storage().put_scalars(**{
-                    'teacher/group_size_mean': sum(sizes) / max(len(sizes), 1),
-                    'teacher/positive_proposals': sum(sizes) / len(groups),
-                    'teacher/gt_segments': len(sizes) / len(groups),
-                })
-            except AssertionError:
-                pass
-        else:
-            matches = self.matcher.match_objects(outputs['proposals'], targets)
+        if prepared is None or indices is None:
+            _, prepared, indices = self.loss_proposals(outputs, targets, return_assignment=True)
+        matches, groups = self.dynamic_teacher_groups(outputs, prepared, indices)
+        try:
+            sizes = [len(members) for mapping in groups for members in mapping.values()]
+            get_event_storage().put_scalars(**{
+                'teacher/group_size_mean': sum(sizes) / max(len(sizes), 1),
+                'teacher/positive_proposals': sum(sizes) / len(groups),
+                'teacher/gt_segments': len(sizes) / len(groups),
+            })
+        except AssertionError:
+            pass
         paths = []
         for matched in matches:
             ordered = matched[torch.randperm(len(matched), device=masks.device)]
@@ -199,8 +189,7 @@ class YOLOXCriterion(nn.Module, DynamicMaskRenderer):
         regions = decoder.prepare_regions(masks, outputs['object_decoder_image_sizes'])
         logits = decoder(embeddings, outputs['object_decoder_image_features'], regions, previous,
                          decoder.prepare_vocabulary_exclusions(masks), positions=positions, ancestors=ancestors)
-        loss = (self.grouped_sequence_loss(logits, weights, groups) if groups is not None else
-                -(logits.float().log_softmax(-1) * weights).sum() / weights.sum())
+        loss = self.grouped_sequence_loss(logits, weights, groups)
         return {'loss_object_decoder': loss}
 
     def loss_object_rl(self, outputs, targets):
@@ -217,8 +206,8 @@ class YOLOXCriterion(nn.Module, DynamicMaskRenderer):
                 max_steps=self.object_rl_max_steps, return_diagnostics=True, return_actions=True)
             greedy, _ = decoder.rollout(embeddings, memories, masks, sizes, sample=False, max_steps=self.object_rl_max_steps)
             prepared = prepare_pq_reward(outputs['proposals'], targets, outputs['padded_size'])
-            rewards = score_orders(orders, prepared, self.isthing, self.num_classes, self.rendering).reshape(samples, batch)
-            greedy_rewards = score_orders(greedy, prepared, self.isthing, self.num_classes, self.rendering)
+            rewards = score_orders(orders, prepared, self.isthing, self.num_classes).reshape(samples, batch)
+            greedy_rewards = score_orders(greedy, prepared, self.isthing, self.num_classes)
         logp = trajectory_log_probability(decoder, embeddings.repeat(samples, 1, 1), repeated_memories,
                                          repeated_masks, sizes, actions).reshape(samples, batch)
         loss, advantage = rloo_loss(rewards, greedy_rewards, logp)

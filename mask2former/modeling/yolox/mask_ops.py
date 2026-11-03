@@ -23,7 +23,6 @@ class DynamicMaskRenderer:
         if points is not None: features = features[:, points]
         kernels = out['kernels'][index, ids]
         base = kernels[..., :-1] @ features + kernels[..., -1:]
-        if not self.dynamic_masks: return base
         h, w = dense.shape[-2:]
         yy, xx = torch.meshgrid(torch.arange(h, device=dense.device), torch.arange(w, device=dense.device), indexing='ij')
         locations = torch.stack(((xx+.5)*out['padded_size'][1]/w, (yy+.5)*out['padded_size'][0]/h)).flatten(1)

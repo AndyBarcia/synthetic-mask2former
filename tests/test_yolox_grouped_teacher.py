@@ -49,7 +49,7 @@ class GroupedTeacherTest(unittest.TestCase):
             m.dynamic_teacher_groups(outputs, prepared, indices)
 
     def test_conflict_repair_covers_gt_and_preserves_disjoint_groups(self):
-        matcher = YOLOXMatcher(3, {1, 2}, ensure_gt_coverage=True)
+        matcher = YOLOXMatcher(3, {1, 2})
         match = torch.tensor([[True, True, False], [False, False, False]])
         cost = torch.tensor([[3., 1., 5.], [4., 3., 2.]])
         ids, gt = matcher._finish_assignment(match, cost, torch.tensor([10, 11, 12]))
@@ -64,8 +64,6 @@ class GroupedTeacherTest(unittest.TestCase):
         m = model().train()
         m.sem_seg_head.num_queries = m.num_queries = 86  # all 84 things + 2 stuff
         m.criterion.object_decoder = ProposalObjectDecoder(256, 32, 86, 1, 4, 64, prefix_tree_branches=2)
-        m.criterion.object_dec_supervision = 'dynamic_k_grouped'
-        m.criterion.matcher.ensure_gt_coverage = True
         return m
 
     def test_training_reuses_mask_assignment_without_hungarian_and_backprops(self):
@@ -74,8 +72,7 @@ class GroupedTeacherTest(unittest.TestCase):
         # projection to test its upstream dynamic-parameter gradient path.
         torch.nn.init.normal_(m.sem_seg_head.token_adapter[-1].weight, std=.01)
         matcher = m.criterion.matcher
-        with patch.object(matcher, 'forward', wraps=matcher.forward) as assignment, \
-             patch.object(matcher, 'match_objects', side_effect=AssertionError('Hungarian used')):
+        with patch.object(matcher, 'forward', wraps=matcher.forward) as assignment:
             losses = m(batch())
         self.assertEqual(assignment.call_count, 1)
         losses['loss_object_decoder'].backward()

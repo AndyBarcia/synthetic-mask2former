@@ -38,7 +38,8 @@ def prepare_pq_reward(proposals,targets,size):
     for p,target in zip(proposals,targets):
         masks=F.interpolate(p['masks'][None].float(),size=size,mode='bilinear',align_corners=False)[0]
         gt=target['masks'].bool()
-        if tuple(gt.shape[-2:])!=tuple(size):gt=F.interpolate(gt[:,None].float(),size=size,mode='nearest')[:,0]>.5
+        if tuple(gt.shape[-2:])!=tuple(size):
+            raise ValueError('PQ reward requires full-resolution padded GT masks')
         identifiers=torch.arange(1,len(gt)+1,device=masks.device,dtype=torch.int32)
         canvas=(gt*identifiers[:,None,None]).amax(0) if len(gt) else torch.zeros(size,device=masks.device,dtype=torch.int32)
         labels=torch.cat((target['labels'].new_full((1,),-1),target['labels'])).to(torch.int32)
@@ -47,20 +48,15 @@ def prepare_pq_reward(proposals,targets,size):
 
 
 @torch.no_grad()
-def score_orders(orders,prepared,isthing,num_classes,rendering="forward"):
+def score_orders(orders,prepared,isthing,num_classes):
     from panoptic_evaluator import PanopticBatch,panoptic_quality
-    from ..panoptic_paint import score_panoptic_masks, paint_panoptic_masks
-    if rendering not in ('forward', 'pixel-score'):
-        raise ValueError(rendering)
+    from ..panoptic_paint import paint_panoptic_masks
     values=[]
     for index,order in enumerate(orders):
         masks,labels,scores,target=prepared[index%len(prepared)]
         ids=torch.as_tensor(order,device=masks.device,dtype=torch.long)
         valid=torch.ones((1,len(ids)),device=masks.device,dtype=torch.bool)
-        if rendering=="forward":
-            canvas,table=paint_panoptic_masks(masks[ids][None],labels[ids][None],valid,isthing,reverse=False)
-        else:
-            canvas,table=score_panoptic_masks(masks[ids][None],labels[ids][None],valid,isthing,scores[ids][None],overlap_threshold=0.)
+        canvas,table=paint_panoptic_masks(masks[ids][None],labels[ids][None],valid,isthing,reverse=False)
         value=panoptic_quality(PanopticBatch(canvas,table),target,num_classes,validate=False).float()
         values.append(value)
     return torch.cat(values)

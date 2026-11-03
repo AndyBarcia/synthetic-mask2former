@@ -396,7 +396,6 @@ MODEL:
     WINDOW_SIZE: 7
   WEIGHTS: detectron2://ImageNetPretrained/torchvision/R-50.pkl
   YOLOX:
-    FULL_MASK_LOSS: true
     TOPK: 337
     MAX_STEPS: 25
     RL_SAMPLES: 4

@@ -6,7 +6,7 @@ The YOLOX path uses the same boundaries as the Mask2Former implementation:
 | --- | --- | --- |
 | `MaskFormer` | `YOLOXObjectDecoder(MaskFormer)` | Image normalization/padding, targets, loss weighting, inference |
 | `MaskFormerHead` | `YOLOXHead` | Pixel decoder, proposal predictions and image/mask embeddings |
-| `HungarianMatcher` | `YOLOXMatcher` | Proposal assignment and object-sequence matching |
+| `HungarianMatcher` | `YOLOXMatcher` | Dynamic-k assignment shared by proposal and sequence losses |
 | `SetCriterion` | `YOLOXCriterion` | Named supervised/RL losses, weights, ownership of the object decoder |
 
 `YOLOXHead` is registered with `SEM_SEG_HEADS_REGISTRY` and built with
@@ -20,6 +20,10 @@ logged: `loss_objectness`, `loss_ce`, `loss_box` (unless box-free), `loss_mask`,
 `loss_dice`, `loss_stuff_presence`, `loss_stuff_mask`, `loss_stuff_dice`,
 `loss_object_decoder`, and optionally `loss_object_rl`. The object decoder lives
 under `criterion.object_decoder`, not in a separate policy wrapper.
+
+The default synthetic recipe is `configs/synthetic/yolox.yaml`; see
+[yolox-fullres.md](yolox-fullres.md) for full-resolution grouped dynamic-k
+supervision and its training schedule.
 
 ## Training and configuration
 
@@ -57,14 +61,12 @@ its console log and exit status.
 
 The dense head produces class/objectness scores, linear mask kernels and compact
 dynamic residual masks on three pyramid levels. Score-only top-K selection
-(default300) precedes rendering. The default variant uses boxes for assignment
+(default337) precedes rendering. The default variant uses boxes for assignment
 and regression; `BOX_FREE: true` uses mask-center and mask-quality costs instead.
 Neither variant uses box NMS, mask NMS, hard overlap exclusion, or box cropping.
 The object decoder excludes only previously selected IDs and learns selection.
 
-`MODEL.YOLOX.RENDERING: forward` is the default: later selected masks overwrite
-earlier ones and same-class stuff is merged. `pixel-score` enables score-weighted
-pixel competition. Outputs follow the standard Detectron2 `panoptic_seg` format,
+Later selected masks overwrite earlier ones and same-class stuff is merged. Outputs follow the standard Detectron2 `panoptic_seg` format,
 with optional semantic maps and thing instances.
 
 Evaluation follows the normal Mask2Former test resize and padding settings:

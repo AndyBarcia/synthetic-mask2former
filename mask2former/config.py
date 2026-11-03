@@ -10,18 +10,12 @@ def add_maskformer2_config(cfg):
     # Native dense-mask/object-decoder architecture. Opt in with META_ARCHITECTURE.
     cfg.MODEL.YOLOX = CN()
     cfg.MODEL.YOLOX.WIDTH = 160
-    cfg.MODEL.YOLOX.TOPK = 300
-    cfg.MODEL.YOLOX.MAX_STEPS = 64
-    cfg.MODEL.YOLOX.DYNAMIC_MASKS = True
-    cfg.MODEL.YOLOX.TOKEN_FUSION = "residual"
+    cfg.MODEL.YOLOX.TOPK = 337
+    cfg.MODEL.YOLOX.MAX_STEPS = 25
     cfg.MODEL.YOLOX.BOX_FREE = False
     cfg.MODEL.YOLOX.SOFT_LABELS = False
-    cfg.MODEL.YOLOX.FULL_MASK_LOSS = False
     cfg.MODEL.YOLOX.LARGE_KERNEL = False
-    cfg.MODEL.YOLOX.MATCH_IOU_THRESHOLD = 0.5
     cfg.MODEL.YOLOX.SEQUENCE_LOSS_WEIGHT = 1.0
-    cfg.MODEL.YOLOX.OBJECT_DEC_SUPERVISION = "hungarian"
-    cfg.MODEL.YOLOX.RENDERING = "forward"
     cfg.MODEL.YOLOX.FREEZE_BACKBONE = False
     cfg.MODEL.YOLOX.FREEZE_PIXEL_DECODER = False
     cfg.MODEL.YOLOX.FREEZE_MEMORY = False
