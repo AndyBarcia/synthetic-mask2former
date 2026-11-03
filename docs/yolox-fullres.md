@@ -8,7 +8,7 @@ by 200 decoder-only RL iterations. Initialization uses a fresh random seed.
 Choose a fresh OUTPUT_DIR to avoid reusing existing experiment artifacts.
 
 GT masks retain their original padded resolution for thing/stuff BCE and Dice,
-assignment mask costs, and teacher-target IoU matching. Predicted stride-4
+assignment mask costs, and teacher-target Hungarian matching. Predicted stride-4
 logits are bilinearly upsampled with align_corners=False. Losses use all target
 pixels; no nearest-neighbor target resizing occurs. The proposal architecture
 and inference resolution are unchanged. Oracle evaluation uses the complete
@@ -18,3 +18,13 @@ The implementation was originally developed in ignored output snapshots;
 it is now available in the main source tree. Historical checkpoints and their
 source snapshots are preserved. Native model/oracle contracts and a single-pixel
 supervision/backpropagation regression test cover the change.
+
+Teacher-forced sequences now use the baseline HungarianMatcher with configured
+CLASS_WEIGHT, MASK_WEIGHT, DICE_WEIGHT and TRAIN_NUM_POINTS. It computes the
+baseline negative class-probability cost and point-sampled mask BCE/Dice costs
+against full-resolution GT. YOLOX retains full per-class proposal logits for
+this matching; hard argmax labels and IoU thresholds never reject assignments.
+The legacy MATCH_IOU_THRESHOLD config is accepted but no longer filters teacher
+targets. Only empty visible GT masks are omitted. Dynamic-k proposal supervision
+and inference are unchanged. Prefix-tree paths use the baseline shared prefix
+and independently permuted suffixes.

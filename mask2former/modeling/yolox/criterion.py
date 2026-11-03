@@ -128,8 +128,16 @@ class YOLOXCriterion(nn.Module, DynamicMaskRenderer):
         decoder = self.object_decoder
         embeddings, masks = outputs['mask_embeddings'], outputs['pred_masks']
         matches = self.matcher.match_objects(outputs['proposals'], targets)
-        paths = [[matched[torch.randperm(len(matched), device=masks.device)].tolist()
-                  for _ in range(decoder.prefix_tree_branches)] for matched in matches]
+        paths = []
+        for matched in matches:
+            ordered = matched[torch.randperm(len(matched), device=masks.device)]
+            split = int(torch.randint(max(len(ordered) - 1, 1), (), device=masks.device))
+            prefix, suffix = ordered[:split], ordered[split:]
+            branches = [ordered.tolist()]
+            for _ in range(decoder.prefix_tree_branches - 1):
+                permutation = torch.randperm(len(suffix), device=masks.device)
+                branches.append(torch.cat((prefix, suffix[permutation])).tolist())
+            paths.append(branches)
         previous, positions, ancestors, weights = decoder.pack_prefix_trees(paths, decoder.num_queries, masks.device)
         regions = decoder.prepare_regions(masks, outputs['object_decoder_image_sizes'])
         logits = decoder(embeddings, outputs['object_decoder_image_features'], regions, previous,

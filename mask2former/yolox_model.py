@@ -55,7 +55,9 @@ class YOLOXObjectDecoder(MaskFormer):
         metadata = MetadataCatalog.get(cfg.DATASETS.TRAIN[0])
         things = metadata.thing_dataset_id_to_contiguous_id.values()
         matcher = YOLOXMatcher(sem_seg_head.num_classes, things, box_free=y.BOX_FREE,
-                               soft_labels=y.SOFT_LABELS, object_iou_threshold=y.MATCH_IOU_THRESHOLD)
+                               soft_labels=y.SOFT_LABELS, object_iou_threshold=y.MATCH_IOU_THRESHOLD,
+                               cost_class=m.CLASS_WEIGHT, cost_mask=m.MASK_WEIGHT,
+                               cost_dice=m.DICE_WEIGHT, num_points=m.TRAIN_NUM_POINTS)
         weight_dict = {
             'loss_objectness': y.OBJECTNESS_WEIGHT, 'loss_ce': m.CLASS_WEIGHT,
             'loss_mask': m.MASK_WEIGHT, 'loss_dice': m.DICE_WEIGHT,

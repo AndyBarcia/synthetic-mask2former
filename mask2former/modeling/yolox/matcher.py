@@ -4,18 +4,23 @@ from torch import nn
 from torch.nn import functional as F
 from torchvision.ops import box_iou, masks_to_boxes
 from .mask_ops import DynamicMaskRenderer
-from scipy.optimize import linear_sum_assignment
+from ..matcher import HungarianMatcher
 
 
 class YOLOXMatcher(nn.Module, DynamicMaskRenderer):
     def __init__(self, num_classes, thing_ids, *, box_free=False, soft_labels=False,
-                 mask_cost=True, object_iou_threshold=0.5):
+                 mask_cost=True, object_iou_threshold=0.5,
+                 cost_class=2., cost_mask=5., cost_dice=5., num_points=1024):
         super().__init__()
         self.box_free = box_free
         self.soft_labels = soft_labels
         self.dynamic_masks = True
         self.mask_cost = mask_cost
-        self.object_iou_threshold = object_iou_threshold
+        # object_iou_threshold is accepted for old configs/checkpoints only.
+        # Teacher targets retain every Hungarian assignment, as in MaskFormer.
+        self.object_matcher = HungarianMatcher(cost_class=cost_class, cost_mask=cost_mask,
+                                              cost_dice=cost_dice, num_points=num_points,
+                                              mask_loss_type='point')
         lookup = torch.full((num_classes,), -1, dtype=torch.long)
         lookup[torch.tensor(sorted(thing_ids), dtype=torch.long)] = torch.arange(len(thing_ids))
         self.register_buffer("thing_lookup", lookup)
@@ -131,15 +136,10 @@ class YOLOXMatcher(nn.Module, DynamicMaskRenderer):
     @torch.no_grad()
     def _match_objects(self, proposal, target):
         valid = target['masks'].flatten(1).any(1)
-        gt = target['masks'][valid].float()
-        if not len(gt):
-            return torch.empty(0, device=gt.device, dtype=torch.long)
-        predicted = (self.upsample_mask_logits(proposal['masks'], gt.shape[-2:]) > 0).flatten(1).float()
-        gt = gt.flatten(1)
-        intersection = predicted @ gt.T
-        iou = intersection / (predicted.sum(-1)[:, None] + gt.sum(-1)[None] - intersection).clamp_min(1)
-        correct_class = proposal['labels'][:, None] == target['labels'][valid][None]
-        rows, cols = linear_sum_assignment((-iou + 1000 * ~correct_class).cpu().numpy())
-        rows = torch.as_tensor(rows, device=gt.device)
-        cols = torch.as_tensor(cols, device=gt.device)
-        return rows[correct_class[rows, cols] & (iou[rows, cols] > self.object_iou_threshold)]
+        targets = [dict(labels=target['labels'][valid], masks=target['masks'][valid])]
+        # HungarianMatcher ignores its final legacy background channel.
+        logits = proposal['class_logits']
+        logits = torch.cat((logits, logits.new_zeros((len(logits), 1))), dim=-1)
+        indices = self.object_matcher(dict(pred_logits=logits[None],
+                                          pred_masks=proposal['masks'][None]), targets)
+        return indices[0][0].to(device=proposal['masks'].device)
