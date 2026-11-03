@@ -4,18 +4,25 @@ from torch import nn
 from torch.nn import functional as F
 from torchvision.ops import box_iou, masks_to_boxes
 from .mask_ops import DynamicMaskRenderer
-from scipy.optimize import linear_sum_assignment
+from ..matcher import HungarianMatcher
 
 
 class YOLOXMatcher(nn.Module, DynamicMaskRenderer):
     def __init__(self, num_classes, thing_ids, *, box_free=False, soft_labels=False,
-                 mask_cost=True, object_iou_threshold=0.5):
+                 mask_cost=True, object_iou_threshold=0.5,
+                 cost_class=2., cost_mask=5., cost_dice=5., num_points=1024,
+                 ensure_gt_coverage=False):
         super().__init__()
         self.box_free = box_free
         self.soft_labels = soft_labels
         self.dynamic_masks = True
         self.mask_cost = mask_cost
-        self.object_iou_threshold = object_iou_threshold
+        self.ensure_gt_coverage = ensure_gt_coverage
+        # object_iou_threshold is accepted for old configs/checkpoints only.
+        # Teacher targets retain every Hungarian assignment, as in MaskFormer.
+        self.object_matcher = HungarianMatcher(cost_class=cost_class, cost_mask=cost_mask,
+                                              cost_dice=cost_dice, num_points=num_points,
+                                              mask_loss_type='point')
         lookup = torch.full((num_classes,), -1, dtype=torch.long)
         lookup[torch.tensor(sorted(thing_ids), dtype=torch.long)] = torch.arange(len(thing_ids))
         self.register_buffer("thing_lookup", lookup)
@@ -74,8 +81,8 @@ class YOLOXMatcher(nn.Module, DynamicMaskRenderer):
             center_penalty = 10.**(distance-3).clamp(max=6)
             cost = soft_cls-3*(iou+1e-8).log()+center_penalty+(~near[:, candidates])*1e6
         if self.mask_cost:
-            points = torch.randperm(dense.shape[-2]*dense.shape[-1], device=device)[:256]
-            logits = self.render_candidates(out, dense, index, candidates, points).sigmoid()
+            points = torch.randperm(masks.shape[-2]*masks.shape[-1], device=device)[:256]
+            logits = self.render_candidates_at_resolution(out, dense, index, candidates, masks.shape[-2:])[:, points].sigmoid()
             gt = masks.flatten(1)[:, points].float()
             dice = 1 - (2*gt @ logits.T+1)/(gt.sum(-1)[:, None]+logits.sum(-1)[None]+1)
             cost = cost + 3*dice
@@ -88,8 +95,7 @@ class YOLOXMatcher(nn.Module, DynamicMaskRenderer):
             best = cost[:, conflicts].argmin(0)
             match[:, conflicts] = False
             match[best, conflicts] = True
-        selected = match.any(0)
-        return candidates[selected], match[:, selected].float().argmax(0)
+        return self._finish_assignment(match, cost, candidates)
 
     @torch.no_grad()
     def _mask_assignment(self, out, dense, index, labels, masks):
@@ -110,7 +116,7 @@ class YOLOXMatcher(nn.Module, DynamicMaskRenderer):
             foreground = torch.where(mask.flatten() > 0)[0]
             if len(foreground): points.append(foreground[torch.randperm(len(foreground), device=dense.device)[:16]])
         points = torch.cat(points).unique()
-        logits = self.render_candidates(out, dense, index, candidates, points)
+        logits = self.render_candidates_at_resolution(out, dense, index, candidates, masks.shape[-2:])[:, points]
         probability = logits.sigmoid(); target = masks.flatten(1)[:, points]
         intersection = target @ probability.T
         dice = 1-(2*intersection+1)/(target.sum(-1)[:, None]+probability.sum(-1)[None]+1)
@@ -125,21 +131,37 @@ class YOLOXMatcher(nn.Module, DynamicMaskRenderer):
         conflict = match.sum(0) > 1
         if conflict.any():
             best = cost[:, conflict].argmin(0); match[:, conflict] = False; match[best, conflict] = True
-        valid = match.any(0)
-        return candidates[valid], match[:, valid].float().argmax(0)
+        return self._finish_assignment(match, cost, candidates)
+
+    def _finish_assignment(self, match, cost, candidates):
+        if self.ensure_gt_coverage:
+            # Repair dynamic-k conflicts without a second/Hungarian assignment.
+            # Prefer unused candidates; otherwise transfer one from a GT with >1.
+            if match.shape[1] < match.shape[0]:
+                raise ValueError('Not enough candidates to cover every GT')
+            for gt in torch.where(~match.any(1))[0].tolist():
+                counts = match.sum(1)
+                available = ~match.any(0) | (match & (counts > 1)[:, None]).any(0)
+                choices = torch.where(available)[0]
+                query = choices[cost[gt, choices].argmin()]
+                match[:, query] = False
+                match[gt, query] = True
+        selected = match.any(0)
+        ids = candidates[selected]
+        matched = match[:, selected].float().argmax(0)
+        if self.ensure_gt_coverage:
+            # First member of each GT's group is its minimum-cost teacher token.
+            ranking = cost[matched, torch.where(selected)[0]].argsort()
+            ids, matched = ids[ranking], matched[ranking]
+        return ids, matched
 
     @torch.no_grad()
     def _match_objects(self, proposal, target):
         valid = target['masks'].flatten(1).any(1)
-        gt = F.interpolate(target['masks'][valid, None].float(), proposal['masks'].shape[-2:], mode='nearest')[:, 0]
-        if not len(gt):
-            return torch.empty(0, device=gt.device, dtype=torch.long)
-        predicted = (proposal['masks'] > 0).flatten(1).float()
-        gt = gt.flatten(1)
-        intersection = predicted @ gt.T
-        iou = intersection / (predicted.sum(-1)[:, None] + gt.sum(-1)[None] - intersection).clamp_min(1)
-        correct_class = proposal['labels'][:, None] == target['labels'][valid][None]
-        rows, cols = linear_sum_assignment((-iou + 1000 * ~correct_class).cpu().numpy())
-        rows = torch.as_tensor(rows, device=gt.device)
-        cols = torch.as_tensor(cols, device=gt.device)
-        return rows[correct_class[rows, cols] & (iou[rows, cols] > self.object_iou_threshold)]
+        targets = [dict(labels=target['labels'][valid], masks=target['masks'][valid])]
+        # HungarianMatcher ignores its final legacy background channel.
+        logits = proposal['class_logits']
+        logits = torch.cat((logits, logits.new_zeros((len(logits), 1))), dim=-1)
+        indices = self.object_matcher(dict(pred_logits=logits[None],
+                                          pred_masks=proposal['masks'][None]), targets)
+        return indices[0][0].to(device=proposal['masks'].device)

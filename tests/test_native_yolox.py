@@ -74,6 +74,21 @@ class NativeYOLOXTest(unittest.TestCase):
         torch.manual_seed(42)
         torch.set_num_threads(1)
 
+    def test_oracle_receives_full_resized_proposal_pool(self):
+        m = model().eval()
+        inputs = batch()
+        inputs[0]['panoptic_ground_truth'] = (torch.zeros(71, 79), [])
+        captured = {}
+        handle = m.sem_seg_head.register_forward_hook(lambda module, args, out: captured.update(out))
+        with torch.no_grad():
+            result = m(inputs)[0]
+        handle.remove()
+        expected = F.interpolate(captured['proposals'][0]['masks'][None].float(),
+                                 (64, 64), mode='bilinear', align_corners=False)[0, :, :59, :61]
+        expected = F.interpolate(expected[None], (71, 79), mode='bilinear', align_corners=False)[0]
+        self.assertEqual(tuple(result['panoptic_proposals'].shape), (20, 71, 79))
+        torch.testing.assert_close(result['panoptic_proposals'], expected)
+
     def test_named_criterion_losses_and_gradients_for_both_heads(self):
         for box_free in (False, True):
             m = model(box_free).train()

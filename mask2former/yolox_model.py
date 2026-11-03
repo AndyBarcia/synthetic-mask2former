@@ -50,12 +50,17 @@ class YOLOXObjectDecoder(MaskFormer):
             raise ValueError('Invalid object matching IoU or renderer')
         if y.RL_SAMPLES < 2:
             raise ValueError('RLOO requires at least two samples')
+        if y.OBJECT_DEC_SUPERVISION not in ("hungarian", "dynamic_k_grouped"):
+            raise ValueError("Invalid YOLOX object decoder supervision")
         backbone = build_backbone(cfg)
         sem_seg_head = build_sem_seg_head(cfg, backbone.output_shape())
         metadata = MetadataCatalog.get(cfg.DATASETS.TRAIN[0])
         things = metadata.thing_dataset_id_to_contiguous_id.values()
         matcher = YOLOXMatcher(sem_seg_head.num_classes, things, box_free=y.BOX_FREE,
-                               soft_labels=y.SOFT_LABELS, object_iou_threshold=y.MATCH_IOU_THRESHOLD)
+                               soft_labels=y.SOFT_LABELS, object_iou_threshold=y.MATCH_IOU_THRESHOLD,
+                               cost_class=m.CLASS_WEIGHT, cost_mask=m.MASK_WEIGHT,
+                               cost_dice=m.DICE_WEIGHT, num_points=m.TRAIN_NUM_POINTS,
+                               ensure_gt_coverage=y.OBJECT_DEC_SUPERVISION == "dynamic_k_grouped")
         weight_dict = {
             'loss_objectness': y.OBJECTNESS_WEIGHT, 'loss_ce': m.CLASS_WEIGHT,
             'loss_mask': m.MASK_WEIGHT, 'loss_dice': m.DICE_WEIGHT,
@@ -75,6 +80,7 @@ class YOLOXObjectDecoder(MaskFormer):
                                   position_encoding=m.OBJECT_DEC_POSITION_ENCODING, rope=m.OBJECT_DEC_ROPE,
                                   eof_threshold=m.OBJECT_DEC_EOF_THRESHOLD, collapse_masks=False),
             things, full_mask_loss=y.FULL_MASK_LOSS, object_rl_weight=m.OBJECT_RL_WEIGHT,
+            object_dec_supervision=y.OBJECT_DEC_SUPERVISION,
             object_rl_only=m.OBJECT_RL_ONLY, object_rl_num_samples=y.RL_SAMPLES,
             object_rl_max_steps=y.MAX_STEPS, rendering=y.RENDERING)
         return dict(
@@ -138,6 +144,12 @@ class YOLOXObjectDecoder(MaskFormer):
         info = [dict(id=i, category_id=int(c), isthing=bool(self.criterion.isthing[c]))
                 for i, c in enumerate(table[0].tolist()) if i and c >= 0]
         result = dict(panoptic_seg=(canvas[0], info))
+        if 'panoptic_ground_truth' in item:
+            # Oracle evaluation needs the full pool before decoder selection.
+            all_masks = F.interpolate(proposal['masks'][None].float(), padded_size,
+                                      mode='bilinear', align_corners=False)[0]
+            result['panoptic_proposals'] = sem_seg_postprocess(
+                all_masks, resized, height, width)
         if self.semantic_on:
             semantic = masks.new_zeros((len(self.criterion.isthing), height, width))
             for segment in info:

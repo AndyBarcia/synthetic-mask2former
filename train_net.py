@@ -136,6 +136,7 @@ class Trainer(DefaultTrainer):
             from mask2former.data.datasets.register_synthetic_scene import SYNTHETIC_SCENE_CLASSES
             return SyntheticScenePanopticEvaluator(
                 class_names=SYNTHETIC_SCENE_CLASSES,
+                evaluate_oracle=cfg.TEST.SYNTHETIC_PANOPTIC_ORACLE,
                 evaluate_instance=cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON,
             )
         if evaluator_type == "coco_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON:

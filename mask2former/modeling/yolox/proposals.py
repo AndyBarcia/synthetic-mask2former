@@ -112,7 +112,15 @@ class YOLOXMaskProposals(nn.Module, DynamicMaskRenderer):
         if self.dynamic_masks:
             positions = torch.where(keep < len(pre))[0]
             masks[positions] = self.render_candidates(out, dense, index, pre[keep[positions]]).reshape(-1, *dense.shape[-2:])
-        result = dict(masks=masks, labels=labels[keep], scores=scores[keep], embeddings=kernels[keep, :-1], isthing=isthing[keep],
+        # Preserve the complete class distribution for teacher-target matching.
+        # The head separates thing and stuff vocabularies; unavailable classes
+        # get a finite low logit, not a hard matching exclusion.
+        class_logits = out['cls'].new_full((len(kernels), self.num_classes), -20.)
+        class_logits[:len(pre), self.thing_ids] = out['cls'][index, pre]
+        class_logits[len(pre) + torch.arange(len(self.stuff_ids), device=dense.device),
+                     self.stuff_ids] = out['stuff_presence'][index]
+        dense_ids = torch.cat((pre, pre.new_full((len(self.stuff_ids),), -1)))[keep]
+        result = dict(dense_ids=dense_ids, masks=masks, labels=labels[keep], scores=scores[keep], class_logits=class_logits[keep], embeddings=kernels[keep, :-1], isthing=isthing[keep],
                       bias=kernels[keep, -1:],
                       centers=torch.cat((out['centers'][pre], canvas[None, 2:].expand(len(self.stuff_ids), -1)/2))[keep],
                       strides=torch.cat((out['strides'][pre], canvas[None, 2:].expand(len(self.stuff_ids), -1)))[keep])
