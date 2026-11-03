@@ -9,7 +9,7 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torchvision.ops import box_iou, masks_to_boxes
+from .mask_ops import DynamicMaskRenderer
 
 
 def block(cin, cout, kernel=3):
@@ -22,7 +22,7 @@ def xyxy(boxes):
                       boxes[..., :2] + boxes[..., 2:] / 2), -1)
 
 
-class YOLOXMaskProposals(nn.Module):
+class YOLOXMaskProposals(nn.Module, DynamicMaskRenderer):
     def __init__(self, channels, num_classes, thing_ids, width=96, *, soft_labels=False, dynamic_masks=False, large_kernel=False, full_mask_loss=False, box_free=False):
         super().__init__()
         self.num_classes = num_classes
@@ -96,43 +96,10 @@ class YOLOXMaskProposals(nn.Module):
         if self.dynamic_masks: out['dynamic_features'] = self.mask_features(dense)
         return out
 
-    @staticmethod
-    def render(kernels, features):
-        return kernels[..., :-1] @ features.flatten(1) + kernels[..., -1:]
-
-    def render_candidates(self, out, dense, index, ids, points=None):
-        features = dense[index].flatten(1)
-        if points is not None: features = features[:, points]
-        kernels = out['kernels'][index, ids]
-        base = kernels[..., :-1] @ features + kernels[..., -1:]
-        if not self.dynamic_masks: return base
-        h, w = dense.shape[-2:]
-        yy, xx = torch.meshgrid(torch.arange(h, device=dense.device), torch.arange(w, device=dense.device), indexing='ij')
-        locations = torch.stack(((xx+.5)*out['padded_size'][1]/w, (yy+.5)*out['padded_size'][0]/h)).flatten(1)
-        prototypes = out['dynamic_features'][index].flatten(1)
-        if points is not None: locations = locations[:, points]; prototypes = prototypes[:, points]
-        # Normalize relative positions by feature-level scale, as in compact dynamic heads.
-        relative = (locations[None]-out['centers'][ids, :, None])/(out['strides'][ids, :, None]*8)
-        x = torch.cat((prototypes[None].expand(len(ids), -1, -1), relative), 1)
-        parameters = out['dynamic_params'][index, ids]
-        offset = 0
-        for cin, cout in [(10, 8), (8, 8), (8, 1)]:
-            count = cin*cout
-            weight = parameters[:, offset:offset+count].reshape(-1, cout, cin); offset += count
-            bias = parameters[:, offset:offset+cout, None]; offset += cout
-            x = torch.bmm(weight, x)+bias
-            if cout != 1: x = F.relu(x)
-        return base+x[:, 0]
-
-    def proposals(self, out, dense, index=0, topk=100, nms=None, crop_margin=None):
-        if nms is not None or crop_margin is not None:
-            raise ValueError('Object-decoder proposals do not use NMS or box cropping')
+    def proposals(self, out, dense, index=0, topk=100):
         cls_score, local_labels = out['cls'][index].sigmoid().max(-1)
         score = cls_score * out['obj'][index].sigmoid()
-        # Cheap prefilter bounds NMS work; there is no hard confidence cutoff.
-        if self.box_free:
-            if nms is not None or crop_margin is not None: raise ValueError('mask-first proposals forbid NMS and box cropping')
-        pre = score.topk(min(topk if nms is None else 1500, len(score))).indices
+        pre = score.topk(min(topk, len(score))).indices
         kernels = torch.cat((out['kernels'][index, pre], out['stuff_kernels'][index]))
         scores = torch.cat((score[pre], out['stuff_presence'][index].sigmoid()))
         labels = torch.cat((self.thing_ids[local_labels[pre]], self.stuff_ids))
@@ -154,122 +121,3 @@ class YOLOXMaskProposals(nn.Module):
             result['dynamic_parameters'] = torch.cat((out['dynamic_params'][index, pre],
                                                        kernels.new_zeros((len(self.stuff_ids), 169))))[keep]
         return result
-
-
-@torch.no_grad()
-def dynamic_assignment(out, index, boxes, labels, masks, features, mask_cost=True, head=None, dense=None):
-    """Center-constrained dynamic-k assignment with optional mask Dice cost."""
-    device = features.device
-    if not len(boxes):
-        empty = torch.empty(0, device=device, dtype=torch.long)
-        return empty, empty
-    centers = (boxes[:, :2] + boxes[:, 2:]) / 2
-    soft = head is not None and head.soft_labels
-    near = ((out['centers'][None] - centers[:, None]).abs() < 2.5*out['strides'][None]).all(-1)
-    if soft:
-        inside = ((out['centers'][None] > boxes[:, None, :2]) & (out['centers'][None] < boxes[:, None, 2:])).all(-1)
-        # Tiny GT boxes may contain no stride-8 center: keep their nearest-center neighborhood.
-        near = torch.where(inside.any(-1)[:, None], inside, near)
-    candidates = torch.where(near.any(0))[0]
-    if not len(candidates):
-        raise ValueError('No assignment candidates for nonempty valid boxes')
-    iou = box_iou(boxes, out['boxes'][index, candidates]).clamp(0, 1)
-    prob = (out['cls'][index, candidates].sigmoid() * out['obj'][index, candidates, None].sigmoid()).sqrt().clamp(1e-5, 1-1e-5)
-    # BCE across classes without allocating [GT, anchors, classes].
-    cls_cost = -torch.log1p(-prob).sum(-1)[None] - prob[:, labels].T.log() + torch.log1p(-prob[:, labels].T)
-    cost = cls_cost - 3*(iou+1e-8).log() + (~near[:, candidates])*1e6
-    if soft:
-        scores = out['cls'][index, candidates]
-        p = scores.sigmoid()
-        negatives = F.softplus(scores)*p.square()
-        positive_logits = scores[:, labels].T
-        positive_prob = p[:, labels].T
-        positive_cost = (F.softplus(positive_logits)-iou*positive_logits)*(iou-positive_prob).square()
-        soft_cls = negatives.sum(-1)[None]-negatives[:, labels].T+positive_cost
-        distance = ((out['centers'][candidates][None]-centers[:, None])/out['strides'][candidates][None]).square().sum(-1).sqrt()
-        center_penalty = 10.**(distance-3).clamp(max=6)
-        cost = soft_cls-3*(iou+1e-8).log()+center_penalty+(~near[:, candidates])*1e6
-    if mask_cost:
-        points = torch.randperm(features.shape[-2]*features.shape[-1], device=device)[:256]
-        logits = (head.render_candidates(out, dense, index, candidates, points) if head is not None else
-                  YOLOXMaskProposals.render(out['kernels'][index, candidates], features)[:, points]).sigmoid()
-        gt = masks.flatten(1)[:, points].float()
-        dice = 1 - (2*gt @ logits.T+1)/(gt.sum(-1)[:, None]+logits.sum(-1)[None]+1)
-        cost = cost + 3*dice
-    match = torch.zeros_like(cost, dtype=torch.bool)
-    dynamic_k = iou.topk(min(13 if soft else 10, len(candidates)), dim=1).values.sum(1).long().clamp_min(1)
-    for gt in range(len(boxes)):
-        match[gt, cost[gt].topk(int(dynamic_k[gt]), largest=False).indices] = True
-    conflicts = match.sum(0) > 1
-    if conflicts.any():
-        best = cost[:, conflicts].argmin(0)
-        match[:, conflicts] = False
-        match[best, conflicts] = True
-    selected = match.any(0)
-    return candidates[selected], match[:, selected].float().argmax(0)
-
-
-def mask_losses(logits, targets):
-    if not len(logits):
-        return logits.sum()*0, logits.sum()*0
-    bce = F.binary_cross_entropy_with_logits(logits, targets.float(), reduction='none').mean(-1).mean()
-    p = logits.sigmoid(); target = targets.float()
-    dice = (1-(2*(p*target).sum(-1)+1)/(p.sum(-1)+target.sum(-1)+1)).mean()
-    return bce, dice
-
-
-def proposal_loss(head, out, dense, targets, mask_cost=True):
-    """Supervise things with detection+mask losses, stuff with presence+mask losses."""
-    total = dense.new_zeros(()); logs = {}; nt = len(head.thing_ids)
-    global_to_local = torch.full((head.num_classes,), -1, device=dense.device, dtype=torch.long)
-    global_to_local[head.thing_ids] = torch.arange(nt, device=dense.device)
-    for index, target in enumerate(targets):
-        # Padding/cropping may leave empty annotated segments: remove them.
-        valid = target['masks'].flatten(1).any(1)
-        labels, full_masks = target['labels'][valid], target['masks'][valid]
-        masks = F.interpolate(full_masks[:, None].float(), dense.shape[-2:], mode='nearest')[:, 0]
-        isthing = global_to_local[labels] >= 0
-        boxes = masks_to_boxes(full_masks[isthing].bool())
-        if len(boxes): boxes[:, 2:] += 1  # exclusive maximum, including one-pixel objects
-        positives, matched = dynamic_assignment(out, index, boxes, global_to_local[labels[isthing]], masks[isthing], dense[index], mask_cost, head, dense)
-        norm = max(len(positives), 1)
-        obj_target = torch.zeros_like(out['obj'][index]); obj_target[positives] = 1
-        losses = dict(obj=F.binary_cross_entropy_with_logits(out['obj'][index], obj_target, reduction='sum')/norm)
-        cls_target = torch.zeros_like(out['cls'][index, positives])
-        if len(positives):
-            pbox, gbox = out['boxes'][index, positives], boxes[matched]
-            lt, rb = torch.maximum(pbox[:, :2], gbox[:, :2]), torch.minimum(pbox[:, 2:], gbox[:, 2:])
-            inter = (rb-lt).clamp_min(0).prod(-1)
-            iou = inter/((pbox[:, 2:]-pbox[:, :2]).clamp_min(0).prod(-1)+(gbox[:, 2:]-gbox[:, :2]).prod(-1)-inter).clamp_min(1e-8)
-            losses['box'] = 5*(1-iou.square()).mean()
-            cls_target[torch.arange(len(positives), device=dense.device), global_to_local[labels[isthing]][matched]] = iou.detach()
-        else:
-            losses['box'] = out['boxes'][index].sum()*0
-        losses['cls'] = F.binary_cross_entropy_with_logits(out['cls'][index, positives], cls_target, reduction='sum')/norm
-        if head.soft_labels:
-            all_targets = torch.zeros_like(out['cls'][index]); all_targets[positives] = cls_target
-            cls_logits = out['cls'][index]
-            losses['cls'] = (F.binary_cross_entropy_with_logits(cls_logits, all_targets, reduction='none') *
-                             (all_targets-cls_logits.sigmoid()).abs().square()).sum()/norm
-        points = (torch.arange(dense.shape[-2]*dense.shape[-1], device=dense.device) if head.full_mask_loss else
-                  torch.randperm(dense.shape[-2]*dense.shape[-1], device=dense.device)[:2048])
-        kernels = out['kernels'][index, positives]
-        pmasks = head.render_candidates(out, dense, index, positives, points)
-        gt_masks = masks[isthing][matched].flatten(1)[:, points]
-        bce, dice = mask_losses(pmasks, gt_masks)
-        losses['mask_bce'], losses['mask_dice'] = 5*bce, 5*dice
-        stuff_targets = torch.zeros((len(head.stuff_ids), *dense.shape[-2:]), device=dense.device)
-        for k, category in enumerate(head.stuff_ids):
-            rows = masks[labels == category]
-            if len(rows): stuff_targets[k] = rows.amax(0)
-        present = stuff_targets.flatten(1).any(1)
-        losses['stuff_presence'] = F.binary_cross_entropy_with_logits(out['stuff_presence'][index], present.float())
-        skernels = out['stuff_kernels'][index, present]
-        slogits = head.render(skernels, dense[index])[:, points]
-        sbce, sdice = mask_losses(slogits, stuff_targets[present].flatten(1)[:, points])
-        losses['stuff_mask'] = 5*(sbce+sdice)
-        total = total + sum(losses.values()) / len(targets)
-        for key, value in losses.items(): logs[key] = logs.get(key, 0.) + float(value.detach())/len(targets)
-        logs['positive_anchors'] = logs.get('positive_anchors', 0.) + len(positives)/len(targets)
-        logs['matched_thing_fraction'] = logs.get('matched_thing_fraction', 0.) + len(matched.unique())/max(int(isthing.sum()), 1)/len(targets)
-    return total, logs

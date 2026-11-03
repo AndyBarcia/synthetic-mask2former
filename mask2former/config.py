@@ -12,7 +12,6 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.YOLOX.WIDTH = 160
     cfg.MODEL.YOLOX.TOPK = 300
     cfg.MODEL.YOLOX.MAX_STEPS = 64
-    cfg.MODEL.YOLOX.PAD_SIZE = 512
     cfg.MODEL.YOLOX.DYNAMIC_MASKS = True
     cfg.MODEL.YOLOX.BOX_FREE = False
     cfg.MODEL.YOLOX.SOFT_LABELS = False
@@ -26,10 +25,9 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.YOLOX.FREEZE_MEMORY = False
     cfg.MODEL.YOLOX.FREEZE_PROPOSALS = False
     cfg.MODEL.YOLOX.RL_SAMPLES = 4
-    cfg.MODEL.YOLOX.FEATURE_LR_MULTIPLIER = 0.1
-    cfg.MODEL.YOLOX.HEAD_GRAD_CLIP = 10.0
-    cfg.MODEL.YOLOX.PIXEL_GRAD_CLIP = 1.0
-    cfg.MODEL.YOLOX.POLICY_GRAD_CLIP = 1.0
+    cfg.MODEL.YOLOX.OBJECTNESS_WEIGHT = 1.0
+    cfg.MODEL.YOLOX.BOX_WEIGHT = 5.0
+    cfg.MODEL.YOLOX.STUFF_PRESENCE_WEIGHT = 1.0
 
     # NOTE: configs from original maskformer
     # data config
@@ -63,6 +61,7 @@ def add_maskformer2_config(cfg):
     # optimizer
     cfg.SOLVER.OPTIMIZER = "ADAMW"
     cfg.SOLVER.BACKBONE_MULTIPLIER = 0.1
+    cfg.SOLVER.MASK_PROPOSAL_MULTIPLIER = 1.0
 
     # mask_former model config
     cfg.MODEL.MASK_FORMER = CN()

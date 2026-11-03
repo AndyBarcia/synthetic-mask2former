@@ -26,7 +26,7 @@ import torch
 import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
-from detectron2.data import MetadataCatalog, build_detection_train_loader, build_detection_test_loader
+from detectron2.data import MetadataCatalog, build_detection_train_loader
 from detectron2.engine import (
     AMPTrainer,
     SimpleTrainer,
@@ -252,10 +252,6 @@ class Trainer(DefaultTrainer):
             "synthetic_scene_panoptic_seg",
         ):
             return SyntheticSceneBatchLoader(cfg, is_train=False)
-        if (cfg.MODEL.META_ARCHITECTURE == "YOLOXObjectDecoder"
-                and cfg.MODEL.YOLOX.PAD_SIZE > 0):
-            from mask2former.data.dataset_mappers.yolox_panoptic_test_mapper import YOLOXPanopticTestMapper
-            return build_detection_test_loader(cfg, dataset_name, mapper=YOLOXPanopticTestMapper(cfg))
         return super().build_test_loader(cfg, dataset_name)
 
     @classmethod
@@ -301,9 +297,8 @@ class Trainer(DefaultTrainer):
                 memo.add(value)
 
                 hyperparams = copy.copy(defaults)
-                if (cfg.MODEL.META_ARCHITECTURE == "YOLOXObjectDecoder"
-                        and module_name.startswith("sem_seg_head")):
-                    hyperparams["lr"] = cfg.SOLVER.BASE_LR * cfg.MODEL.YOLOX.FEATURE_LR_MULTIPLIER
+                if module_name.startswith("sem_seg_head"):
+                    hyperparams["lr"] *= cfg.SOLVER.MASK_PROPOSAL_MULTIPLIER
                 if "backbone" in module_name:
                     hyperparams["lr"] = hyperparams["lr"] * cfg.SOLVER.BACKBONE_MULTIPLIER
                 if (
@@ -326,28 +321,6 @@ class Trainer(DefaultTrainer):
                 and cfg.SOLVER.CLIP_GRADIENTS.CLIP_TYPE == "full_model"
                 and clip_norm_val > 0.0
             )
-
-            if cfg.MODEL.META_ARCHITECTURE == "YOLOXObjectDecoder":
-                # Keep the independently clipped proposal/pixel/policy updates
-                # used by the dense-mask experiments, inside the native optimizer.
-                limits = {"head": cfg.MODEL.YOLOX.HEAD_GRAD_CLIP,
-                          "pixel": cfg.MODEL.YOLOX.PIXEL_GRAD_CLIP,
-                          "policy": cfg.MODEL.YOLOX.POLICY_GRAD_CLIP}
-                branches = {key: [] for key in limits}
-                for name, parameter in model.named_parameters():
-                    if parameter.requires_grad:
-                        branch = ("head" if name.startswith("sem_seg_head.proposal_head.")
-                                  else "policy" if name.startswith("policy.") else "pixel")
-                        branches[branch].append(parameter)
-
-                class DenseMaskGradientClippingOptimizer(optim):
-                    def step(self, closure=None):
-                        for branch, parameters in branches.items():
-                            if limits[branch] > 0:
-                                torch.nn.utils.clip_grad_norm_(parameters, limits[branch])
-                        return super().step(closure=closure)
-
-                return DenseMaskGradientClippingOptimizer if enable else optim
 
             class FullModelGradientClippingOptimizer(optim):
                 def step(self, closure=None):

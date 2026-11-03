@@ -1,137 +1,96 @@
-"""Detectron2 meta-architecture for dense mask proposals and an object decoder."""
+"""MaskFormer-style meta-architecture with dense YOLOX mask proposals."""
 import torch
-from torch import nn
 from torch.nn import functional as F
-
 from detectron2.config import configurable
 from detectron2.data import MetadataCatalog
-from detectron2.modeling import META_ARCH_REGISTRY, build_backbone
+from detectron2.modeling import META_ARCH_REGISTRY, build_backbone, build_sem_seg_head
 from detectron2.structures import ImageList, Instances, BitMasks
-from detectron2.utils.events import get_event_storage
+from detectron2.modeling.postprocessing import sem_seg_postprocess
 
-from .modeling.pixel_decoder.fpn import build_pixel_decoder
-from .modeling.transformer_decoder.position_encoding import PositionEmbeddingSine
-from .modeling.yolox.rendering import paint_panoptic_masks, score_panoptic_masks
-from .modeling.yolox.proposals import YOLOXMaskProposals, proposal_loss
-from .modeling.yolox.mask_first import MaskFirstProposals, mask_first_loss
-from .modeling.yolox.policy import DynamicMaskPolicy, ProposalObjectDecoder
-
-
-class ImageMemories(nn.Module):
-    """Project the three pixel-decoder scales into the object decoder's memory."""
-
-    def __init__(self, channels, hidden_dim, enforce_projection=False):
-        super().__init__()
-        self.input_proj = nn.ModuleList([
-            nn.Conv2d(channels, hidden_dim, 1) if channels != hidden_dim or enforce_projection else nn.Sequential()
-            for _ in range(3)
-        ])
-        self.level_embed = nn.Embedding(3, hidden_dim)
-        self.pe_layer = PositionEmbeddingSine(hidden_dim // 2, normalize=True)
-
-    def forward(self, multi):
-        return [(self.input_proj[i](x).flatten(2) + self.level_embed.weight[i][None, :, None]
-                 + self.pe_layer(x, None).flatten(2)).transpose(1, 2) for i, x in enumerate(multi)]
+from .maskformer_model import MaskFormer
+from .modeling.yolox.criterion import YOLOXCriterion
+from .modeling.yolox.matcher import YOLOXMatcher
+from .modeling.yolox.object_decoder import ProposalObjectDecoder
+from .modeling.panoptic_paint import paint_panoptic_masks, score_panoptic_masks
 
 
 @META_ARCH_REGISTRY.register()
-class YOLOXObjectDecoder(nn.Module):
-    """Standard loss-dict / batched prediction interface used by ``train_net.py``.
-
-    There is no Mask2Former proposal transformer in this architecture. The
-    backbone, pixel decoder, dense proposal head and object policy are registered
-    modules, so Detectron2 owns optimization, DDP, evaluation and checkpointing.
-    """
+class YOLOXObjectDecoder(MaskFormer):
+    """Reuse MaskFormer's preprocessing, targets, loss weighting, and trainer contract."""
 
     @configurable
-    def __init__(self, *, backbone, pixel_decoder, proposal_head, memory, policy,
-                 metadata, pixel_mean, pixel_std, freeze_backbone, freeze_pixel_decoder,
-                 freeze_memory, freeze_proposals, budget, max_steps, rendering,
-                 semantic_on=False, instance_on=False, rl_weight=0., rl_only=False,
-                 rl_samples=4, sequence_weight=1., pad_size=0):
-        super().__init__()
-        if budget <= 0 or max_steps <= 0 or rendering not in ('forward', 'pixel-score'):
-            raise ValueError('Positive proposal/action budgets and a supported renderer are required')
-        if rl_only and rl_weight <= 0:
-            raise ValueError('Decoder-only RL requires a positive RL weight')
-        if rl_only and not (freeze_backbone and freeze_pixel_decoder and freeze_memory and freeze_proposals):
-            raise ValueError('Decoder-only RL requires all feature and proposal modules frozen')
-        self.backbone = backbone
-        # Preserve conventional pixel-decoder names for Detectron2 initialization.
-        self.sem_seg_head = nn.Module()
-        self.sem_seg_head.pixel_decoder = pixel_decoder
-        self.sem_seg_head.proposal_head = proposal_head
-        self.sem_seg_head.memory = memory
-        self.policy = policy
-        self.metadata = metadata
-        self.freeze_backbone = freeze_backbone
-        self.freeze_pixel_decoder = freeze_pixel_decoder
-        self.freeze_memory = freeze_memory
-        self.freeze_proposals = freeze_proposals
-        self.pad_size = pad_size
-        self.budget, self.max_steps = budget, max_steps
+    def __init__(self, *, backbone, sem_seg_head, criterion, metadata, pixel_mean, pixel_std,
+                 num_queries, max_steps, rendering, freeze_backbone=False, freeze_pixel_decoder=False,
+                 freeze_memory=False, freeze_proposals=False, semantic_on=False, instance_on=False,
+                 size_divisibility=32, test_topk_per_image=100):
+        super().__init__(
+            backbone=backbone, sem_seg_head=sem_seg_head, criterion=criterion, num_queries=num_queries,
+            object_mask_threshold=0., panoptic_paint_order='forward', overlap_threshold=0., metadata=metadata,
+            size_divisibility=size_divisibility, sem_seg_postprocess_before_inference=True,
+            pixel_mean=pixel_mean, pixel_std=pixel_std, semantic_on=semantic_on, panoptic_on=True,
+            instance_on=instance_on, test_topk_per_image=test_topk_per_image,
+            object_rl_only=criterion.object_rl_only)
+        self.max_steps = max_steps
         self.rendering = rendering
-        self.semantic_on, self.instance_on = semantic_on, instance_on
-        self.rl_weight, self.rl_only, self.rl_samples = rl_weight, rl_only, rl_samples
-        self.sequence_weight = sequence_weight
+        self.freeze_backbone = freeze_backbone or self.object_rl_only
+        self.freeze_pixel_decoder = freeze_pixel_decoder or self.object_rl_only
+        self.freeze_memory = freeze_memory or self.object_rl_only
+        self.freeze_proposals = freeze_proposals or self.object_rl_only
         for module, frozen in self._freeze_modules():
             module.requires_grad_(not frozen)
-        self.register_buffer('pixel_mean', torch.tensor(pixel_mean).view(-1, 1, 1), persistent=False)
-        self.register_buffer('pixel_std', torch.tensor(pixel_std).view(-1, 1, 1), persistent=False)
-        things = set(metadata.thing_dataset_id_to_contiguous_id.values())
-        self.register_buffer('isthing', torch.tensor([i in things for i in range(proposal_head.num_classes)]), persistent=False)
+        self.sem_seg_head.token_adapter.requires_grad_(True)
         self.train(self.training)
 
     @classmethod
     def from_config(cls, cfg):
         y, m = cfg.MODEL.YOLOX, cfg.MODEL.MASK_FORMER
-        if not y.DYNAMIC_MASKS:
-            raise ValueError('YOLOXObjectDecoder requires dynamic-mask tokens')
-        if not cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON:
-            raise ValueError('YOLOXObjectDecoder requires panoptic evaluation enabled')
-        if cfg.MODEL.SEM_SEG_HEAD.CONVS_DIM != cfg.MODEL.SEM_SEG_HEAD.MASK_DIM:
-            raise ValueError('Dense pyramid channels and mask dimension must match')
-        if y.WIDTH % 8 or y.MATCH_IOU_THRESHOLD < 0 or y.MATCH_IOU_THRESHOLD > 1:
-            raise ValueError('WIDTH must be divisible by 8 and matching IoU must be in [0, 1]')
+        if y.TOPK <= 0 or y.MAX_STEPS <= 0 or y.WIDTH <= 0 or y.WIDTH % 8:
+            raise ValueError('YOLOX budgets must be positive and WIDTH divisible by eight')
+        if not 0 <= y.MATCH_IOU_THRESHOLD <= 1 or y.RENDERING not in ('forward', 'pixel-score'):
+            raise ValueError('Invalid object matching IoU or renderer')
         if y.RL_SAMPLES < 2:
             raise ValueError('RLOO requires at least two samples')
         backbone = build_backbone(cfg)
-        pixel = build_pixel_decoder(cfg, backbone.output_shape())
+        sem_seg_head = build_sem_seg_head(cfg, backbone.output_shape())
         metadata = MetadataCatalog.get(cfg.DATASETS.TRAIN[0])
-        classes = cfg.MODEL.SEM_SEG_HEAD.NUM_CLASSES
         things = metadata.thing_dataset_id_to_contiguous_id.values()
-        if not len(things) or len(things) == classes:
-            raise ValueError('The dense panoptic head requires thing and stuff classes')
-        head_type = MaskFirstProposals if y.BOX_FREE else YOLOXMaskProposals
-        options = dict(soft_labels=y.SOFT_LABELS, full_mask_loss=y.FULL_MASK_LOSS, large_kernel=y.LARGE_KERNEL)
+        matcher = YOLOXMatcher(sem_seg_head.num_classes, things, box_free=y.BOX_FREE,
+                               soft_labels=y.SOFT_LABELS, object_iou_threshold=y.MATCH_IOU_THRESHOLD)
+        weight_dict = {
+            'loss_objectness': y.OBJECTNESS_WEIGHT, 'loss_ce': m.CLASS_WEIGHT,
+            'loss_mask': m.MASK_WEIGHT, 'loss_dice': m.DICE_WEIGHT,
+            'loss_stuff_presence': y.STUFF_PRESENCE_WEIGHT,
+            'loss_stuff_mask': m.MASK_WEIGHT, 'loss_stuff_dice': m.DICE_WEIGHT,
+            'loss_object_decoder': y.SEQUENCE_LOSS_WEIGHT,
+        }
         if not y.BOX_FREE:
-            options['dynamic_masks'] = True
-        head = head_type(cfg.MODEL.SEM_SEG_HEAD.MASK_DIM, classes, things, y.WIDTH, **options)
-        decoder = ProposalObjectDecoder(
-            cfg.MODEL.SEM_SEG_HEAD.MASK_DIM, m.HIDDEN_DIM, y.TOPK, m.OBJECT_DEC_LAYERS,
-            m.NHEADS, m.DIM_FEEDFORWARD, mask_iou_threshold=1.,
-            prefix_tree_branches=m.OBJECT_DEC_PREFIX_TREE_BRANCHES,
-            position_encoding=m.OBJECT_DEC_POSITION_ENCODING, rope=m.OBJECT_DEC_ROPE,
-            eof_threshold=m.OBJECT_DEC_EOF_THRESHOLD, collapse_masks=False)
-        rl_only = m.OBJECT_RL_ONLY
+            weight_dict['loss_box'] = y.BOX_WEIGHT
+        if m.OBJECT_RL_WEIGHT > 0:
+            weight_dict['loss_object_rl'] = m.OBJECT_RL_WEIGHT
+        criterion = YOLOXCriterion(
+            sem_seg_head.num_classes, matcher, weight_dict,
+            ProposalObjectDecoder(cfg.MODEL.SEM_SEG_HEAD.MASK_DIM, m.HIDDEN_DIM, y.TOPK,
+                                  m.OBJECT_DEC_LAYERS, m.NHEADS, m.DIM_FEEDFORWARD,
+                                  mask_iou_threshold=1., prefix_tree_branches=m.OBJECT_DEC_PREFIX_TREE_BRANCHES,
+                                  position_encoding=m.OBJECT_DEC_POSITION_ENCODING, rope=m.OBJECT_DEC_ROPE,
+                                  eof_threshold=m.OBJECT_DEC_EOF_THRESHOLD, collapse_masks=False),
+            things, full_mask_loss=y.FULL_MASK_LOSS, object_rl_weight=m.OBJECT_RL_WEIGHT,
+            object_rl_only=m.OBJECT_RL_ONLY, object_rl_num_samples=y.RL_SAMPLES,
+            object_rl_max_steps=y.MAX_STEPS, rendering=y.RENDERING)
         return dict(
-            backbone=backbone, pixel_decoder=pixel, proposal_head=head,
-            memory=ImageMemories(cfg.MODEL.SEM_SEG_HEAD.CONVS_DIM, m.HIDDEN_DIM, m.ENFORCE_INPUT_PROJ),
-            policy=DynamicMaskPolicy(decoder, classes, cfg.MODEL.SEM_SEG_HEAD.MASK_DIM, y.MATCH_IOU_THRESHOLD),
-            metadata=metadata, pixel_mean=cfg.MODEL.PIXEL_MEAN, pixel_std=cfg.MODEL.PIXEL_STD,
-            freeze_backbone=y.FREEZE_BACKBONE or rl_only,
-            freeze_pixel_decoder=y.FREEZE_PIXEL_DECODER or rl_only,
-            freeze_memory=y.FREEZE_MEMORY or rl_only, freeze_proposals=y.FREEZE_PROPOSALS or rl_only,
-            budget=y.TOPK, max_steps=y.MAX_STEPS, rendering=y.RENDERING,
+            backbone=backbone, sem_seg_head=sem_seg_head, criterion=criterion, metadata=metadata,
+            pixel_mean=cfg.MODEL.PIXEL_MEAN, pixel_std=cfg.MODEL.PIXEL_STD,
+            num_queries=y.TOPK, max_steps=y.MAX_STEPS, rendering=y.RENDERING,
+            freeze_backbone=y.FREEZE_BACKBONE, freeze_pixel_decoder=y.FREEZE_PIXEL_DECODER,
+            freeze_memory=y.FREEZE_MEMORY, freeze_proposals=y.FREEZE_PROPOSALS,
             semantic_on=m.TEST.SEMANTIC_ON, instance_on=m.TEST.INSTANCE_ON,
-            rl_weight=m.OBJECT_RL_WEIGHT, rl_only=rl_only, rl_samples=y.RL_SAMPLES,
-            sequence_weight=y.SEQUENCE_LOSS_WEIGHT, pad_size=y.PAD_SIZE)
+            size_divisibility=m.SIZE_DIVISIBILITY, test_topk_per_image=cfg.TEST.DETECTIONS_PER_IMAGE)
 
     def _freeze_modules(self):
         return [(self.backbone, self.freeze_backbone),
                 (self.sem_seg_head.pixel_decoder, self.freeze_pixel_decoder),
                 (self.sem_seg_head.memory, self.freeze_memory),
-                (self.sem_seg_head.proposal_head, self.freeze_proposals)]
+                (self.sem_seg_head.predictor, self.freeze_proposals)]
 
     def train(self, mode=True):
         super().train(mode)
@@ -140,73 +99,26 @@ class YOLOXObjectDecoder(nn.Module):
                 module.eval()
         return self
 
-    @property
-    def device(self):
-        return self.pixel_mean.device
-
-    def _targets(self, inputs, images):
-        height, width = images.tensor.shape[-2:]
-        targets = []
-        for item in inputs:
-            instances = item['instances'].to(self.device)
-            masks = instances.gt_masks
-            masks = masks.tensor if isinstance(masks, BitMasks) else masks
-            padded = masks.new_zeros((len(masks), height, width))
-            padded[:, :masks.shape[-2], :masks.shape[-1]] = masks
-            targets.append(dict(labels=instances.gt_classes, masks=padded))
-        return targets
-
     def forward(self, batched_inputs):
-        tensors, resized_sizes = [], []
-        for item in batched_inputs:
-            image = item['image'].to(self.device).float()
-            h, w = image.shape[-2:]
-            resized_sizes.append(item.get('valid_resized_size', (h, w)))
-            if self.pad_size:
-                if max(h, w) > self.pad_size:
-                    raise ValueError('Input exceeds YOLOX.PAD_SIZE; resize first or set PAD_SIZE=0')
-                image = F.pad(image, (0, self.pad_size - w, 0, self.pad_size - h), value=128.)
-            tensors.append((image - self.pixel_mean) / self.pixel_std)
-        images = ImageList.from_tensors(tensors, self.backbone.size_divisibility)
-        # Frozen modules still propagate gradients to their inputs when needed.
+        images = [(x['image'].to(self.device) - self.pixel_mean) / self.pixel_std for x in batched_inputs]
+        images = ImageList.from_tensors(images, self.size_divisibility)
         features = self.backbone(images.tensor)
-        dense, _, multi = self.sem_seg_head.pixel_decoder.forward_features(features)
-        memories = self.sem_seg_head.memory(multi)
-        sizes = [tuple(x.shape[-2:]) for x in multi]
-        size = tuple(images.tensor.shape[-2:])
-        head = self.sem_seg_head.proposal_head
-        raw = head(multi, dense, size)
-        proposals = [head.proposals(raw, dense, index=i, topk=self.budget) for i in range(len(batched_inputs))]
-        if any(len(p['masks']) != self.budget for p in proposals):
-            raise ValueError('Proposal budget exceeds the available candidates for this image size')
+        outputs = self.sem_seg_head(features, padded_size=tuple(images.tensor.shape[-2:]))
         if self.training:
-            targets = self._targets(batched_inputs, images)
-            losses = {}
-            if not self.rl_only:
-                if not self.freeze_proposals or not self.freeze_pixel_decoder or not self.freeze_backbone:
-                    objective = mask_first_loss if head.box_free else proposal_loss
-                    losses['loss_proposal'], metrics = objective(head, raw, dense, targets)
-                    try:
-                        storage = get_event_storage()
-                    except AssertionError:
-                        storage = None
-                    if storage is not None:
-                        storage.put_scalars(**{'proposal/' + k: v for k, v in metrics.items()})
-                losses['loss_object_decoder'] = self.sequence_weight * self.policy.supervised_loss(
-                    proposals, targets, memories, sizes, size)
-            if self.rl_weight:
-                from .modeling.yolox.rl import policy_rl_loss
-                loss, metrics = policy_rl_loss(self.policy, proposals, targets, memories, sizes, size,
-                                               self.isthing, self.rl_samples, self.max_steps, self.rendering)
-                losses['loss_object_rl'] = self.rl_weight * loss
-                try:
-                    get_event_storage().put_scalars(**{'rl/' + k: v for k, v in metrics.items()})
-                except AssertionError:
-                    pass
+            instances = [x['instances'].to(self.device) for x in batched_inputs]
+            targets = self.prepare_targets(instances, images)
+            losses = self.criterion(outputs, targets)
+            for key in list(losses):
+                if key in self.criterion.weight_dict:
+                    losses[key] *= self.criterion.weight_dict[key]
+                else:
+                    losses.pop(key)
             return losses
-        orders = self.policy.select(proposals, memories, sizes, size, self.max_steps)
-        return [self._inference(p, order, item, resized, size)
-                for p, order, item, resized in zip(proposals, orders, batched_inputs, resized_sizes)]
+        orders, _ = self.criterion.object_decoder.rollout(
+            outputs['mask_embeddings'], outputs['object_decoder_image_features'], outputs['pred_masks'],
+            outputs['object_decoder_image_sizes'], sample=False, max_steps=self.max_steps)
+        return [self._inference(p, order, item, resized, outputs['padded_size'])
+                for p, order, item, resized in zip(outputs['proposals'], orders, batched_inputs, images.image_sizes)]
 
     def _inference(self, proposal, order, item, resized, padded_size):
         ids = torch.as_tensor(order, device=self.device, dtype=torch.long)
@@ -214,26 +126,25 @@ class YOLOXObjectDecoder(nn.Module):
         height, width = item.get('height', resized[0]), item.get('width', resized[1])
         if len(ids):
             masks = F.interpolate(masks[None].float(), padded_size, mode='bilinear', align_corners=False)[0]
-            masks = masks[:, :resized[0], :resized[1]]
-            masks = F.interpolate(masks[None], (height, width), mode='bilinear', align_corners=False)[0]
+            masks = sem_seg_postprocess(masks, resized, height, width)
         else:
             masks = masks.new_empty((0, height, width))
         labels, scores = proposal['labels'][ids], proposal['scores'][ids]
         valid = torch.ones((1, len(ids)), device=self.device, dtype=torch.bool)
         if self.rendering == 'forward':
-            canvas, table = paint_panoptic_masks(masks[None], labels[None], valid, self.isthing)
+            canvas, table = paint_panoptic_masks(masks[None], labels[None], valid, self.criterion.isthing)
         else:
-            canvas, table = score_panoptic_masks(masks[None], labels[None], valid, self.isthing, scores[None], overlap_threshold=0.)
-        info = [dict(id=i, category_id=int(c), isthing=bool(self.isthing[c]))
+            canvas, table = score_panoptic_masks(masks[None], labels[None], valid, self.criterion.isthing, scores[None], overlap_threshold=0.)
+        info = [dict(id=i, category_id=int(c), isthing=bool(self.criterion.isthing[c]))
                 for i, c in enumerate(table[0].tolist()) if i and c >= 0]
         result = dict(panoptic_seg=(canvas[0], info))
         if self.semantic_on:
-            semantic = masks.new_zeros((len(self.isthing), height, width))
+            semantic = masks.new_zeros((len(self.criterion.isthing), height, width))
             for segment in info:
                 semantic[segment['category_id']] += (canvas[0] == segment['id']).to(semantic)
             result['sem_seg'] = semantic
         if self.instance_on:
-            keep = self.isthing[labels]
+            keep = self.criterion.isthing[labels]
             instances = Instances((height, width))
             instances.pred_masks = masks[keep] > 0
             instances.pred_classes = labels[keep]

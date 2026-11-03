@@ -49,7 +49,7 @@ def prepare_pq_reward(proposals,targets,size):
 @torch.no_grad()
 def score_orders(orders,prepared,isthing,num_classes,rendering="forward"):
     from panoptic_evaluator import PanopticBatch,panoptic_quality
-    from .rendering import score_panoptic_masks, paint_panoptic_masks
+    from ..panoptic_paint import score_panoptic_masks, paint_panoptic_masks
     if rendering not in ('forward', 'pixel-score'):
         raise ValueError(rendering)
     values=[]
@@ -64,29 +64,3 @@ def score_orders(orders,prepared,isthing,num_classes,rendering="forward"):
         value=panoptic_quality(PanopticBatch(canvas,table),target,num_classes,validate=False).float()
         values.append(value)
     return torch.cat(values)
-
-
-def policy_rl_loss(policy,proposals,targets,memories,sizes,padded_size,isthing,samples=4,max_steps=64,rendering="forward"):
-    batch=len(proposals)
-    masks=torch.stack([p['masks'] for p in proposals])
-    with torch.no_grad():
-        tokens=torch.stack([policy.tokens(p,padded_size) for p in proposals])
-        repeat_memories=[x.repeat(samples,1,1) for x in memories]
-        repeat_masks=masks.repeat(samples,1,1,1)
-        orders,_,diagnostics,actions=policy.decoder.rollout(tokens.repeat(samples,1,1),repeat_memories,repeat_masks,sizes,
-            sample=True,max_steps=max_steps,return_diagnostics=True,return_actions=True)
-        greedy,_,greedy_diagnostics=policy.decoder.rollout(tokens,memories,masks,sizes,sample=False,max_steps=max_steps,return_diagnostics=True)
-        prepared=prepare_pq_reward(proposals,targets,padded_size)
-        rewards=score_orders(orders,prepared,isthing,policy.num_classes,rendering).reshape(samples,batch)
-        greedy_reward=score_orders(greedy,prepared,isthing,policy.num_classes,rendering)
-    # Recompute tokens with gradients, so the learned token adapter is optimized
-    # along with the decoder. Proposal tensors and image memories remain frozen.
-    tokens=torch.stack([policy.tokens(p,padded_size) for p in proposals]).repeat(samples,1,1)
-    logp=trajectory_log_probability(policy.decoder,tokens,repeat_memories,repeat_masks,sizes,actions).reshape(samples,batch)
-    loss,advantage=rloo_loss(rewards,greedy_reward,logp)
-    metrics=dict(sampled_pq=float(rewards.mean()),greedy_pq=float(greedy_reward.mean()),
-                 advantage_abs=float(advantage.abs().mean()),advantage_nonzero=float((advantage!=0).float().mean()),
-                 sampled_length=float(diagnostics['length'].mean()),greedy_length=float(greedy_diagnostics['length'].mean()),
-                 sampled_capped=float(diagnostics['truncated'].mean()),greedy_capped=float(greedy_diagnostics['truncated'].mean()),
-                 log_probability=float(logp.detach().mean()))
-    return loss,metrics

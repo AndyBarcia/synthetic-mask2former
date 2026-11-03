@@ -3,12 +3,12 @@ MODEL:
   META_ARCHITECTURE: YOLOXObjectDecoder
   # ImageNet backbone only: segmentation and object-decoder modules start fresh.
   WEIGHTS: detectron2://ImageNetPretrained/torchvision/R-50.pkl
+  SEM_SEG_HEAD:
+    NAME: YOLOXHead
   YOLOX:
     WIDTH: 160
-    FEATURE_LR_MULTIPLIER: 0.1
     TOPK: 300
     MAX_STEPS: 64
-    PAD_SIZE: 512
     BOX_FREE: false
     RENDERING: forward
     FREEZE_BACKBONE: false
@@ -28,6 +28,7 @@ MODEL:
       SEMANTIC_ON: false
 SOLVER:
   BASE_LR: 0.0001
+  MASK_PROPOSAL_MULTIPLIER: 0.1
   BACKBONE_MULTIPLIER: 0.1
   MAX_ITER: 100000
   STEPS: [80000, 95000]
@@ -48,7 +49,7 @@ TEST:
 INPUT:
   IMAGE_SIZE: 512
   MIN_SIZE_TEST: 512
-  MAX_SIZE_TEST: 512
+  MAX_SIZE_TEST: 2048
 TRAINING:
   MODE: supervised
 SEED: 42

@@ -29,6 +29,8 @@ def convert(cfg, base, joint=None, head=None):
     source_head = joint['head'] if joint else head['head']
     if joint and joint['arguments']['budget'] != cfg.MODEL.YOLOX.TOPK:
         raise ValueError('Proposal budget does not match the source joint checkpoint')
+    if not torch.equal(source_head['thing_ids'], state['criterion.thing_ids']):
+        raise ValueError('Thing category mapping does not match the source checkpoint')
     missing = []
     for name, value in state.items():
         source = None
@@ -38,23 +40,25 @@ def convert(cfg, base, joint=None, head=None):
             key = name[len('sem_seg_head.pixel_decoder.'):]
             source = (joint['pixel_decoder'].get(key) if joint and 'pixel_decoder' in joint
                       else segmentation.get(name))
-        elif name.startswith('sem_seg_head.proposal_head.'):
-            source = source_head.get(name[len('sem_seg_head.proposal_head.'):])
+        elif name.startswith('sem_seg_head.predictor.'):
+            source = source_head.get(name[len('sem_seg_head.predictor.'):] )
         elif name.startswith('sem_seg_head.memory.'):
             source = segmentation.get(name.replace('sem_seg_head.memory.', 'sem_seg_head.predictor.'))
-        elif source_policy is not None:
-            source = source_policy.get(name.removeprefix('policy.'))
-        elif name.startswith('policy.decoder.'):
-            source = segmentation.get(name.replace('policy.decoder.', 'criterion.object_decoder.'))
-            if name == 'policy.decoder.position.weight' and source is not None and source.shape != value.shape:
+        elif name.startswith('sem_seg_head.token_adapter.'):
+            source = (source_policy.get(name.replace('sem_seg_head.token_adapter.', 'adapter.'))
+                      if source_policy is not None else value)
+        elif name.startswith('criterion.object_decoder.'):
+            source = (source_policy.get(name.replace('criterion.object_decoder.', 'decoder.'))
+                      if source_policy is not None else segmentation.get(name))
+            if name == 'criterion.object_decoder.position.weight' and source is not None and source.shape != value.shape:
                 if cfg.MODEL.MASK_FORMER.OBJECT_DEC_POSITION_ENCODING:
                     raise ValueError('Cannot resize an active sequence-position table implicitly')
                 grown = value.clone()
                 count = min(len(source), len(grown))
                 grown[:count] = source[:count]
                 source = grown
-        elif name.startswith('policy.adapter.'):
-            # Match the zero-residual adapter initialization used by the pilots.
+        elif name.startswith('criterion.'):
+            # Nonlearned class/category lookup buffers are rebuilt from metadata.
             source = value
         if source is None:
             missing.append(name)
