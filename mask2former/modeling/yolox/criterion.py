@@ -26,7 +26,8 @@ class YOLOXCriterion(nn.Module, DynamicMaskRenderer):
 
     def __init__(self, num_classes, matcher, weight_dict, object_decoder, thing_ids,
                  *, full_mask_loss=False, object_rl_weight=0., object_rl_only=False,
-                 object_rl_num_samples=4, object_rl_max_steps=64, rendering='forward'):
+                 object_rl_num_samples=4, object_rl_max_steps=64, rendering='forward',
+                 object_dec_supervision='hungarian'):
         super().__init__()
         self.num_classes = num_classes
         self.matcher = matcher
@@ -39,6 +40,7 @@ class YOLOXCriterion(nn.Module, DynamicMaskRenderer):
         self.object_rl_num_samples = object_rl_num_samples
         self.object_rl_max_steps = object_rl_max_steps
         self.rendering = rendering
+        self.object_dec_supervision = object_dec_supervision
         thing_ids = sorted(thing_ids)
         self.register_buffer('thing_ids', torch.tensor(thing_ids, dtype=torch.long))
         self.register_buffer('stuff_ids', torch.tensor(sorted(set(range(num_classes)) - set(thing_ids)), dtype=torch.long))
@@ -85,7 +87,7 @@ class YOLOXCriterion(nn.Module, DynamicMaskRenderer):
             'loss_stuff_mask': bce, 'loss_stuff_dice': dice,
         }
 
-    def loss_proposals(self, outputs, targets):
+    def loss_proposals(self, outputs, targets, *, return_assignment=False):
         raw, dense = outputs['dense_predictions'], outputs['mask_features']
         prepared = []
         for target in targets:
@@ -122,12 +124,67 @@ class YOLOXCriterion(nn.Module, DynamicMaskRenderer):
             image_losses.update(self.loss_stuff(raw, dense, target, index, points))
             for name, loss in image_losses.items():
                 losses[name] = losses.get(name, 0.) + loss / len(targets)
-        return losses
+        return (losses, prepared, indices) if return_assignment else losses
 
-    def loss_object_decoder(self, outputs, targets):
+    @staticmethod
+    def grouped_sequence_loss(logits, weights, groups):
+        """Trie edge counts weight -log(total probability of the GT group)."""
+        log_probs = logits.float().log_softmax(-1)
+        numerator = logits.sum() * 0.
+        for image, mapping in enumerate(groups):
+            for representative in torch.where(weights[image].sum(0) > 0)[0].tolist():
+                nodes = weights[image, :, representative] > 0
+                members = mapping.get(representative, [representative])  # EOF is singleton.
+                mass = torch.logsumexp(log_probs[image, nodes][:, members], dim=-1)
+                numerator = numerator - (mass * weights[image, nodes, representative]).sum()
+        return numerator / weights.sum()
+
+    @torch.no_grad()
+    def dynamic_teacher_groups(self, outputs, prepared, indices):
+        representatives, groups = [], []
+        for proposal, target, (ids, matched) in zip(outputs['proposals'], prepared, indices):
+            mapping, best = {}, []
+            things = self.matcher.thing_lookup[target['labels']] >= 0
+            for gt in range(int(things.sum())):
+                positive_ids = ids[matched == gt]  # Already sorted by assignment cost.
+                members = []
+                for dense_id in positive_ids:
+                    query = torch.where(proposal['dense_ids'] == dense_id)[0]
+                    if len(query) != 1:
+                        raise ValueError('Grouped supervision requires every mask-positive proposal in the decoder vocabulary; increase TOPK')
+                    members.append(int(query[0]))
+                if not members:
+                    raise ValueError('Dynamic-k teacher group is empty; enable GT coverage repair')
+                best.append(members[0]); mapping[members[0]] = members
+            for category in self.stuff_ids:
+                if (target['labels'] == category).any():
+                    queries = torch.where((proposal['dense_ids'] == -1) & (proposal['labels'] == category))[0]
+                    if len(queries) != 1:
+                        raise ValueError('Missing supervised stuff proposal in decoder vocabulary')
+                    query = int(queries[0]); best.append(query); mapping[query] = [query]
+            representatives.append(torch.tensor(best, device=ids.device, dtype=torch.long))
+            groups.append(mapping)
+        return representatives, groups
+
+    def loss_object_decoder(self, outputs, targets, prepared=None, indices=None):
         decoder = self.object_decoder
         embeddings, masks = outputs['mask_embeddings'], outputs['pred_masks']
-        matches = self.matcher.match_objects(outputs['proposals'], targets)
+        groups = None
+        if self.object_dec_supervision == 'dynamic_k_grouped':
+            if prepared is None or indices is None:
+                _, prepared, indices = self.loss_proposals(outputs, targets, return_assignment=True)
+            matches, groups = self.dynamic_teacher_groups(outputs, prepared, indices)
+            try:
+                sizes = [len(members) for mapping in groups for members in mapping.values()]
+                get_event_storage().put_scalars(**{
+                    'teacher/group_size_mean': sum(sizes) / max(len(sizes), 1),
+                    'teacher/positive_proposals': sum(sizes) / len(groups),
+                    'teacher/gt_segments': len(sizes) / len(groups),
+                })
+            except AssertionError:
+                pass
+        else:
+            matches = self.matcher.match_objects(outputs['proposals'], targets)
         paths = []
         for matched in matches:
             ordered = matched[torch.randperm(len(matched), device=masks.device)]
@@ -142,7 +199,9 @@ class YOLOXCriterion(nn.Module, DynamicMaskRenderer):
         regions = decoder.prepare_regions(masks, outputs['object_decoder_image_sizes'])
         logits = decoder(embeddings, outputs['object_decoder_image_features'], regions, previous,
                          decoder.prepare_vocabulary_exclusions(masks), positions=positions, ancestors=ancestors)
-        return {'loss_object_decoder': -(logits.float().log_softmax(-1) * weights).sum() / weights.sum()}
+        loss = (self.grouped_sequence_loss(logits, weights, groups) if groups is not None else
+                -(logits.float().log_softmax(-1) * weights).sum() / weights.sum())
+        return {'loss_object_decoder': loss}
 
     def loss_object_rl(self, outputs, targets):
         from .rl import prepare_pq_reward, score_orders, trajectory_log_probability, rloo_loss
@@ -173,8 +232,8 @@ class YOLOXCriterion(nn.Module, DynamicMaskRenderer):
     def forward(self, outputs, targets):
         if self.object_rl_only:
             return self.loss_object_rl(outputs, targets)
-        losses = self.loss_proposals(outputs, targets)
-        losses.update(self.loss_object_decoder(outputs, targets))
+        losses, prepared, indices = self.loss_proposals(outputs, targets, return_assignment=True)
+        losses.update(self.loss_object_decoder(outputs, targets, prepared, indices))
         if self.object_rl_weight > 0:
             losses.update(self.loss_object_rl(outputs, targets))
         return losses

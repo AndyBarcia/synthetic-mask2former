@@ -10,12 +10,14 @@ from ..matcher import HungarianMatcher
 class YOLOXMatcher(nn.Module, DynamicMaskRenderer):
     def __init__(self, num_classes, thing_ids, *, box_free=False, soft_labels=False,
                  mask_cost=True, object_iou_threshold=0.5,
-                 cost_class=2., cost_mask=5., cost_dice=5., num_points=1024):
+                 cost_class=2., cost_mask=5., cost_dice=5., num_points=1024,
+                 ensure_gt_coverage=False):
         super().__init__()
         self.box_free = box_free
         self.soft_labels = soft_labels
         self.dynamic_masks = True
         self.mask_cost = mask_cost
+        self.ensure_gt_coverage = ensure_gt_coverage
         # object_iou_threshold is accepted for old configs/checkpoints only.
         # Teacher targets retain every Hungarian assignment, as in MaskFormer.
         self.object_matcher = HungarianMatcher(cost_class=cost_class, cost_mask=cost_mask,
@@ -93,8 +95,7 @@ class YOLOXMatcher(nn.Module, DynamicMaskRenderer):
             best = cost[:, conflicts].argmin(0)
             match[:, conflicts] = False
             match[best, conflicts] = True
-        selected = match.any(0)
-        return candidates[selected], match[:, selected].float().argmax(0)
+        return self._finish_assignment(match, cost, candidates)
 
     @torch.no_grad()
     def _mask_assignment(self, out, dense, index, labels, masks):
@@ -130,8 +131,29 @@ class YOLOXMatcher(nn.Module, DynamicMaskRenderer):
         conflict = match.sum(0) > 1
         if conflict.any():
             best = cost[:, conflict].argmin(0); match[:, conflict] = False; match[best, conflict] = True
-        valid = match.any(0)
-        return candidates[valid], match[:, valid].float().argmax(0)
+        return self._finish_assignment(match, cost, candidates)
+
+    def _finish_assignment(self, match, cost, candidates):
+        if self.ensure_gt_coverage:
+            # Repair dynamic-k conflicts without a second/Hungarian assignment.
+            # Prefer unused candidates; otherwise transfer one from a GT with >1.
+            if match.shape[1] < match.shape[0]:
+                raise ValueError('Not enough candidates to cover every GT')
+            for gt in torch.where(~match.any(1))[0].tolist():
+                counts = match.sum(1)
+                available = ~match.any(0) | (match & (counts > 1)[:, None]).any(0)
+                choices = torch.where(available)[0]
+                query = choices[cost[gt, choices].argmin()]
+                match[:, query] = False
+                match[gt, query] = True
+        selected = match.any(0)
+        ids = candidates[selected]
+        matched = match[:, selected].float().argmax(0)
+        if self.ensure_gt_coverage:
+            # First member of each GT's group is its minimum-cost teacher token.
+            ranking = cost[matched, torch.where(selected)[0]].argsort()
+            ids, matched = ids[ranking], matched[ranking]
+        return ids, matched
 
     @torch.no_grad()
     def _match_objects(self, proposal, target):

@@ -19,6 +19,7 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.YOLOX.LARGE_KERNEL = False
     cfg.MODEL.YOLOX.MATCH_IOU_THRESHOLD = 0.5
     cfg.MODEL.YOLOX.SEQUENCE_LOSS_WEIGHT = 1.0
+    cfg.MODEL.YOLOX.OBJECT_DEC_SUPERVISION = "hungarian"
     cfg.MODEL.YOLOX.RENDERING = "forward"
     cfg.MODEL.YOLOX.FREEZE_BACKBONE = False
     cfg.MODEL.YOLOX.FREEZE_PIXEL_DECODER = False

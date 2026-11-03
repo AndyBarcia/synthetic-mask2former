@@ -119,7 +119,8 @@ class YOLOXMaskProposals(nn.Module, DynamicMaskRenderer):
         class_logits[:len(pre), self.thing_ids] = out['cls'][index, pre]
         class_logits[len(pre) + torch.arange(len(self.stuff_ids), device=dense.device),
                      self.stuff_ids] = out['stuff_presence'][index]
-        result = dict(masks=masks, labels=labels[keep], scores=scores[keep], class_logits=class_logits[keep], embeddings=kernels[keep, :-1], isthing=isthing[keep],
+        dense_ids = torch.cat((pre, pre.new_full((len(self.stuff_ids),), -1)))[keep]
+        result = dict(dense_ids=dense_ids, masks=masks, labels=labels[keep], scores=scores[keep], class_logits=class_logits[keep], embeddings=kernels[keep, :-1], isthing=isthing[keep],
                       bias=kernels[keep, -1:],
                       centers=torch.cat((out['centers'][pre], canvas[None, 2:].expand(len(self.stuff_ids), -1)/2))[keep],
                       strides=torch.cat((out['strides'][pre], canvas[None, 2:].expand(len(self.stuff_ids), -1)))[keep])

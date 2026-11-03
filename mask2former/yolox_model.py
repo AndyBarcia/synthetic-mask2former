@@ -50,6 +50,8 @@ class YOLOXObjectDecoder(MaskFormer):
             raise ValueError('Invalid object matching IoU or renderer')
         if y.RL_SAMPLES < 2:
             raise ValueError('RLOO requires at least two samples')
+        if y.OBJECT_DEC_SUPERVISION not in ("hungarian", "dynamic_k_grouped"):
+            raise ValueError("Invalid YOLOX object decoder supervision")
         backbone = build_backbone(cfg)
         sem_seg_head = build_sem_seg_head(cfg, backbone.output_shape())
         metadata = MetadataCatalog.get(cfg.DATASETS.TRAIN[0])
@@ -57,7 +59,8 @@ class YOLOXObjectDecoder(MaskFormer):
         matcher = YOLOXMatcher(sem_seg_head.num_classes, things, box_free=y.BOX_FREE,
                                soft_labels=y.SOFT_LABELS, object_iou_threshold=y.MATCH_IOU_THRESHOLD,
                                cost_class=m.CLASS_WEIGHT, cost_mask=m.MASK_WEIGHT,
-                               cost_dice=m.DICE_WEIGHT, num_points=m.TRAIN_NUM_POINTS)
+                               cost_dice=m.DICE_WEIGHT, num_points=m.TRAIN_NUM_POINTS,
+                               ensure_gt_coverage=y.OBJECT_DEC_SUPERVISION == "dynamic_k_grouped")
         weight_dict = {
             'loss_objectness': y.OBJECTNESS_WEIGHT, 'loss_ce': m.CLASS_WEIGHT,
             'loss_mask': m.MASK_WEIGHT, 'loss_dice': m.DICE_WEIGHT,
@@ -77,6 +80,7 @@ class YOLOXObjectDecoder(MaskFormer):
                                   position_encoding=m.OBJECT_DEC_POSITION_ENCODING, rope=m.OBJECT_DEC_ROPE,
                                   eof_threshold=m.OBJECT_DEC_EOF_THRESHOLD, collapse_masks=False),
             things, full_mask_loss=y.FULL_MASK_LOSS, object_rl_weight=m.OBJECT_RL_WEIGHT,
+            object_dec_supervision=y.OBJECT_DEC_SUPERVISION,
             object_rl_only=m.OBJECT_RL_ONLY, object_rl_num_samples=y.RL_SAMPLES,
             object_rl_max_steps=y.MAX_STEPS, rendering=y.RENDERING)
         return dict(

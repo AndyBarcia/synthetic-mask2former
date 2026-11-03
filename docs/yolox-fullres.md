@@ -28,3 +28,34 @@ The legacy MATCH_IOU_THRESHOLD config is accepted but no longer filters teacher
 targets. Only empty visible GT masks are omitted. Dynamic-k proposal supervision
 and inference are unchanged. Prefix-tree paths use the baseline shared prefix
 and independently permuted suffixes.
+
+## Dynamic-k grouped teacher targets
+
+`configs/synthetic/yolox_dynamic_k_grouped.yaml` opts into
+`MODEL.YOLOX.OBJECT_DEC_SUPERVISION: dynamic_k_grouped`; the default remains
+`hungarian`. Grouped mode reuses the exact assignment computed for proposal
+mask loss, without a second assignment or class/IoU filtering. Each thing GT
+owns its dynamic-k mask-positive proposals. The minimum-cost member is the
+teacher token; all group members contribute probability to the decoder target:
+
+`loss = -log(sum(softmax(next_token_logits)[group_members]))`.
+
+Compute the sum in log space. Preserve prefix-tree edge/path counts and use
+singleton targets for EOF and present stuff classes. This is probability-mass
+supervision, not an average of per-proposal cross entropies or a uniform-label
+target. It allows concentration within a GT group.
+
+Dynamic-k conflicts are repaired for this mode: give an uncovered GT its
+lowest-cost unused candidate, or transfer one from a GT with multiple matches.
+Both mask supervision and the teacher groups use the repaired assignment, so
+their positive identities remain aligned. Each candidate belongs to only one
+GT. Representatives are ranked using the existing assignment cost. If TOPK
+drops any mask-positive proposal or a present stuff token, training fails with
+an explicit error rather than silently omitting it from decoder supervision;
+the all-337 experiment retains every candidate. Empty scenes use EOF alone.
+
+Sequence permutations and inference are unchanged from the Hungarian test.
+Inference still excludes exact emitted IDs, not whole GT groups (GT is not
+available during inference). Full-resolution targets and oracle evaluation
+remain enabled. `teacher/group_size_mean`, `teacher/positive_proposals`, and
+`teacher/gt_segments` record training target statistics.
