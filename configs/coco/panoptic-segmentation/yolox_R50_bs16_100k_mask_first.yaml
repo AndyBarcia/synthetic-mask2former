@@ -1,0 +1,5 @@
+_BASE_: yolox_R50_bs16_100k.yaml
+MODEL:
+  YOLOX:
+    BOX_FREE: true
+OUTPUT_DIR: output/yolox_R50_bs16_100k_mask_first

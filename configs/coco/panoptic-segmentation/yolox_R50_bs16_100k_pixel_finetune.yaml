@@ -1,0 +1,10 @@
+_BASE_: yolox_R50_bs16_100k.yaml
+# Set MODEL.WEIGHTS to a converted research checkpoint (see docs/yolox-object-decoder.md).
+# Same trainable components as the current pixel-decoder experiment.
+MODEL:
+  WEIGHTS: ""
+  YOLOX:
+    FREEZE_BACKBONE: true
+    FREEZE_PIXEL_DECODER: false
+    FREEZE_MEMORY: true
+OUTPUT_DIR: output/yolox_R50_bs16_100k_pixel_finetune

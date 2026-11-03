@@ -7,6 +7,30 @@ def add_maskformer2_config(cfg):
     """
     Add config for MASK_FORMER.
     """
+    # Native dense-mask/object-decoder architecture. Opt in with META_ARCHITECTURE.
+    cfg.MODEL.YOLOX = CN()
+    cfg.MODEL.YOLOX.WIDTH = 160
+    cfg.MODEL.YOLOX.TOPK = 300
+    cfg.MODEL.YOLOX.MAX_STEPS = 64
+    cfg.MODEL.YOLOX.PAD_SIZE = 512
+    cfg.MODEL.YOLOX.DYNAMIC_MASKS = True
+    cfg.MODEL.YOLOX.BOX_FREE = False
+    cfg.MODEL.YOLOX.SOFT_LABELS = False
+    cfg.MODEL.YOLOX.FULL_MASK_LOSS = False
+    cfg.MODEL.YOLOX.LARGE_KERNEL = False
+    cfg.MODEL.YOLOX.MATCH_IOU_THRESHOLD = 0.5
+    cfg.MODEL.YOLOX.SEQUENCE_LOSS_WEIGHT = 1.0
+    cfg.MODEL.YOLOX.RENDERING = "forward"
+    cfg.MODEL.YOLOX.FREEZE_BACKBONE = False
+    cfg.MODEL.YOLOX.FREEZE_PIXEL_DECODER = False
+    cfg.MODEL.YOLOX.FREEZE_MEMORY = False
+    cfg.MODEL.YOLOX.FREEZE_PROPOSALS = False
+    cfg.MODEL.YOLOX.RL_SAMPLES = 4
+    cfg.MODEL.YOLOX.FEATURE_LR_MULTIPLIER = 0.1
+    cfg.MODEL.YOLOX.HEAD_GRAD_CLIP = 10.0
+    cfg.MODEL.YOLOX.PIXEL_GRAD_CLIP = 1.0
+    cfg.MODEL.YOLOX.POLICY_GRAD_CLIP = 1.0
+
     # NOTE: configs from original maskformer
     # data config
     # select the dataset mapper

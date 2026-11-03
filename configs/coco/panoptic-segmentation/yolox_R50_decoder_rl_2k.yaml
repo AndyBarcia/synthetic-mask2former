@@ -1,0 +1,19 @@
+_BASE_: yolox_R50_bs16_100k.yaml
+# Supply a native supervised checkpoint with MODEL.WEIGHTS.
+MODEL:
+  WEIGHTS: ""
+  YOLOX:
+    FREEZE_BACKBONE: true
+    FREEZE_PIXEL_DECODER: true
+    FREEZE_MEMORY: true
+    FREEZE_PROPOSALS: true
+    RL_SAMPLES: 4
+TRAINING:
+  MODE: rl
+  RL:
+    MAX_ITER: 2000
+    BASE_LR: 0.00001
+    STEPS: [1600, 1900]
+    WARMUP_ITERS: 0
+    WEIGHT: 1.0
+OUTPUT_DIR: output/yolox_R50_decoder_rl_2k
