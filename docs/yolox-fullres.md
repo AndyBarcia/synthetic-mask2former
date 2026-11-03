@@ -59,3 +59,20 @@ Inference still excludes exact emitted IDs, not whole GT groups (GT is not
 available during inference). Full-resolution targets and oracle evaluation
 remain enabled. `teacher/group_size_mean`, `teacher/positive_proposals`, and
 `teacher/gt_segments` record training target statistics.
+
+## Concatenated proposal tokens
+
+`configs/synthetic/yolox_dynamic_k_concat.yaml` enables dynamic masks and
+`MODEL.YOLOX.TOKEN_FUSION: concat`. The existing residual adapter already receives
+the dynamic parameters and spatial context, but compresses them into an additive
+mask-dimensional residual through a zero-initialized projection. Concatenation
+instead feeds the decoder the original mask embedding followed by all 169 dynamic
+MLP parameters, normalized center/stride, mask bias, score and class one-hot.
+The decoder's input/output vocabulary projections accept the expanded dimension
+(437 for 256 mask features and 6 classes). It is used for teacher feedback,
+vocabulary attention and output scoring, including cached inference and RL.
+There is no zero-initialized adapter between kernel parameters and the decoder,
+so object loss can reach the dynamic branch immediately. The default remains
+`residual`, preserving existing checkpoints. Concat changes decoder projection
+shapes and should be trained with a fresh decoder. It keeps grouped dynamic-k
+supervision, full-resolution targets, and the original best-proposal suffixes.
