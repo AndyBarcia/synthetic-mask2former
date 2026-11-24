@@ -115,6 +115,10 @@ class MaskFormer(nn.Module):
         backbone = build_backbone(cfg)
         sem_seg_head = build_sem_seg_head(cfg, backbone.output_shape())
 
+        standard = cfg.MODEL.MASK_FORMER.STANDARD_CLASSIFICATION
+        sem_seg_head.predictor.standard_classification = standard
+        if standard:
+            sem_seg_head.predictor.query_bias_embed.requires_grad_(False)
         # Loss parameters:
         deep_supervision = cfg.MODEL.MASK_FORMER.DEEP_SUPERVISION
         no_object_weight = cfg.MODEL.MASK_FORMER.NO_OBJECT_WEIGHT
@@ -130,11 +134,12 @@ class MaskFormer(nn.Module):
             cost_class=class_weight,
             cost_mask=mask_weight,
             cost_dice=dice_weight,
-            cost_query_bias=cfg.MODEL.MASK_FORMER.QUERY_BIAS_MATCHER_WEIGHT,
+            cost_query_bias=0.0 if standard else cfg.MODEL.MASK_FORMER.QUERY_BIAS_MATCHER_WEIGHT,
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
             mask_loss_type=cfg.MODEL.MASK_FORMER.MASK_LOSS_TYPE,
         )
 
+        matcher.standard_classification = standard
         weight_dict = {
             "loss_ce": class_weight,
             "loss_mask": mask_weight,
@@ -158,7 +163,9 @@ class MaskFormer(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items() if k not in ("loss_object_decoder", "loss_object_rl")})
             weight_dict.update(aux_weight_dict)
 
-        losses = ["labels", "masks", "query_bias"]
+        losses = ["labels", "masks"] if standard else ["labels", "masks", "query_bias"]
+        if standard:
+            weight_dict = {k: v for k, v in weight_dict.items() if not k.startswith("loss_query_bias")}
 
         criterion = SetCriterion(
             sem_seg_head.num_classes,
@@ -199,6 +206,21 @@ class MaskFormer(nn.Module):
             object_rl_objective=cfg.MODEL.MASK_FORMER.OBJECT_RL_OBJECTIVE,
             object_rl_train_eof=cfg.MODEL.MASK_FORMER.OBJECT_RL_TRAIN_EOF,
         )
+        criterion.standard_classification = standard
+        criterion.proposals_per_gt = cfg.MODEL.MASK_FORMER.PROPOSALS_PER_GT
+        criterion.object_pretrain_best_of_k = cfg.MODEL.MASK_FORMER.OBJECT_PRETRAIN_BEST_OF_K
+        if criterion.object_pretrain_best_of_k < 0:
+            raise ValueError("OBJECT_PRETRAIN_BEST_OF_K must be nonnegative")
+        if criterion.proposals_per_gt < 1:
+            raise ValueError("PROPOSALS_PER_GT must be positive")
+        if criterion.proposals_per_gt > 1 and (
+                not standard or not use_object_decoder
+                or cfg.MODEL.MASK_FORMER.FUSED_THING_MASKS
+                or criterion.object_pretrain_best_of_k < 1
+                or cfg.MODEL.MASK_FORMER.HYBRID_SELECTED_PANOPTIC_SUPERVISION
+                or (cfg.MODEL.MASK_FORMER.OBJECT_RL_WEIGHT > 0
+                    and not cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY)):
+            raise ValueError("Multiple proposals require standard classification, no fused targets, best-of-K teachers, and supervised or decoder-only RL")
         criterion.hybrid_selected_panoptic_supervision = cfg.MODEL.MASK_FORMER.HYBRID_SELECTED_PANOPTIC_SUPERVISION
         if criterion.hybrid_selected_panoptic_supervision and (
             cfg.MODEL.MASK_FORMER.OBJECT_RL_ONLY
@@ -298,7 +320,7 @@ class MaskFormer(nn.Module):
             else:
                 targets = None
 
-            if targets is not None and not self.object_rl_only:
+            if targets is not None and not self.object_rl_only and not self.criterion.standard_classification:
                 gt_query_bias_logits = [
                     self.sem_seg_head.predictor.query_bias_embed(features, target["masks"])
                     for features, target in zip(outputs["query_bias_features"], targets)
@@ -322,6 +344,8 @@ class MaskFormer(nn.Module):
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
             query_bias_results = outputs["query_bias_logits"].sigmoid()
+            if self.criterion.standard_classification:
+                query_bias_results = 1 - outputs["pred_logits"].softmax(-1)[..., -1]
             generated_objects = (
                 self.criterion.object_decoder.generate(
                     outputs["mask_embeddings"], outputs["object_decoder_image_features"],

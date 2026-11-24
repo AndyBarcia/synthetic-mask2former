@@ -46,6 +46,8 @@ def add_maskformer2_config(cfg):
     # loss
     cfg.MODEL.MASK_FORMER.DEEP_SUPERVISION = True
     cfg.MODEL.MASK_FORMER.NO_OBJECT_WEIGHT = 0.1
+    cfg.MODEL.MASK_FORMER.STANDARD_CLASSIFICATION = True
+    cfg.MODEL.MASK_FORMER.PROPOSALS_PER_GT = 1
     cfg.MODEL.MASK_FORMER.CLASS_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.DICE_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.MASK_WEIGHT = 20.0
@@ -66,6 +68,7 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.INFERENCE_MASK_OPTIMIZATION = True
     # Number of suffix permutations sharing a randomly sampled training prefix.
     cfg.MODEL.MASK_FORMER.OBJECT_DEC_PREFIX_TREE_BRANCHES = 4
+    cfg.MODEL.MASK_FORMER.OBJECT_PRETRAIN_BEST_OF_K = 32
     cfg.MODEL.MASK_FORMER.OBJECT_PRETRAIN_PQ_TEMPERATURE = 0.0
     cfg.MODEL.MASK_FORMER.OBJECT_PRETRAIN_PQ_REWARD = "terminal"
     # Greedy inference and RL reference only; sampled EOF stays stochastic.

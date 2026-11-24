@@ -240,7 +240,18 @@ class SetCriterion(nn.Module):
         self.mask_loss_type = mask_loss_type
 
     def loss_labels(self, outputs, targets, indices, num_masks):
-        """Classify matched queries among foreground classes only."""
+        """Classify queries, optionally including standard no-object targets."""
+        if getattr(self, "standard_classification", False):
+            logits = outputs["pred_logits"].float()
+            classes = torch.full(logits.shape[:2], self.num_classes,
+                                 dtype=torch.long, device=logits.device)
+            idx = self._get_src_permutation_idx(indices)
+            classes[idx] = torch.cat([t["labels"][j] for t, (_, j) in zip(targets, indices)])
+            weights = logits.new_ones(self.num_classes + 1)
+            weights[-1] = self.eos_coef
+            if classes.numel() == 0:
+                return {"loss_ce": logits.sum() * 0.0}
+            return {"loss_ce": F.cross_entropy(logits.transpose(1, 2), classes, weight=weights)}
         assert "pred_logits" in outputs
         idx = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
@@ -280,23 +291,34 @@ class SetCriterion(nn.Module):
         weights = torch.where(target.bool(), 1.0, self.eos_coef)
         return {"loss_query_bias": (loss * weights).sum() / weights.sum().clamp_min(1.0)}
 
-    def loss_object_decoder(self, outputs, indices):
-        """Teacher-force shared prefixes and permuted suffixes in one tree pass."""
+    def loss_object_decoder(self, outputs, indices, targets=None):
+        """Teacher-force the best-PQ candidate, or legacy random prefix trees."""
         embeddings = outputs["mask_embeddings"]
         num_queries = embeddings.shape[1]
-        paths_per_image = []
-        for src_indices, _ in indices:
-            src_indices = src_indices.to(embeddings.device)
-            ordered = src_indices[torch.randperm(len(src_indices), device=embeddings.device)]
-            # Keep at least two suffix objects when possible, so branching can
-            # change the order. Empty and singleton scenes remain valid paths.
-            split = int(torch.randint(max(len(ordered) - 1, 1), (), device=embeddings.device))
-            prefix, suffix = ordered[:split], ordered[split:]
-            paths = [ordered.tolist()]
-            for _ in range(self.object_decoder.prefix_tree_branches - 1):
-                permutation = torch.randperm(len(suffix), device=embeddings.device)
-                paths.append(torch.cat((prefix, suffix[permutation])).tolist())
-            paths_per_image.append(paths)
+        k = getattr(self, "object_pretrain_best_of_k", 0)
+        if k:
+            from .teacher_permutations import generate_permutations, select_best_permutations
+            if getattr(self, "proposals_per_gt", 1) > 1:
+                from .multiple_proposals import generate_proposal_permutations
+                candidates = generate_proposal_permutations(indices, k, embeddings.device)
+            else:
+                candidates = generate_permutations(indices, k, embeddings.device)
+            quality = self.object_reward(candidates, outputs, targets).reshape(k, -1)
+            paths_per_image = [[order] for order in select_best_permutations(candidates, quality)]
+        else:
+            paths_per_image = []
+            for src_indices, _ in indices:
+                src_indices = src_indices.to(embeddings.device)
+                ordered = src_indices[torch.randperm(len(src_indices), device=embeddings.device)]
+                # Keep at least two suffix objects when possible, so branching can
+                # change the order. Empty and singleton scenes remain valid paths.
+                split = int(torch.randint(max(len(ordered) - 1, 1), (), device=embeddings.device))
+                prefix, suffix = ordered[:split], ordered[split:]
+                paths = [ordered.tolist()]
+                for _ in range(self.object_decoder.prefix_tree_branches - 1):
+                    permutation = torch.randperm(len(suffix), device=embeddings.device)
+                    paths.append(torch.cat((prefix, suffix[permutation])).tolist())
+                paths_per_image.append(paths)
         previous, positions, ancestors, weights = self.object_decoder.pack_prefix_trees(
             paths_per_image, num_queries, embeddings.device
         )
@@ -310,7 +332,8 @@ class SetCriterion(nn.Module):
             embeddings, outputs["object_decoder_image_features"], image_regions, previous,
             vocabulary_exclusions, positions=positions, ancestors=ancestors,
         )
-        loss = -(F.log_softmax(logits.float(), dim=-1) * weights).sum() / weights.sum()
+        log_probability = F.log_softmax(logits.float(), dim=-1)
+        loss = -(torch.where(weights > 0, log_probability, 0.) * weights).sum() / weights.sum()
         return {"loss_object_decoder": loss}
 
     @torch.no_grad()
@@ -818,6 +841,10 @@ class SetCriterion(nn.Module):
         if getattr(self, "hybrid_selected_panoptic_supervision", False):
             return self.loss_selected_panoptic(outputs, targets)
 
+        if getattr(self, "proposals_per_gt", 1) > 1:
+            from .multiple_proposals import multiple_proposal_loss
+            return multiple_proposal_loss(self, outputs, targets)
+
         outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
         mask_targets = self._mask_targets(targets, num_queries=outputs["pred_masks"].shape[1])
         if self.fused_thing_masks and any(
@@ -850,7 +877,9 @@ class SetCriterion(nn.Module):
             losses.update(self.get_loss(loss, outputs, loss_targets, loss_indices, num_masks))
         if self.object_decoder is not None:
             if self.object_rl_weight <= 0:
-                losses.update(self.loss_object_decoder(outputs, object_indices))
+                losses.update(self.loss_object_decoder(outputs, object_indices, targets)
+                              if getattr(self, "object_pretrain_best_of_k", 0)
+                              else self.loss_object_decoder(outputs, object_indices))
             if self.object_rl_weight > 0:
                 losses.update(self.loss_object_rl(outputs, targets))
 

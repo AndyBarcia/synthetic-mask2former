@@ -137,7 +137,9 @@ class HungarianMatcher(nn.Module):
         for b in range(bs):
 
             # The final logit is the unused legacy background channel.
-            out_prob = outputs["pred_logits"][b, :, :-1].softmax(-1)
+            logits = outputs["pred_logits"][b]
+            out_prob = (logits.softmax(-1)[:, :-1] if getattr(self, "standard_classification", False)
+                        else logits[:, :-1].softmax(-1))
             tgt_ids = targets[b]["labels"]
 
             if tgt_ids.numel() == 0:

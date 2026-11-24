@@ -456,7 +456,8 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
                 predictions_mask = [torch.einsum("bqc,bchw->bqhw", mask_embeddings, mask_features)]
         # Object-ordered semantic/panoptic inference does not use query priors.
         query_bias_logits = (mask_embeddings.new_zeros(bs, self.num_queries)
-                             if efficient and defer_mask_predictions else
+                             if (getattr(self, "standard_classification", False) or
+                                 (efficient and defer_mask_predictions)) else
                              self.query_bias_embed.predicted_query_logits(mask_features, predictions_mask[-1]))
         out = {
             'pred_logits': predictions_class[-1],
