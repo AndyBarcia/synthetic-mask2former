@@ -78,3 +78,7 @@ If you find the code useful, please also consider the following BibTeX entry.
 Code is largely based on MaskFormer (https://github.com/facebookresearch/MaskFormer).
 
 See [training modes](docs/training-modes.md) for supervised training, supervised → RL, and RL from a checkpoint.
+
+See [multiple-object proposals](docs/multiple-object-proposals.md) for the default
+k=3 Hungarian experiment with tiered IoU >0.5 / >0.9 and correct-class filtering,
+plus configurable scalar filters and the optional dynamic-k assignment variant.

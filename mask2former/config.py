@@ -48,6 +48,13 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.NO_OBJECT_WEIGHT = 0.1
     cfg.MODEL.MASK_FORMER.STANDARD_CLASSIFICATION = True
     cfg.MODEL.MASK_FORMER.PROPOSALS_PER_GT = 1
+    cfg.MODEL.MASK_FORMER.PROPOSAL_ASSIGNMENT = "hungarian"
+    cfg.MODEL.MASK_FORMER.DYNAMIC_K_TOPK = 10
+    # Negative disables filtering; always retain the highest-IoU match per object.
+    cfg.MODEL.MASK_FORMER.EXTRA_PROPOSAL_MIN_IOU = -1.0
+    cfg.MODEL.MASK_FORMER.EXTRA_PROPOSAL_REQUIRE_CORRECT_CLASS = False
+    # Optional thresholds by descending IoU rank, excluding the unconditional best.
+    cfg.MODEL.MASK_FORMER.EXTRA_PROPOSAL_IOU_THRESHOLDS = []
     cfg.MODEL.MASK_FORMER.CLASS_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.DICE_WEIGHT = 1.0
     cfg.MODEL.MASK_FORMER.MASK_WEIGHT = 20.0

@@ -298,7 +298,7 @@ class SetCriterion(nn.Module):
         k = getattr(self, "object_pretrain_best_of_k", 0)
         if k:
             from .teacher_permutations import generate_permutations, select_best_permutations
-            if getattr(self, "proposals_per_gt", 1) > 1:
+            if getattr(self, "proposals_per_gt", 1) > 1 or getattr(self, "dynamic_assignment", False):
                 from .multiple_proposals import generate_proposal_permutations
                 candidates = generate_proposal_permutations(indices, k, embeddings.device)
             else:
@@ -841,7 +841,7 @@ class SetCriterion(nn.Module):
         if getattr(self, "hybrid_selected_panoptic_supervision", False):
             return self.loss_selected_panoptic(outputs, targets)
 
-        if getattr(self, "proposals_per_gt", 1) > 1:
+        if getattr(self, "proposals_per_gt", 1) > 1 or getattr(self, "dynamic_assignment", False):
             from .multiple_proposals import multiple_proposal_loss
             return multiple_proposal_loss(self, outputs, targets)
 

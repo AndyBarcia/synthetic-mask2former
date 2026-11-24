@@ -36,6 +36,49 @@ batch_dice_loss_jit = torch.jit.script(
 )  # type: torch.jit.ScriptModule
 
 
+@torch.no_grad()
+def dynamic_k_assignment(cost, ious, candidate_topk=10):
+    """SimOTA selection for (query, original GT) matrices, without box priors.
+
+    Each GT requests floor(sum(top-k mask IoUs)), at least one query.
+    Conflicting queries go to their globally cheapest GT, as in YOLOX.
+    Conflicts can leave objects unrepresented; do not silently add matches.
+    """
+    if candidate_topk < 1:
+        raise ValueError("DYNAMIC_K_TOPK must be positive")
+    if cost.shape != ious.shape or cost.ndim != 2:
+        raise ValueError("Cost and IoUs must have the same (query, GT) shape")
+    queries, objects = cost.shape
+    if not queries or not objects:
+        empty = torch.empty(0, dtype=torch.int64)
+        return empty, empty.clone()
+    counts = ious.topk(min(candidate_topk, queries), dim=0).values.sum(0).long().clamp(min=1)
+    matching = torch.zeros_like(cost, dtype=torch.bool)
+    for obj in range(objects):
+        selected = cost[:, obj].topk(int(counts[obj]), largest=False).indices
+        matching[selected, obj] = True
+    conflicts = matching.sum(1) > 1
+    if conflicts.any():
+        winners = cost[conflicts].argmin(1)
+        matching[conflicts] = False
+        matching[conflicts, winners] = True
+    src, dst = matching.nonzero(as_tuple=True)
+    return src.cpu(), dst.cpu()
+
+
+@torch.no_grad()
+def pairwise_binary_mask_iou(logits, targets):
+    """IoU of thresholded bilinear-upsampled masks at padded GT resolution."""
+    predicted = F.interpolate(logits.float()[:, None], size=targets.shape[-2:],
+                              mode="bilinear", align_corners=False)[:, 0] > 0
+    predicted = predicted.flatten(1).float()
+    truth = targets.flatten(1).float()
+    with autocast(logits.device.type, enabled=False):
+        intersection = predicted @ truth.T
+        union = predicted.sum(1)[:, None] + truth.sum(1)[None] - intersection
+        return intersection / union.clamp_min(1)
+
+
 def batch_sigmoid_ce_loss(inputs: torch.Tensor, targets: torch.Tensor):
     """
     Args:
@@ -157,6 +200,9 @@ class HungarianMatcher(nn.Module):
             out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
             # gt masks are already padded when preparing target
             tgt_mask = targets[b]["masks"].to(out_mask)
+            dynamic = getattr(self, "proposal_assignment", "hungarian") == "dynamic_k"
+            if dynamic:
+                mask_ious = pairwise_binary_mask_iou(out_mask, tgt_mask)
 
             if self.mask_loss_type == "block":
                 positive_counts, block_area, target_h, target_w = compute_mask_block_counts(
@@ -211,9 +257,11 @@ class HungarianMatcher(nn.Module):
             elif "query_bias_logits" in outputs:
                 query_bias_cost = -outputs["query_bias_logits"][b].float().sigmoid()
                 C[:, :num_objects] += self.cost_query_bias * query_bias_cost[:, None]
-            C = C.reshape(num_queries, -1).cpu()
-
-            indices.append(linear_sum_assignment(C))
+            C = C.reshape(num_queries, -1)
+            if dynamic:
+                indices.append(dynamic_k_assignment(C, mask_ious, self.dynamic_k_topk))
+            else:
+                indices.append(linear_sum_assignment(C.cpu()))
 
         return [
             (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))

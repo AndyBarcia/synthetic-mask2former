@@ -1,0 +1,11 @@
+# Default multiple-proposal experiment: one unconditional match, then two
+# IoU-ranked extras requiring the correct class and IoU strictly above .5/.9.
+_BASE_: "maskseq_R50_bs16_10kpre_2krl_multiple_proposals_k2.yaml"
+MODEL:
+  MASK_FORMER:
+    PROPOSAL_ASSIGNMENT: hungarian
+    PROPOSALS_PER_GT: 3
+    EXTRA_PROPOSAL_MIN_IOU: 0.5
+    EXTRA_PROPOSAL_IOU_THRESHOLDS: [0.5, 0.9]
+    EXTRA_PROPOSAL_REQUIRE_CORRECT_CLASS: true
+OUTPUT_DIR: "output/synth_pan_R50_bs16_10kpre_2krl_multiple_proposals"

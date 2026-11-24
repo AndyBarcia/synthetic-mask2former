@@ -208,12 +208,39 @@ class MaskFormer(nn.Module):
         )
         criterion.standard_classification = standard
         criterion.proposals_per_gt = cfg.MODEL.MASK_FORMER.PROPOSALS_PER_GT
+        criterion.dynamic_assignment = cfg.MODEL.MASK_FORMER.PROPOSAL_ASSIGNMENT == "dynamic_k"
+        criterion.extra_proposal_min_iou = cfg.MODEL.MASK_FORMER.EXTRA_PROPOSAL_MIN_IOU
+        criterion.extra_proposal_require_correct_class = cfg.MODEL.MASK_FORMER.EXTRA_PROPOSAL_REQUIRE_CORRECT_CLASS
+        criterion.extra_proposal_iou_thresholds = tuple(cfg.MODEL.MASK_FORMER.EXTRA_PROPOSAL_IOU_THRESHOLDS)
+        thresholds = criterion.extra_proposal_iou_thresholds
+        if thresholds and (
+                criterion.extra_proposal_min_iou < 0
+                or len(thresholds) != criterion.proposals_per_gt - 1
+                or any(not 0 <= value <= 1 for value in thresholds)
+                or list(thresholds) != sorted(thresholds)):
+            raise ValueError("EXTRA_PROPOSAL_IOU_THRESHOLDS requires enabled fixed-k filtering and one nondecreasing [0,1] threshold per extra proposal")
+        if criterion.extra_proposal_require_correct_class and criterion.extra_proposal_min_iou < 0:
+            raise ValueError("Correct-class filtering requires EXTRA_PROPOSAL_MIN_IOU enabled")
+        if not (criterion.extra_proposal_min_iou == -1.0 or
+                0.0 <= criterion.extra_proposal_min_iou <= 1.0):
+            raise ValueError("EXTRA_PROPOSAL_MIN_IOU must be -1 (disabled) or in [0, 1]")
+        if criterion.extra_proposal_min_iou >= 0 and (
+                criterion.dynamic_assignment or criterion.proposals_per_gt <= 1):
+            raise ValueError("Extra-proposal filtering requires fixed-k Hungarian with PROPOSALS_PER_GT>1")
+        if cfg.MODEL.MASK_FORMER.PROPOSAL_ASSIGNMENT not in {"hungarian", "dynamic_k"}:
+            raise ValueError("PROPOSAL_ASSIGNMENT must be hungarian or dynamic_k")
+        matcher.proposal_assignment = cfg.MODEL.MASK_FORMER.PROPOSAL_ASSIGNMENT
+        matcher.dynamic_k_topk = cfg.MODEL.MASK_FORMER.DYNAMIC_K_TOPK
+        if matcher.dynamic_k_topk < 1:
+            raise ValueError("DYNAMIC_K_TOPK must be positive")
+        if criterion.dynamic_assignment and criterion.proposals_per_gt != 1:
+            raise ValueError("Dynamic assignment uses original targets; set PROPOSALS_PER_GT=1")
         criterion.object_pretrain_best_of_k = cfg.MODEL.MASK_FORMER.OBJECT_PRETRAIN_BEST_OF_K
         if criterion.object_pretrain_best_of_k < 0:
             raise ValueError("OBJECT_PRETRAIN_BEST_OF_K must be nonnegative")
         if criterion.proposals_per_gt < 1:
             raise ValueError("PROPOSALS_PER_GT must be positive")
-        if criterion.proposals_per_gt > 1 and (
+        if (criterion.proposals_per_gt > 1 or criterion.dynamic_assignment) and (
                 not standard or not use_object_decoder
                 or cfg.MODEL.MASK_FORMER.FUSED_THING_MASKS
                 or criterion.object_pretrain_best_of_k < 1

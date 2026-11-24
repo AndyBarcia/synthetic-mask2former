@@ -9,7 +9,7 @@ from train_net import get_cfg, add_deeplab_config, add_maskformer2_config, Train
 from mask2former.data.synthetic_scene_batch_loader import SyntheticSceneBatchLoader
 
 p = argparse.ArgumentParser()
-p.add_argument('--config-file', default=str(Path(__file__).resolve().parents[1] / 'configs/synthetic-scene/panoptic-segmentation/maskseq_R50_bs16_10kpre_2krl_multiple_proposals_k2.yaml'))
+p.add_argument('--config-file', default=str(Path(__file__).resolve().parents[1] / 'configs/synthetic-scene/panoptic-segmentation/maskseq_R50_bs16_10kpre_2krl_multiple_proposals.yaml'))
 a = p.parse_args()
 torch.set_num_threads(2); torch.manual_seed(42)
 cfg = get_cfg(); add_deeplab_config(cfg); add_maskformer2_config(cfg)
@@ -31,7 +31,8 @@ with EventStorage():
     model.zero_grad(set_to_none=True); model.eval()
     with torch.no_grad(), torch.autocast('cuda', dtype=torch.float16):
         predictions = model(batch)
-    assert all(p['panoptic_seg'][0].shape == (512, 512) for p in predictions)
+    assert all(p['panoptic_seg'][0].shape == (record['height'], record['width'])
+               for p, record in zip(predictions, batch))
     print('Whole-object panoptic and instance inference passed', flush=True)
     model.train(); model.object_rl_only = True
     model.backbone.requires_grad_(False); model.sem_seg_head.requires_grad_(False)
